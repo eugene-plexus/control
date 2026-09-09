@@ -14,7 +14,7 @@ Supervision is the [`agent`](https://github.com/eugene-plexus/agent)'s job, and 
 
 Once things are running, the data path needs no control root: the gateway routes from topology it already holds plus driver health, each driver holds its own config on disk, and engines are supervised by their local agent. So `control` going down pauses config edits, new runtimes, enrollment and UI login — and a chat completion still succeeds.
 
-That was an accident of the architecture before this repo existed. [`tests/test_survives_control_root_loss.py`](tests/test_survives_control_root_loss.py) and [`specs/scripts/m5-acceptance.sh`](https://github.com/eugene-plexus/specs/blob/main/scripts/m5-acceptance.sh) are what make it a guarantee: the second of those kills the control root mid-run and asserts a real completion still comes back through a real engine.
+That was an accident of the architecture before this repo existed. Two tests make it a guarantee. [`tests/test_control_root_loss.py`](tests/test_control_root_loss.py) covers the half this repo owns — an unclean kill loses nothing a caller was promised, and a replicating standby can be promoted from the passphrase alone. [`specs/scripts/m5-acceptance.sh`](https://github.com/eugene-plexus/specs/blob/main/scripts/m5-acceptance.sh) covers the half it cannot: five real processes and a real 27B model, the control root killed through the OS mid-run, and a completion back two seconds later.
 
 ## One writer, one ordered log
 
