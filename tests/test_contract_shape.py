@@ -24,7 +24,7 @@ from eugene_plexus_control.app import create_app
 from eugene_plexus_control.state_machine import StateMachine
 
 from .conftest import PASSPHRASE, settings_for
-from .test_replay_equivalence import _write_history
+from .test_replay_equivalence import _write_history, placeholder
 
 
 def _active(tmp_path: Path) -> tuple[TestClient, dict[str, str]]:
@@ -130,7 +130,7 @@ def test_the_snapshot_can_hold_every_ops_effect(tmp_path: Path) -> None:
         assert document["config"]["uiTheme"] == "light"
         # rotateSigningKey
         assert document["signingKeyId"] == "2"
-        assert document["sealedSigningKey"] == "cm90YXRlZC1rZXk="
+        assert document["sealedSigningKey"] == placeholder("rotated")
         # promote
         assert document["epoch"] == 2
     finally:

@@ -75,15 +75,28 @@ EXERCISED_OPS = {
 }
 
 
+def placeholder(label: str) -> str:
+    """A deterministic, obviously-not-a-key stand-in.
+
+    Computed from readable text rather than written as a base64 literal.
+    A literal here is indistinguishable from a real leaked key to a
+    secret scanner — and to a reader — and this repo's CI runs gitleaks
+    over every commit. The apply function treats these as opaque
+    strings, so what matters is only that they are stable across a
+    replay.
+    """
+    return base64.b64encode(f"THIS-IS-NOT-A-REAL-KEY::{label}".encode()).decode("ascii")
+
+
 def _seed_identity(machine: StateMachine) -> None:
     machine.seed_identity(
         {
             "salt": base64.b64encode(b"0123456789abcdef").decode("ascii"),
             "passphraseVerifier": "$argon2id$v=19$m=65536,t=3,p=4$fake$verifier",
-            "sealedSigningKey": "c2VhbGVkLXNpZ25pbmcta2V5",
-            "sealedControlKey": "c2VhbGVkLWNvbnRyb2wta2V5",
-            "controlPublicKey": "Y29udHJvbC1wdWJsaWM=",
-            "sealedRecoveryKey": "c2VhbGVkLXJlY292ZXJ5",
+            "sealedSigningKey": placeholder("signing"),
+            "sealedControlKey": placeholder("control-identity"),
+            "controlPublicKey": placeholder("control-public"),
+            "sealedRecoveryKey": placeholder("recovery"),
             "signingKeyId": "1",
         }
     )
@@ -176,7 +189,7 @@ def _write_history(machine: StateMachine) -> None:
     machine.append(OP_DELETE_COMPONENT, {"node": "attic", "name": "gateway"})
     machine.append(
         OP_ROTATE_SIGNING_KEY,
-        {"signingKeyId": "2", "sealedSigningKey": "cm90YXRlZC1rZXk=", "reason": "operator"},
+        {"signingKeyId": "2", "sealedSigningKey": placeholder("rotated"), "reason": "operator"},
     )
     # Revoking takes the node's component and runtime with it. Placed
     # last so the cascade shows up in the compared state.
@@ -501,5 +514,5 @@ def _genesis(machine: StateMachine) -> dict[str, Any]:
         "runtimes": [],
         "config": {},
         "signingKeyId": "1",
-        "sealedSigningKey": "c2VhbGVkLXNpZ25pbmcta2V5",
+        "sealedSigningKey": placeholder("signing"),
     }
