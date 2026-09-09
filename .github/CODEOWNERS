@@ -1,0 +1,5 @@
+# Auto-requests review from listed owners on every PR.
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-security/customizing-your-repository/about-code-owners
+
+# Default — every file in this repo.
+*       @troycorbinz

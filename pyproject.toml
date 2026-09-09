@@ -1,0 +1,144 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "eugene-plexus-control"
+version = "0.1.0"
+description = "Eugene Plexus control root: the install's trust root, node registry, install-wide topology and replicated control-state log. Exactly one active, plus warm standbys. Spawns nothing."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+authors = [
+    { name = "Eugene Plexus contributors" },
+]
+keywords = ["eugene-plexus", "control-plane", "multi-host", "replication", "fastapi"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# No consensus library, deliberately: the design is one writer plus warm
+# standbys, and §5 of the M5 design records why quorum is out of scope
+# (a management plane, not a storage layer). The log is a JSONL file and
+# a lock, which is the whole point — a later move to Raft is a transport
+# and election swap, not a rewrite.
+#
+# `httpx` is here because this component *asks* rather than spawns: the
+# union runtime view is assembled by calling each enrolled node's agent,
+# and a standby pulls the log over the same client.
+#
+# Note that this component is `pip install -e`'d into the agent's venv
+# so the supervisor can spawn it (the control root is a supervised
+# component like any other), so a new runtime dependency has to be
+# installed there too.
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.27,<1",
+    "uvicorn[standard]>=0.32,<1",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "pyyaml>=6.0,<7",
+    # The trust root's security stack. Moved here from the agent, which
+    # held it only because it used to be the single process.
+    "argon2-cffi>=23.1,<24",      # passphrase hash + master-key KDF
+    "pyjwt>=2.10,<3",             # session/service token sign + verify
+    "pynacl>=1.5,<2",             # secretbox at rest, sealed boxes per node
+    "keyring>=25.5,<26",          # OS Credential Manager / Keychain / Secret Service
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.4.2",
+    "pytest-asyncio==0.26.0",
+    "httpx>=0.27,<1",          # FastAPI test client
+    "ruff==0.15.14",
+    "mypy==1.20.2",
+    "types-pyyaml>=6,<7",
+    "datamodel-code-generator==0.57.0",
+]
+
+[project.scripts]
+eugene-plexus-control = "eugene_plexus_control.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/eugene-plexus"
+Repository = "https://github.com/eugene-plexus/control"
+Specs = "https://github.com/eugene-plexus/specs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eugene_plexus_control"]
+
+# -----------------------------------------------------------------------------
+# Ruff (linter + formatter)
+# -----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "src/eugene_plexus_control/_generated",
+]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # isort
+    "B",             # bugbear
+    "UP",            # pyupgrade
+    "ASYNC",         # async-correctness
+    "SIM",           # simplifications
+    "RUF",
+]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E501"]
+# FastAPI uses Depends() as an argument default, which is the framework's
+# idiom for dependency injection but trips ruff's "no function calls in
+# defaults" rule. Allow it only in the dependency module that defines them.
+"src/eugene_plexus_control/dependencies.py" = ["B008"]
+# Same idiom, same rule: FastAPI wants Query() as an argument default.
+"src/eugene_plexus_control/routes/control.py" = ["B008"]
+# The log writer touches the filesystem from the request path: append a
+# line, fsync it, rename a snapshot into place. ASYNC240 wants those on
+# a thread, and that is the wrong trade here — the append is the
+# serialization point of the whole component, so moving it off the loop
+# would buy concurrency we deliberately do not want. Writes are a few
+# hundred bytes and the durability barrier is the point.
+"src/eugene_plexus_control/log_store.py" = ["ASYNC240"]
+
+# -----------------------------------------------------------------------------
+# Mypy
+# -----------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+# call-arg is disabled because mypy doesn't recognize pydantic's
+# `field: T = Field(default, ...)` defaults — every optional codegen'd
+# Pydantic field is reported as missing at the call site otherwise.
+disable_error_code = ["call-arg"]
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+exclude = [
+    "src/eugene_plexus_control/_generated",
+]
+
+[[tool.mypy.overrides]]
+module = "eugene_plexus_control._generated.*"
+ignore_errors = true
+
+# -----------------------------------------------------------------------------
+# Pytest
+# -----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"

@@ -1,0 +1,15 @@
+# Pre-commit hooks — mirror the CI lint/format gate so unformatted or
+# unlinted code never reaches CI (the cause of the chronic CI-red runs).
+#
+# One-time setup per clone:
+#   pip install pre-commit && pre-commit install
+#
+# After that, `git commit` auto-runs ruff (lint --fix) + ruff-format on
+# staged Python files. If a hook modifies files, re-stage and commit again.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.14
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
