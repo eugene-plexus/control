@@ -30,6 +30,10 @@ The full DCO text is in [the specs CONTRIBUTING.md](https://github.com/eugene-pl
 
 If your change touches the HTTP API — endpoints, request/response shapes, schemas — it belongs in [`eugene-plexus/specs`](https://github.com/eugene-plexus/specs), not here. Land that PR first; bump `SPECS_REF` and re-run codegen here in a follow-up.
 
+This consumer generates from **two** documents, `control.yaml` and `agent.yaml`.
+Audit both inputs when updating the pin, including shared-schema output. See the
+[consumer update workflow](https://github.com/eugene-plexus/specs/blob/main/CONTRIBUTING.md#consumer-updates).
+
 ## Read this before touching the log
 
 Four rules hold this component up. Each has a test, and a change that breaks one is a change that makes promotion unsafe rather than a change that fails a test.
@@ -96,4 +100,5 @@ File issues at <https://github.com/eugene-plexus/control/issues>. Useful issues 
 
 **Security.** This is a security design that has had no adversarial review, and that is stated plainly as the largest risk in the M5 design doc. Enrollment, revocation-as-rotation and the sealing recipients each have failure modes that are invisible until someone attacks them. If you have found one, please report it privately rather than in a public issue.
 
-For broader architectural questions about Eugene Plexus, file the issue on the [gateway repo](https://github.com/eugene-plexus/gateway) instead.
+Cross-component architecture questions belong in
+[specs issues](https://github.com/eugene-plexus/specs/issues).

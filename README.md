@@ -22,11 +22,11 @@ Every control-state change — enroll a node, revoke one, declare or delete a ru
 
 Three rules hold the whole thing up, and each is asserted by a test rather than trusted:
 
-| Rule | Why | Where |
-|---|---|---|
-| `apply()` never reads the clock, the filesystem, or the network | otherwise replay diverges from the original and a standby's state is a guess | [`applied.py`](src/eugene_plexus_control/applied.py) |
-| Index is the only ordering; timestamps are informational | keeps clock skew between buildings out of the correctness argument | [`log_store.py`](src/eugene_plexus_control/log_store.py) |
-| Liveness is **not** replicated state | `reachable`, `lastSeenAt`, `lastSeenEpoch` are one root's observations, not facts about the install | [`applied.py`](src/eugene_plexus_control/applied.py) |
+| Rule                                                            | Why                                                                                                 | Where                                                    |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `apply()` never reads the clock, the filesystem, or the network | otherwise replay diverges from the original and a standby's state is a guess                        | [`applied.py`](src/eugene_plexus_control/applied.py)     |
+| Index is the only ordering; timestamps are informational        | keeps clock skew between buildings out of the correctness argument                                  | [`log_store.py`](src/eugene_plexus_control/log_store.py) |
+| Liveness is **not** replicated state                            | `reachable`, `lastSeenAt`, `lastSeenEpoch` are one root's observations, not facts about the install | [`applied.py`](src/eugene_plexus_control/applied.py)     |
 
 **Replay equivalence** — a standby's applied state must be byte-identical to the active root's after applying the same log — is a required deliverable of this milestone, not a nice-to-have. It is what makes a promotion safe rather than hopeful, and it is what would later let Raft be dropped in underneath: the log, the apply function, the snapshot and the epoch already exist, so consensus would be a swap of the transport and the election, not a redesign.
 
@@ -46,19 +46,29 @@ The known and accepted cost: an agent partitioned *during* a promotion still tru
 
 Each node has an identity keypair generated at enrollment whose private half never leaves it. A secret is sealed to the node whose component will read it — topology already says which node that is — plus a **recovery recipient** held here and itself sealed under the passphrase-derived key.
 
-| Compromise | Yields |
-|---|---|
-| One node | that node's secrets only |
-| This process | nothing directly — the recovery key is sealed under the passphrase |
-| This process **and** the passphrase | everything. Unavoidable, and what the passphrase *is* |
+| Compromise                                         | Yields                                                                  |
+| -------------------------------------------------- | ----------------------------------------------------------------------- |
+| A node's private sealing key                       | Secrets sealed to that node; it cannot decrypt another node's envelopes |
+| A locked control-state copy without its unlock key | Encrypted recovery material; the passphrase is required to recover it   |
+| An unlocked control process or recovery key        | Recovery access to all sealed secrets                                   |
+
+These are encryption boundaries, not complete host-compromise guarantees. M7
+stores the shared install signing key in cleartext on each enrolled node so
+headless children can authenticate. A compromised node can therefore also forge
+install bearer tokens; per-node sealing does not isolate signing authority.
 
 `securityMode: os_keyring` is **host-bound**: the master key sits in *this* machine's Credential Manager or Keychain, so a standby cannot inherit auto-unlock and will require the passphrase at promotion. That is consistent with promotion being a human act anyway, but the wizard has to say so in words rather than let it be discovered during a failover.
 
 ## Status
 
-**M5, partial.** Landed and tested: the single-writer ordered log, the deterministic apply function, snapshots and compaction, the standby follower, epoch fencing, promotion, node enrollment and revocation-as-rotation, two-recipient sealing, the trust root's auth surface, the config trio, and the install-wide topology views.
+**M5 core and M7 integration built (2026-09-10).** Landed and tested: the single-writer ordered log, deterministic apply, snapshots and compaction, standby replication, epoch fencing, promotion, enrollment and revocation-as-rotation, two-recipient sealing, auth, config, and union topology views. M7 adds node-provided URLs, control-identity-signed rekeying and epoch announcements after promotion. All six consumers pin the M7 contracts.
 
-Not here yet: serving the UI (still the agent's job until the assets move), the log-shaped side of `securityMode: os_keyring` auto-unlock on a standby, recovery-from-a-dead-node as an operator flow, and the wizard copy that has to explain the keyring/HA tension. `POST /v1/runtimes` forwards to a node's agent; a node that is `down` during a key rotation is re-keyed on reconnect.
+M5 verified inference surviving a killed control root. M7 verified enrollment and
+rotation with two agents on one host. Real two-machine partitions, an offline
+node during rotation, and clock-skew behavior remain unverified; see the
+[M7 acceptance record](https://github.com/eugene-plexus/specs/blob/main/docs/acceptance/m7-two-agent-run.md).
+
+Not here yet: serving the UI (assets remain with the agent; ownership is undecided), dedicated control-root screens, the log-shaped side of `securityMode: os_keyring` auto-unlock on a standby, recovery-from-a-dead-node as an operator flow, and wizard copy explaining keyring/HA. `POST /v1/runtimes` forwards to a node's agent; a node that is `down` during key rotation is re-keyed on reconnect.
 
 **Explicitly out of scope, by decision and not by neglect:** Raft, quorum, automatic promotion, multi-writer control state, and migrating an existing single-host install.
 
@@ -66,22 +76,22 @@ Not here yet: serving the UI (still the agent's job until the assets move), the 
 
 Defined in [`specs/openapi/control.yaml`](https://github.com/eugene-plexus/specs/blob/main/openapi/control.yaml). Port **8083**.
 
-| | |
-|---|---|
-| `GET /v1/nodes` | Every host, with its identity, role and last-seen epoch |
-| `GET`/`DELETE /v1/nodes/{name}` | Read one / revoke it, **which rotates the signing key** |
-| `POST /v1/nodes/join-token` | Mint a single-use, short-lived, node-scoped token |
-| `POST /v1/nodes/enroll` | Called by an agent; join-token authenticated, no session |
-| `GET /v1/control/status` | Role, epoch, applied index, and every standby's lag |
-| `GET /v1/control/log` | Standbys pull entries after an index |
-| `GET /v1/control/snapshot` | Bootstrap a standby; recover past compaction |
-| `POST /v1/control/promote` | Operator action on the standby, passphrase required |
-| `POST`/`GET /v1/control/rotate-key` | Explicit rotation / its progress |
-| `GET /v1/components` | Install-wide, each entry tagged with its node |
-| `GET`/`POST /v1/runtimes` | The union across nodes / declare one, forwarded to an agent |
-| `GET /v1/auth/status`, `POST /v1/auth/initialize`, `POST /v1/auth/login` | The trust root |
-| `GET`/`PATCH /v1/config`, `GET /v1/config/schema` | The standard config trio |
-| `GET /healthz` | Liveness. Healthy on a standby too — replicating is doing its job |
+|                                                                          |                                                                   |
+| ------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| `GET /v1/nodes`                                                          | Every host, with its identity, role and last-seen epoch           |
+| `GET`/`DELETE /v1/nodes/{name}`                                          | Read one / revoke it, **which rotates the signing key**           |
+| `POST /v1/nodes/join-token`                                              | Mint a single-use, short-lived, node-scoped token                 |
+| `POST /v1/nodes/enroll`                                                  | Called by an agent; join-token authenticated, no session          |
+| `GET /v1/control/status`                                                 | Role, epoch, applied index, and every standby's lag               |
+| `GET /v1/control/log`                                                    | Standbys pull entries after an index                              |
+| `GET /v1/control/snapshot`                                               | Bootstrap a standby; recover past compaction                      |
+| `POST /v1/control/promote`                                               | Operator action on the standby, passphrase required               |
+| `POST`/`GET /v1/control/rotate-key`                                      | Explicit rotation / its progress                                  |
+| `GET /v1/components`                                                     | Install-wide, each entry tagged with its node                     |
+| `GET`/`POST /v1/runtimes`                                                | The union across nodes / declare one, forwarded to an agent       |
+| `GET /v1/auth/status`, `POST /v1/auth/initialize`, `POST /v1/auth/login` | The trust root                                                    |
+| `GET`/`PATCH /v1/config`, `GET /v1/config/schema`                        | The standard config trio                                          |
+| `GET /healthz`                                                           | Liveness. Healthy on a standby too — replicating is doing its job |
 
 Generated Pydantic models live in `src/eugene_plexus_control/_generated/` and are committed. They are regenerated from the specs commit pinned in [`SPECS_REF`](SPECS_REF):
 
@@ -101,7 +111,11 @@ python -m eugene_plexus_control          # binds 127.0.0.1:8083
 pytest
 ```
 
-Startup-only settings come from `EUGENE_PLEXUS_CONTROL_*` env vars — where the state directory lives, which interface to bind, safe mode. Everything an operator would want to tune is a config field reachable from the UI, because if it is tunable the UI exposes it. Bad config never stops startup: the config endpoints are how a broken config gets repaired, so refusing to boot over one would lock the operator out of the fix.
+Startup-only settings come from `EUGENE_PLEXUS_CONTROL_*` env vars: state directory,
+bind interface and safe mode. Runtime tuning is exposed through the config trio
+with UI metadata. The UI has generated control types and proxy support, but this
+does not yet provide complete control-root operator workflows. Bad config never
+stops startup: reachable config endpoints are how a broken config gets repaired.
 
 ## License
 
