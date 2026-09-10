@@ -60,6 +60,30 @@ def test_enrollment_hands_back_the_installs_signing_key(active_client: TestClien
     assert body["recoveryPublicKey"] == sealing.public_from_private(auth.recovery_private_key)
 
 
+def test_enrollment_records_where_the_agent_is_and_names_the_key_generation(
+    active_client: TestClient,
+) -> None:
+    """The two fields M7 added to the exchange, and why. Without `url`
+    every really-enrolled node had no address: the poller reported "no
+    url recorded", forwarding answered 502, the gateway fell back to
+    loopback. Without `signingKeyId` a node could not tell a newer re-key
+    from a replay."""
+    response = _enroll(active_client, _mint(active_client), "gpu-box", url="http://100.64.0.7:8079")
+    assert response.status_code == 201, response.text
+    assert response.json()["signingKeyId"] == "1"
+
+    node = active_client.get("/v1/nodes/gpu-box").json()
+    assert node["url"].rstrip("/") == "http://100.64.0.7:8079"
+    # Normalized once on the way into the log, the way every URL is.
+    record = active_client.app.state.machine.state.nodes["gpu-box"]  # type: ignore[attr-defined]
+    assert record.url == "http://100.64.0.7:8079/"
+
+    # An enrollment without one is accepted and produces a node this root
+    # cannot reach — honest, and visible.
+    assert _enroll(active_client, _mint(active_client), "shed").status_code == 201
+    assert active_client.get("/v1/nodes/shed").json().get("url") is None
+
+
 def test_a_join_token_cannot_be_replayed(active_client: TestClient) -> None:
     """409 rather than 401, because the two mean different things to
     whoever is holding the token: "wrong credential" versus "that

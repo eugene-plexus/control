@@ -640,6 +640,10 @@ class Enrollment(BaseModel):
         ...,
         description="The current service-token signing key, so this node's\ncomponents can verify tokens minted anywhere in the install.\n**This is what a single-watchdog install could not do**: a\ndriver spawned on one host used to reject a gateway's token\nfrom another because the keys were unrelated.\n",
     )
+    signingKeyId: str | None = Field(
+        None,
+        description="The key's generation (`Snapshot.signingKeyId`), so the node\ncan tell a later `POST /v1/node/rekey` that is newer from one\nthat is a replay.\n",
+    )
     controlPublicKey: str | None = Field(
         None,
         description="The control root's public key, so the node can verify that\nlater epoch changes come from a root it recognises rather\nthan from anything that can reach its port.\n",
@@ -947,6 +951,10 @@ class EnrollmentRequest(BaseModel):
         ...,
         description="The agent's identity public key. The private half stays on\nthe node; sending it would defeat the point of per-node\nsealing.\n",
     )
+    url: AnyUrl | None = Field(
+        None,
+        description="Where other hosts reach this agent — its `advertiseUrl`,\nconfigured or derived (`agent.yaml`, `GET /v1/node`). Becomes\n`Node.url`. The agent sends it because the agent knows which\ninterface it used to reach this root; a root deriving it from\nthe request's source address would be right on a flat mesh\nnetwork and wrong behind anything else.\n",
+    )
     agentVersion: str | None = None
     os: Os | None = None
     arch: Arch | None = None
@@ -1039,7 +1047,8 @@ class Node(BaseModel):
         min_length=1,
     )
     url: AnyUrl | None = Field(
-        None, description="Where this node's agent is reachable."
+        None,
+        description="Where this node's agent is reachable — from this root, and from\na gateway sending a lifecycle action to the agent that owns a\nruntime. Recorded verbatim from `EnrollmentRequest.url`; the\nagent is the one that knows how it reached this root, and this\nroot does not guess from a source address.\n",
     )
     role: NodeRole
     reachable: bool = Field(

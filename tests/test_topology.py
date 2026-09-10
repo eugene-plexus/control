@@ -125,6 +125,10 @@ def agent_a() -> Iterator[_Server]:
 def _enroll(client: TestClient, name: str, url: str) -> None:
     import base64
 
+    # The agent's address rides on the enrollment from M7. Before that the
+    # exchange never carried it and this helper appended a second
+    # `enrollNode` entry by hand — which is how every really-enrolled node
+    # came to have no URL without any test noticing.
     token = client.post("/v1/nodes/join-token").json()["token"]
     response = client.post(
         "/v1/nodes/enroll",
@@ -132,23 +136,10 @@ def _enroll(client: TestClient, name: str, url: str) -> None:
             "token": token,
             "name": name,
             "publicKey": base64.b64encode(name.encode().ljust(32, b"0")).decode(),
+            "url": url,
         },
     )
     assert response.status_code == 201, response.text
-    # The agent's address is topology the operator supplies; enrollment
-    # does not carry it, so it is recorded separately.
-    machine = client.app.state.machine  # type: ignore[attr-defined]
-    record = machine.state.nodes[name]
-    machine.append(
-        "enrollNode",
-        {
-            "name": name,
-            "role": record.role,
-            "url": url,
-            "publicKey": record.publicKey,
-            "enrolledAt": record.enrolledAt,
-        },
-    )
 
 
 def test_the_union_view_tags_every_runtime_with_the_node_that_reported_it(

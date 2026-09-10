@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 
-from .. import security
+from .. import sealing, security
 from .._generated.models import (
     ControlStatus,
     KeyRotation,
@@ -249,6 +249,32 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
             status.HTTP_409_CONFLICT, "Already active", "This control root is already active."
         ) from exc
 
+    # Announce the epoch. M5 §9 said agents learn it "on their next
+    # contact"; this is the contact — the same signed message a rotation
+    # sends, carrying the UNCHANGED signing key and the new epoch, so an
+    # agent records the generation and restarts nothing. Best-effort and
+    # not a log entry: it delivers an observation about the log's own
+    # epoch, and a node that is down learns it from the next rotation or
+    # announcement that reaches it. The identity key that signs it is the
+    # one promotion deliberately preserved (`sealedControlKey`).
+    if auth.control_private_key is not None and auth.signing_key is not None:
+        request.app.state.announce_task = asyncio.create_task(
+            _notify_nodes(
+                request,
+                key_b64=base64.b64encode(auth.signing_key).decode("ascii"),
+                key_id=machine.state.identity.signingKeyId or "1",
+                epoch=machine.state.epoch,
+                tracker=None,
+            ),
+            name="control-epoch-announce",
+        )
+    else:
+        log.warning(
+            "promoted without the control identity key in memory; nodes will learn epoch %d "
+            "from the next rotation instead of now",
+            machine.state.epoch,
+        )
+
     log.warning(
         "PROMOTED to active control root at epoch %d, applied index %d%s",
         machine.state.epoch,
@@ -354,6 +380,17 @@ async def perform_rotation(
             "The master key is not available in this process, so a new signing key "
             "cannot be sealed. Log in first.",
         )
+    if auth.control_private_key is None:
+        # Checked BEFORE minting. A rotation whose re-keys cannot be signed
+        # would log a new key no node could be told about, which is the
+        # one order this operation must never end up in.
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Control identity unavailable",
+            "The control root's identity key did not open at login, so a re-key cannot be "
+            "signed and no node would accept it. Check the login log for "
+            "'control identity key did not open'.",
+        )
 
     node_names = sorted(machine.state.nodes)
     try:
@@ -392,51 +429,86 @@ async def perform_rotation(
     # the install in the mixed-key state this whole operation is
     # careful about.
     request.app.state.rotation_task = asyncio.create_task(
-        _distribute(request, new_key, key_id), name="control-key-rotation"
+        _notify_nodes(
+            request,
+            key_b64=base64.b64encode(new_key).decode("ascii"),
+            key_id=key_id,
+            epoch=machine.state.epoch,
+            tracker=tracker,
+        ),
+        name="control-key-rotation",
     )
     current = tracker.current
     assert current is not None
     return _to_key_rotation(current)
 
 
-async def _distribute(request: Request, new_key: bytes, key_id: str) -> None:
-    """Hand the new key to every remaining node.
+async def _notify_nodes(
+    request: Request,
+    *,
+    key_b64: str,
+    key_id: str,
+    epoch: int,
+    tracker: RotationTracker | None,
+) -> None:
+    """Send every node a signed `POST /v1/node/rekey`.
 
-    A node that refuses or times out is left pending and named. There is
-    deliberately no retry loop here: a rotation that quietly retried for
-    an hour would report `distributing` while an operator waited for a
-    verdict, and the verdict they need is "these three hosts are stale".
-    Re-running the rotation is the retry, and it is idempotent.
+    Two callers, one message. A **rotation** passes the new key and its
+    tracker, and a node that refuses or times out is left pending and
+    named — there is deliberately no retry loop, because a rotation that
+    quietly retried for an hour would report `distributing` while an
+    operator waited for a verdict, and the verdict they need is "these
+    three hosts are stale". Re-running the rotation is the retry, and it
+    is idempotent. A **promotion** passes the unchanged key and the new
+    epoch with no tracker: the node records the epoch and restarts
+    nothing.
+
+    The body is signed with the control identity, not authenticated by
+    a bearer — `sealing.sign_rekey` says why — and the service token is
+    still sent because the agent ignores it on this one route and every
+    other call this client makes needs it.
     """
     machine: StateMachine = request.app.state.machine
-    tracker: RotationTracker = request.app.state.rotation
     auth: AuthState = request.app.state.auth_state
     client = request.app.state.nodes_client
 
     from .nodes import node_service_token
 
+    private = auth.control_private_key
+    if private is None:  # pragma: no cover - both callers check first
+        if tracker is not None:
+            tracker.fail("control identity key not in memory; the re-key cannot be signed")
+        return
+
+    message = sealing.rekey_message(signing_key=key_b64, signing_key_id=key_id, epoch=epoch)
+    body = {
+        "signingKey": key_b64,
+        "signingKeyId": key_id,
+        "epoch": epoch,
+        "signature": sealing.sign_rekey(private, message),
+    }
     token = node_service_token(auth)
-    key_b64 = base64.b64encode(new_key).decode("ascii")
 
     for record in list(machine.state.nodes.values()):
         if not record.url:
             continue
         try:
-            await client.post_json(
-                record.url,
-                "/v1/node/rekey",
-                token,
-                {"signingKey": key_b64, "signingKeyId": key_id, "epoch": machine.state.epoch},
-            )
-            tracker.rekeyed(record.name)
+            await client.post_json(record.url, "/v1/node/rekey", token, body)
         except (httpx.HTTPError, ValueError) as exc:
             log.warning(
-                "node %s was not re-keyed (%s); it holds the previous key and will be "
-                "refused until it reconnects",
+                "node %s did not take %s (%s); it will be told again by the next rotation "
+                "or announcement that reaches it",
                 record.name,
+                f"signing key generation {key_id}" if tracker is not None else f"epoch {epoch}",
                 exc,
             )
-    tracker.finish()
+            continue
+        if tracker is not None:
+            tracker.rekeyed(record.name)
+        else:
+            log.info("node %s acknowledged epoch %d", record.name, epoch)
+    if tracker is not None:
+        tracker.finish()
 
 
 # --------------------------------------------------------------------------- #

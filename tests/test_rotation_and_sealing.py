@@ -19,13 +19,17 @@ from typing import Any
 
 import pytest
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.testclient import TestClient
 
 from eugene_plexus_control import sealing
+from eugene_plexus_control.app import create_app
 from eugene_plexus_control.applied import NodeRecord
 from eugene_plexus_control.rotation import RotationTracker
 from eugene_plexus_control.sealing import SealError
+from eugene_plexus_control.state_machine import StateMachine
+
+from .conftest import PASSPHRASE, login, settings_for, standby_at
 
 # --------------------------------------------------------------------------- #
 # Rotation
@@ -33,11 +37,28 @@ from eugene_plexus_control.sealing import SealError
 
 
 def _rekeyable_agent() -> tuple[FastAPI, list[dict[str, Any]]]:
+    """A fake agent that does what a real one does with a re-key: verify
+    the signature against the control identity it recorded at
+    enrollment, and refuse anything else with 401. A fake that recorded
+    whatever arrived is how the unsigned re-key survived M5 — the real
+    agent would have refused every rotation the control root ever sent."""
     received: list[dict[str, Any]] = []
     app = FastAPI()
+    app.state.control_public_key = None
 
     @app.post("/v1/node/rekey")
-    async def rekey(body: dict[str, Any]) -> dict[str, str]:
+    async def rekey(body: dict[str, Any], response: Response) -> dict[str, str]:
+        expected = app.state.control_public_key
+        message = sealing.rekey_message(
+            signing_key=body["signingKey"],
+            signing_key_id=body["signingKeyId"],
+            epoch=body["epoch"],
+        )
+        if expected is None or not sealing.verify_rekey(
+            expected, message, body.get("signature", "")
+        ):
+            response.status_code = 401
+            return {"detail": "signature rejected"}
         received.append(body)
         return {"ok": "true"}
 
@@ -50,6 +71,7 @@ def _rekeyable_agent() -> tuple[FastAPI, list[dict[str, Any]]]:
 
 class _Server:
     def __init__(self, app: FastAPI) -> None:
+        self.app = app
         config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
         self.server = uvicorn.Server(config)
         self.thread = threading.Thread(target=self.server.run, daemon=True)
@@ -78,26 +100,24 @@ def rekeyable() -> Iterator[tuple[_Server, list[dict[str, Any]]]]:
 
 
 def _enroll(client: TestClient, name: str, url: str) -> None:
+    """Enroll through the API, URL included — the path a real agent takes
+    from M7. Until then this helper appended a second `enrollNode` entry
+    by hand to give the node an address the exchange never carried."""
     token = client.post("/v1/nodes/join-token").json()["token"]
     public = base64.b64encode(name.encode().ljust(32, b"0")).decode()
-    assert (
-        client.post(
-            "/v1/nodes/enroll", json={"token": token, "name": name, "publicKey": public}
-        ).status_code
-        == 201
+    response = client.post(
+        "/v1/nodes/enroll",
+        json={"token": token, "name": name, "publicKey": public, "url": url},
     )
+    assert response.status_code == 201, response.text
+
+
+def _trust(server: _Server, client: TestClient) -> None:
+    """Tell the fake agent which control identity to verify re-keys
+    against — what a real agent records at enrollment as
+    `controlPublicKey`."""
     machine = client.app.state.machine  # type: ignore[attr-defined]
-    record = machine.state.nodes[name]
-    machine.append(
-        "enrollNode",
-        {
-            "name": name,
-            "role": record.role,
-            "url": url,
-            "publicKey": record.publicKey,
-            "enrolledAt": record.enrolledAt,
-        },
-    )
+    server.app.state.control_public_key = machine.state.identity.controlPublicKey
 
 
 def test_rotation_mints_logs_and_redistributes_in_that_order(
@@ -111,6 +131,7 @@ def test_rotation_mints_logs_and_redistributes_in_that_order(
     knows about, which nothing fixes.
     """
     server, received = rekeyable
+    _trust(server, active_client)
     _enroll(active_client, "gpu-box", server.url)
     machine = active_client.app.state.machine  # type: ignore[attr-defined]
 
@@ -134,8 +155,24 @@ def test_rotation_mints_logs_and_redistributes_in_that_order(
 
     _await_rotation(active_client)
     progress = active_client.get("/v1/control/rotate-key").json()
-    assert progress["state"] in ("distributing", "done")
+    assert progress["state"] == "done", progress
     assert received and base64.b64decode(received[0]["signingKey"]) == auth.signing_key
+
+    # The re-key the node took was signed by the control identity — the
+    # fake refused anything else with 401, so `done` is the proof — and
+    # carries the generation and the epoch the node fences on.
+    assert received[0]["signingKeyId"] == machine.state.identity.signingKeyId
+    assert received[0]["epoch"] == machine.state.epoch
+    message = sealing.rekey_message(
+        signing_key=received[0]["signingKey"],
+        signing_key_id=received[0]["signingKeyId"],
+        epoch=received[0]["epoch"],
+    )
+    assert sealing.verify_rekey(
+        machine.state.identity.controlPublicKey, message, received[0]["signature"]
+    )
+    impostor = sealing.generate_control_identity()
+    assert not sealing.verify_rekey(impostor.public, message, received[0]["signature"])
 
 
 def test_a_node_that_is_down_during_a_rotation_is_named_not_hidden(
@@ -149,6 +186,7 @@ def test_a_node_that_is_down_during_a_rotation_is_named_not_hidden(
     them the install is consistent when it is not.
     """
     server, _ = rekeyable
+    _trust(server, active_client)
     _enroll(active_client, "gpu-box", server.url)
     _enroll(active_client, "attic", "http://127.0.0.1:1")
     _enroll(active_client, "shed", server.url)
@@ -165,6 +203,85 @@ def test_a_node_that_is_down_during_a_rotation_is_named_not_hidden(
     assert final.nodes_pending == ("attic",)
     assert final.error is not None and "attic" in final.error
     assert "re-keyed on reconnect" in final.error
+
+
+def test_a_node_that_does_not_trust_this_root_is_named_stale(
+    active_client: TestClient, rekeyable: tuple[_Server, list[dict[str, Any]]]
+) -> None:
+    """The other half of the signature: a node enrolled with a *different*
+    root refuses this one's re-key, and the rotation says so rather than
+    calling the install consistent."""
+    server, received = rekeyable
+    server.app.state.control_public_key = sealing.generate_control_identity().public
+    _enroll(active_client, "gpu-box", server.url)
+
+    assert active_client.post("/v1/control/rotate-key").status_code == 202
+    _relogin(active_client)
+    _await_rotation(active_client)
+    tracker: RotationTracker = active_client.app.state.rotation  # type: ignore[attr-defined]
+    final = tracker.current
+    assert final is not None
+    assert final.state == "failed"
+    assert final.nodes_pending == ("gpu-box",)
+    assert received == []
+
+
+def _replicate(active: StateMachine, standby_dir: Any) -> StateMachine:
+    standby = standby_at(standby_dir)
+    standby.install_snapshot(active.snapshot_document())
+    for entry in active.read_page(standby.state.index, 10_000):
+        standby.accept_replicated(entry)
+    return standby
+
+
+def test_promotion_announces_the_new_epoch_to_every_node(
+    tmp_path: Any, rekeyable: tuple[_Server, list[dict[str, Any]]]
+) -> None:
+    """M5 §9 said agents learn the new epoch "on their next contact". This
+    is the contact: the promoted root sends every node the same signed
+    message a rotation would, with the signing key UNCHANGED and the new
+    epoch, so the node records the generation and restarts nothing. The
+    identity that signs it is the one promotion preserved — a promoted
+    standby with a fresh keypair would be refused by every node it tried
+    to command, which is the fencing mechanism firing at the wrong target."""
+    import time
+
+    server, received = rekeyable
+    active_app = create_app(settings_for(tmp_path / "active"))
+    with TestClient(active_app) as active:
+        assert (
+            active.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
+        )
+        active.headers["Authorization"] = f"Bearer {login(active)}"
+        _trust(server, active)
+        _enroll(active, "gpu-box", server.url)
+        active_machine: StateMachine = active_app.state.machine
+        key_before = active_app.state.auth_state.signing_key
+        epoch_before = active_machine.state.epoch
+        _replicate(active_machine, tmp_path / "standby" / "state")
+
+    standby_app = create_app(settings_for(tmp_path / "standby", role="standby"))
+    with TestClient(standby_app) as standby:
+        token = standby.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        promoted = standby.post(
+            "/v1/control/promote", json={"passphrase": PASSPHRASE}, headers=headers
+        )
+        assert promoted.status_code == 200, promoted.text
+        assert promoted.json()["epoch"] == epoch_before + 1
+
+        deadline = time.time() + 20
+        while not received and time.time() < deadline:
+            standby.get("/healthz")
+            time.sleep(0.05)
+
+    assert received, "the promoted root never announced its epoch"
+    announcement = received[-1]
+    assert announcement["epoch"] == epoch_before + 1
+    assert base64.b64decode(announcement["signingKey"]) == key_before, (
+        "a promotion changes the epoch, never the key"
+    )
+    assert announcement["signingKeyId"] == "1"
 
 
 def test_two_concurrent_rotations_are_refused(active_client: TestClient) -> None:

@@ -38,6 +38,7 @@ from ..applied import (
     OP_ENROLL_NODE,
     OP_REVOKE_NODE,
     NodeRecord,
+    normalize_url,
 )
 from ..auth_state import AuthState
 from ..dependencies import problem, require_authorized, require_operator
@@ -175,6 +176,16 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
     exchange it receives the install's signing key — **the thing a
     single-watchdog install could not give it**, because a driver
     spawned on one host used to reject a gateway's token from another.
+
+    The `url` it sends is recorded as `Node.url`, where this root probes
+    it, forwards declarations to it, and where a gateway sends a stop or
+    start for a runtime it owns. Recorded verbatim (normalized once, on
+    the way into the log, as every URL is): the agent knows which
+    interface it used to reach this root, and a root deriving it from the
+    request's source address would be right on a flat mesh network and
+    wrong behind anything else. M7 — before it, every really-enrolled
+    node had no address and the tests were appending a second
+    `enrollNode` entry by hand.
     """
     machine: StateMachine = request.app.state.machine
     auth: AuthState = request.app.state.auth_state
@@ -217,6 +228,7 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         "name": body.name,
         "role": "agent",
         "publicKey": body.publicKey,
+        "url": normalize_url(str(body.url)) if body.url else None,
         "agentVersion": body.agentVersion,
         "os": body.os.value if body.os else None,
         "arch": body.arch.value if body.arch else None,
@@ -237,6 +249,7 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         name=body.name,
         epoch=machine.state.epoch,
         signingKey=base64.b64encode(auth.signing_key).decode("ascii"),
+        signingKeyId=identity.signingKeyId,
         controlPublicKey=identity.controlPublicKey,
         recoveryPublicKey=recovery_public,
     )

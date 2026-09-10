@@ -182,6 +182,46 @@ def public_from_private(private_b64: str) -> str:
     return base64.b64encode(bytes(_load_private(private_b64).public_key)).decode("ascii")
 
 
+def rekey_message(*, signing_key: str, signing_key_id: str, epoch: int) -> bytes:
+    """The canonical bytes a re-key is signed over — `RekeyRequest.signature`
+    in `agent.yaml`, byte for byte: the JSON object with keys sorted and no
+    whitespace. Three fields, one serializer, stated in the contract so the
+    agent implements it from the same sentence."""
+    return json.dumps(
+        {"epoch": epoch, "signingKey": signing_key, "signingKeyId": signing_key_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def sign_rekey(control_private_key: str, message: bytes) -> str:
+    """Detached Ed25519 signature by the control identity, base64.
+
+    Why a signature and not a bearer: a rotation invalidates every service
+    token in the install, including any this root could present, and a
+    re-run of an interrupted rotation cannot know which key each node
+    still holds. The identity key does not rotate, which is what makes it
+    the one credential that survives the operation — and it is what nodes
+    recorded `controlPublicKey` at enrollment for."""
+    try:
+        seed = base64.b64decode(control_private_key, validate=True)
+        signing = nacl.signing.SigningKey(seed)
+    except Exception as exc:
+        raise SealError(f"control identity key is malformed: {exc}") from exc
+    return base64.b64encode(signing.sign(message).signature).decode("ascii")
+
+
+def verify_rekey(control_public_key: str, message: bytes, signature: str) -> bool:
+    """The agent's side, kept here so the fake agents in this repo's tests
+    verify exactly what a real one does."""
+    try:
+        verify_key = nacl.signing.VerifyKey(base64.b64decode(control_public_key, validate=True))
+        verify_key.verify(message, base64.b64decode(signature, validate=True))
+    except Exception:
+        return False
+    return True
+
+
 def node_recipient_label(node_name: str) -> str:
     return f"{RECIPIENT_NODE_PREFIX}{node_name}"
 
