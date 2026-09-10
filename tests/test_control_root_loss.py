@@ -240,7 +240,9 @@ def test_a_replicating_standby_is_promotable_from_the_passphrase_alone(tmp_path:
         # A standby is loggable-into, using the replicated verifier and
         # salt. It has to be: deciding whether to promote means reading
         # `GET /v1/control/status` first, and that needs a token.
-        token = standby.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+        token = standby.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
         headers = {"Authorization": f"Bearer {token}"}
 
         readable = standby.get("/v1/control/status", headers=headers)
@@ -299,7 +301,9 @@ def test_the_active_root_refuses_to_promote_itself(tmp_path: Path) -> None:
         assert (
             client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
         )
-        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
         response = client.post(
             "/v1/control/promote",
             json={"passphrase": PASSPHRASE},

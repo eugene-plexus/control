@@ -116,7 +116,9 @@ def test_config_survives_a_restart_through_the_log(tmp_path: Path) -> None:
         assert (
             client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
         )
-        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
         client.patch(
             "/v1/config",
             json={"uiTheme": "dark", "joinTokenTtlSeconds": 60},
@@ -143,7 +145,9 @@ def test_the_bootstrap_cache_is_written_through(tmp_path: Path) -> None:
         assert (
             client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
         )
-        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
         client.patch(
             "/v1/config", json={"logLevel": "DEBUG"}, headers={"Authorization": f"Bearer {token}"}
         )
@@ -184,7 +188,9 @@ def test_safe_mode_ignores_config_but_not_the_log(tmp_path: Path) -> None:
         assert (
             client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
         )
-        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
         client.patch(
             "/v1/config", json={"uiTheme": "dark"}, headers={"Authorization": f"Bearer {token}"}
         )

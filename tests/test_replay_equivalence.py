@@ -220,7 +220,9 @@ def test_standby_matches_active_after_pulling_the_log_over_http(tmp_path: Path) 
         assert (
             active.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
         )
-        token = active.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+        token = active.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
         headers = {"Authorization": f"Bearer {token}"}
 
         machine: StateMachine = active_app.state.machine
@@ -255,7 +257,9 @@ def test_the_snapshot_document_is_the_bytes_that_are_compared(tmp_path: Path) ->
         assert (
             client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
         )
-        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
         machine: StateMachine = app.state.machine
         _write_history(machine)
 

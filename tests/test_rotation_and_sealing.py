@@ -262,7 +262,9 @@ def test_promotion_announces_the_new_epoch_to_every_node(
 
     standby_app = create_app(settings_for(tmp_path / "standby", role="standby"))
     with TestClient(standby_app) as standby:
-        token = standby.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+        token = standby.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
         headers = {"Authorization": f"Bearer {token}"}
         promoted = standby.post(
             "/v1/control/promote", json={"passphrase": PASSPHRASE}, headers=headers
@@ -315,7 +317,7 @@ def _relogin(client: TestClient) -> None:
     """
     from .conftest import PASSPHRASE
 
-    token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+    token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["sessionToken"]
     client.headers["Authorization"] = f"Bearer {token}"
 
 

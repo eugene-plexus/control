@@ -32,7 +32,7 @@ def _active(tmp_path: Path) -> tuple[TestClient, dict[str, str]]:
     client = TestClient(app)
     client.__enter__()
     assert client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
-    token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+    token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["sessionToken"]
     machine: StateMachine = app.state.machine
     _write_history(machine)
     # The shared history ends with a revocation, which correctly

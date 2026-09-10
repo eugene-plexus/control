@@ -68,7 +68,11 @@ def uninitialized_client(tmp_path: Path) -> Iterator[TestClient]:
 def login(client: TestClient, passphrase: str = PASSPHRASE) -> str:
     response = client.post("/v1/auth/login", json={"passphrase": passphrase})
     assert response.status_code == 200, response.text
-    return str(response.json()["token"])
+    # `sessionToken`, from common.yaml's shared AuthLoginResponse - the
+    # same field the agent returns. This used to be `token`, from a local
+    # duplicate schema. `/v1/nodes/join-token` still returns `token`; it
+    # is a JoinToken and a different thing.
+    return str(response.json()["sessionToken"])
 
 
 def machine_at(directory: Path, *, role: str = ROLE_ACTIVE) -> StateMachine:

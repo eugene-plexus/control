@@ -92,7 +92,9 @@ def test_a_restart_is_not_a_re_key(tmp_path: Path) -> None:
         )
         first_key = app.state.auth_state.signing_key
         assert first_key is not None
-        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
 
     restarted = create_app(settings_for(directory))
     with TestClient(restarted) as client:
@@ -151,7 +153,9 @@ def test_logout_revokes_only_the_presented_token(active_client: TestClient) -> N
     assert active_client.delete("/v1/auth/sessions/current").status_code == 204
     assert active_client.get("/v1/nodes").status_code == 401
 
-    fresh = active_client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+    fresh = active_client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+        "sessionToken"
+    ]
     assert fresh != token
     assert (
         active_client.get("/v1/nodes", headers={"Authorization": f"Bearer {fresh}"}).status_code

@@ -815,11 +815,6 @@ class AuthInitializeRequest(BaseModel):
     )
 
 
-class SessionToken(BaseModel):
-    token: str
-    expiresAt: AwareDatetime | None = None
-
-
 class ComputeDevice(BaseModel):
     """
     One compute device on one host, as that host's agent detected it.

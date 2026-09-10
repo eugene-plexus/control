@@ -82,7 +82,9 @@ def live_active(tmp_path: Path) -> Iterator[tuple[_LiveServer, StateMachine, str
         assert (
             client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
         )
-        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["token"]
+        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
         client.close()
         yield server, app.state.machine, token
 

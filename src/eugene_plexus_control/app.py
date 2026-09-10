@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
-from . import __version__
+from . import __version__, keyring_store
 from . import config as config_module
 from .applied import normalize_url
 from .auth_state import AuthState
@@ -86,6 +86,23 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not hasattr(app.state, "auth_state"):
         app.state.auth_state = AuthState()
 
+    # OS keyring auto-unlock, when the operator opted in. Without it a
+    # trust root comes back from a restart holding its keys sealed and
+    # locked - correct, and also an install that cannot recover from a
+    # power cut without a person present, which is what this field
+    # promises.
+    #
+    # Safe mode skips it deliberately: safe mode exists to get a broken
+    # config back to an endpoint, and a hanging keyring backend is one
+    # more thing between the operator and that.
+    if (
+        not settings.safe_mode
+        and machine.state.identity.salt is not None
+        and not app.state.auth_state.has_master_key()
+        and config_module.effective(machine.state.config)["securityMode"] == "os_keyring"
+    ):
+        _auto_unlock(app, machine)
+
     app.state.join_tokens = JoinTokenStore()
     app.state.rotation = RotationTracker()
     app.state.node_probes = {}
@@ -133,6 +150,47 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             with suppress(asyncio.CancelledError, Exception):
                 await app.state.node_poller
         await app.state.nodes_client.aclose()
+
+
+def _auto_unlock(app: FastAPI, machine: StateMachine) -> None:
+    """Recover the master key from the OS keyring and open the sealed values.
+
+    Never fatal. A trust root that refused to start because a keyring
+    backend was locked would be worse than one that asks for the
+    passphrase - the passphrase path is exactly the behaviour with this
+    field unset, so every failure here degrades to it.
+
+    A stored key that does not open the sealed values is reported and
+    then discarded. The keyring entry outlives the install directory, so
+    a state wipe and re-initialize under a different passphrase - any
+    fresh test install - leaves an entry that derives to nothing. A
+    secret whose failure mode is "auto-unlock appeared to work" is worse
+    than no secret.
+    """
+    stored = keyring_store.get_master_key()
+    if stored is None:
+        log.warning(
+            "securityMode is os_keyring but no key was retrievable from the OS keyring; "
+            "this root is locked until POST /v1/auth/login. Logging in stores the key, "
+            "so the next restart should auto-unlock."
+        )
+        return
+    try:
+        auth_routes.unseal_with_master_key(app.state.auth_state, machine, stored)
+    except Exception as exc:
+        # Includes the HTTPException that `unseal_with_master_key`
+        # raises for an unreadable signing key. At startup that is not
+        # an HTTP concern, it is a locked root.
+        app.state.auth_state.forget_master_key()
+        keyring_store.delete_master_key()
+        log.error(
+            "the key stored in the OS keyring did not open this install's sealed values "
+            "(%s). The stored key has been discarded; log in with the passphrase. This is "
+            "what a passphrase rotation since the key was stored looks like.",
+            exc,
+        )
+        return
+    log.info("master key recovered from the OS keyring; this root is unlocked")
 
 
 async def _poll_nodes(app: FastAPI) -> None:

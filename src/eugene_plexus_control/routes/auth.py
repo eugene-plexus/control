@@ -32,11 +32,12 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from .. import sealing, security
+from .. import config as config_module
+from .. import keyring_store, sealing, security
 from .._generated.models import (
     AuthInitializeRequest,
+    AuthLoginResponse,
     AuthStatus,
-    SessionToken,
 )
 from ..auth_state import AuthState
 from ..dependencies import problem, require_operator
@@ -135,8 +136,8 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
     )
 
 
-@router.post("/v1/auth/login", response_model=SessionToken)
-async def login(request: Request, body: AuthInitializeRequest) -> SessionToken:
+@router.post("/v1/auth/login", response_model=AuthLoginResponse)
+async def login(request: Request, body: AuthInitializeRequest) -> AuthLoginResponse:
     """Verify the passphrase, unseal the keys, issue a session token.
 
     Unsealing on login is what makes a restart not a re-key: the signing
@@ -187,8 +188,26 @@ async def login(request: Request, body: AuthInitializeRequest) -> SessionToken:
     unseal_into(auth, machine, passphrase)
 
     token, expires = security.issue_operator_token(signing_key=_require_signing_key(auth))
+
+    # Persist for auto-unlock if the operator asked for it. Here rather
+    # than only on the config flip, because the flip can happen while
+    # the root is locked (there is nothing to store yet) - both paths
+    # converge on "the next restart auto-recovers".
+    if config_module.effective(machine.state.config)["securityMode"] == "os_keyring":
+        if auth.master_key is not None and keyring_store.set_master_key(auth.master_key):
+            log.info("master key persisted to the OS keyring for auto-unlock")
+        else:
+            log.warning(
+                "securityMode is os_keyring but the master key could not be stored; "
+                "this root will ask for the passphrase again after a restart"
+            )
+
     log.info("operator login from %s", remote)
-    return SessionToken(token=token, expiresAt=datetime.fromtimestamp(expires, tz=UTC))
+    return AuthLoginResponse(
+        sessionToken=token,
+        expiresAt=datetime.fromtimestamp(expires, tz=UTC),
+        operatorName="operator",
+    )
 
 
 @router.delete("/v1/auth/sessions/current", status_code=204)
@@ -236,6 +255,20 @@ def unseal_into(auth: AuthState, machine: StateMachine, passphrase: str) -> None
         )
 
     master_key = security.derive_master_key(passphrase, _b64.b64decode(identity.salt))
+    unseal_with_master_key(auth, machine, master_key)
+
+
+def unseal_with_master_key(auth: AuthState, machine: StateMachine, master_key: bytes) -> None:
+    """The half of `unseal_into` after the key is derived.
+
+    Split out for OS keyring auto-unlock, which holds the derived master
+    key and never sees the passphrase. One place opens the sealed values
+    either way, so the "a sealed value that will not open is reported
+    loudly" rule cannot drift between the two entry points.
+    """
+    import base64 as _b64
+
+    identity = machine.state.identity
     auth.set_master_key(master_key)
 
     if identity.sealedSigningKey is not None:
