@@ -624,6 +624,40 @@ class JoinToken(BaseModel):
     )
 
 
+class NodeAddressAnnouncement(BaseModel):
+    """
+    A node telling this root where it now is. Signed by the node, not
+    bearer-authenticated — see `PATCH /v1/nodes/{name}`.
+
+    """
+
+    url: AnyUrl = Field(
+        ...,
+        description="Where other hosts now reach this node's agent. Becomes\n`Node.url`, normalized once on the way into the log exactly\nas enrollment's is.\n",
+    )
+    sequence: int = Field(
+        ...,
+        description='Strictly increasing per node, persisted on the node. This\nroot refuses anything at or below `Node.advertiseSequence`,\nwhich is what stops a captured announcement being replayed to\npin a node to an address it has left.\n',
+        ge=1,
+    )
+    signature: str = Field(
+        ...,
+        description='Detached Ed25519 signature, base64, by the node\'s identity\nsigning key over the **canonical message**: the UTF-8 bytes\nof the JSON object `{"name": "<name>", "sequence":\n<sequence>, "url": "<url>"}` with keys sorted and no\nwhitespace — `json.dumps(obj, sort_keys=True,\nseparators=(",", ":"))`. `name` is the path parameter and\n`url` is the value in this body, verbatim and unnormalized.\n\nSame construction as `RekeyRequest.signature` in\n`agent.yaml`, deliberately: three fields, one serializer,\nstated here so both sides implement it from one sentence.\nIncluding `name` is what stops one node\'s announcement being\nreplayed against another\'s record.\n\n**Verified against the raw request body, never against a\nparsed `url`.** An OpenAPI `format: uri` becomes a URL type\nin most generators, and those normalize — Pydantic\'s\n`AnyUrl` appends a trailing slash to an authority-only URL —\nso a verifier that parses first compares different bytes\nfrom the ones the node signed, and *every* announcement\nfails with what looks like a crypto error. Found by it\nhappening. A signature is over bytes on the wire; `format:\nuri` stays here because the validation and the generated\nclients are still worth having.\n',
+    )
+
+
+class NodeAddressAck(BaseModel):
+    name: str
+    url: AnyUrl = Field(
+        ..., description='The address now recorded, after normalization.'
+    )
+    sequence: int = Field(..., description='The sequence now recorded.')
+    changed: bool = Field(
+        ...,
+        description='False when the announcement matched what was already\nrecorded, which is the common case on a restart. Nothing was\nappended to the log.\n',
+    )
+
+
 class Enrollment(BaseModel):
     """
     What a newly enrolled node needs in order to participate, and
@@ -673,9 +707,22 @@ class LogOp(StrEnum):
     an operation that is not in this list is an operation that would
     not replicate. Adding a mutation means adding an op here.
 
+    **`updateNode` is the tenth, added at M9**, and it is worth
+    saying why the set opened. M5 closed it at nine and the rule that
+    closed it was about what does *not* belong: minting a join token
+    and initializing the install are not replicated state, so they
+    got no op. An address change is the opposite case — it mutates
+    `Node.url`, which lives in the snapshot, and by this schema's own
+    sentence something that mutates applied state and has no op is
+    something that would not replicate. Reusing `enrollNode` as an
+    upsert would have worked and been worse: the log is read by
+    operators, and a node that moved house would appear to have
+    enrolled again.
+
     """
 
     enrollNode = 'enrollNode'
+    updateNode = 'updateNode'
     revokeNode = 'revokeNode'
     putComponent = 'putComponent'
     deleteComponent = 'deleteComponent'
@@ -946,6 +993,10 @@ class EnrollmentRequest(BaseModel):
         ...,
         description="The agent's identity public key. The private half stays on\nthe node; sending it would defeat the point of per-node\nsealing.\n",
     )
+    signingPublicKey: str | None = Field(
+        None,
+        description="The agent's Ed25519 public key, recorded as\n`Node.signingPublicKey` and used to verify later address\nannouncements. Optional so an older agent still enrolls; the\ncost of omitting it is that the node cannot re-advertise.\n",
+    )
     url: AnyUrl | None = Field(
         None,
         description="Where other hosts reach this agent — its `advertiseUrl`,\nconfigured or derived (`agent.yaml`, `GET /v1/node`). Becomes\n`Node.url`. The agent sends it because the agent knows which\ninterface it used to reach this root; a root deriving it from\nthe request's source address would be right on a flat mesh\nnetwork and wrong behind anything else.\n",
@@ -1054,6 +1105,15 @@ class Node(BaseModel):
         None,
         description="The node's identity public key, generated at enrollment. The\nprivate half never leaves the node, which is what makes\nper-node sealing meaningful: a secret sealed to this key can\nbe read by this host and by the recovery recipient, and by\nnothing else.\n",
     )
+    signingPublicKey: str | None = Field(
+        None,
+        description="The node's **Ed25519** public key, used for one thing: to\nverify that a `PATCH /v1/nodes/{name}` really came from this\nnode. `publicKey` cannot do it — that one is X25519 and\nexists so secrets can be sealed to the node — and a key that\nboth seals and signs is a key whose compromise costs twice.\n\nAbsent on a node enrolled before nodes had a signing\nidentity. Such a node cannot re-advertise and must re-enroll;\nsurfaced here rather than inferred from a 401.\n",
+    )
+    advertiseSequence: int | None = Field(
+        None,
+        description='The highest announcement sequence accepted from this node. A\n`PATCH /v1/nodes/{name}` at or below it is a replay and is\nrefused. Applied state, so a promoted standby refuses the\nsame replays this root would.\n',
+        ge=0,
+    )
     lastSeenEpoch: int | None = Field(
         None,
         description='The highest control-root epoch this node has acknowledged. A\nvalue below `ControlStatus.epoch` is the visible symptom of a\nnode that was partitioned during a promotion — bounded,\nself-healing, and deliberately surfaced rather than hidden.\n',
@@ -1095,8 +1155,8 @@ class Snapshot(BaseModel):
 
     **The governing rule, learned by implementing it:** a snapshot
     has to be able to reproduce exactly what the log produces,
-    because it *is* the log's compacted head. Every one of the nine
-    `LogOp` values must have somewhere to land here, or compaction
+    because it *is* the log's compacted head. **Every** `LogOp` value
+    must have somewhere to land here, or compaction
     silently discards the state that op wrote — and the loss shows
     up at a promotion rather than at the compaction. Adding an op
     means checking this schema can hold its effect.
@@ -1120,7 +1180,7 @@ class Snapshot(BaseModel):
     )
     config: dict[str, Any] | None = Field(
         None,
-        description="The control root's own applied configuration.\n\nReplicated because `patchConfig` is one of the nine ops, so\nconfig *is* control state — and a snapshot that dropped it\nwould lose every config change made before the last\ncompaction. A promoted standby that came up without\n`standbyUrls` would silently have no standbys of its own,\nwhich is the failure mode where the second failover is the\none that hurts.\n",
+        description="The control root's own applied configuration.\n\nReplicated because `patchConfig` is one of the ops, so\nconfig *is* control state — and a snapshot that dropped it\nwould lose every config change made before the last\ncompaction. A promoted standby that came up without\n`standbyUrls` would silently have no standbys of its own,\nwhich is the failure mode where the second failover is the\none that hurts.\n",
     )
     signingKeyId: str | None = Field(
         None,

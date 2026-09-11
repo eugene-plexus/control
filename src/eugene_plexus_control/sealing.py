@@ -222,6 +222,52 @@ def verify_rekey(control_public_key: str, message: bytes, signature: str) -> boo
     return True
 
 
+def address_message(*, name: str, sequence: int, url: str) -> bytes:
+    """The canonical bytes an address announcement is signed over —
+    `NodeAddressAnnouncement.signature` in `control.yaml`, byte for byte.
+
+    The mirror of `rekey_message`, in the other direction: three fields,
+    keys sorted, no whitespace. `name` is in there so one node's
+    announcement cannot be replayed against another node's record, and
+    `url` is the value exactly as sent, before this root normalizes it —
+    normalizing first would mean the two ends sign different bytes.
+    """
+    return json.dumps(
+        {"name": name, "sequence": sequence, "url": url},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def sign_address(node_private_key: str, message: bytes) -> str:
+    """The node's side, kept here so this repo's tests sign exactly what a
+    real agent signs — the same reason `verify_rekey` lives here."""
+    try:
+        seed = base64.b64decode(node_private_key, validate=True)
+        signing = nacl.signing.SigningKey(seed)
+    except Exception as exc:
+        raise SealError(f"node signing key is malformed: {exc}") from exc
+    return base64.b64encode(signing.sign(message).signature).decode("ascii")
+
+
+def verify_address(node_signing_public_key: str, message: bytes, signature: str) -> bool:
+    """True iff the node whose Ed25519 public half this is signed it.
+
+    Every malformed input is simply False: this root has exactly one
+    answer for "not from the node it claims to be", and distinguishing
+    "bad base64" from "wrong key" in the response would only tell a
+    caller which half of its forgery to fix.
+    """
+    try:
+        verify_key = nacl.signing.VerifyKey(
+            base64.b64decode(node_signing_public_key, validate=True)
+        )
+        verify_key.verify(message, base64.b64decode(signature, validate=True))
+    except Exception:
+        return False
+    return True
+
+
 def node_recipient_label(node_name: str) -> str:
     return f"{RECIPIENT_NODE_PREFIX}{node_name}"
 

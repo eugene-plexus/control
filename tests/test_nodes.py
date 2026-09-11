@@ -205,3 +205,226 @@ def test_re_enrolling_the_same_name_replaces_rather_than_conflicts(
     nodes = active_client.app.state.machine.state.nodes  # type: ignore[attr-defined]
     assert len(nodes) == 1
     assert nodes["gpu-box"].publicKey == replacement
+
+
+# --------------------------------------------------------------------------- #
+# Re-advertising: a node whose address changed (M9)
+# --------------------------------------------------------------------------- #
+
+
+def _node_keypair() -> tuple[str, str]:
+    """`(private seed, public)` base64 Ed25519 — the shape an agent mints
+    for signing, alongside the X25519 pair it has sealed to."""
+    import nacl.signing
+
+    signing = nacl.signing.SigningKey.generate()
+    return (
+        base64.b64encode(bytes(signing)).decode("ascii"),
+        base64.b64encode(bytes(signing.verify_key)).decode("ascii"),
+    )
+
+
+def _announce(client: TestClient, name: str, *, url: str, sequence: int, private: str) -> object:
+    message = sealing.address_message(name=name, sequence=sequence, url=url)
+    return client.patch(
+        f"/v1/nodes/{name}",
+        json={
+            "url": url,
+            "sequence": sequence,
+            "signature": sealing.sign_address(private, message),
+        },
+    )
+
+
+def test_a_node_that_moved_can_say_so_and_the_root_records_it(
+    active_client: TestClient,
+) -> None:
+    """The M9 defect, closed.
+
+    Before this the address was announced once, at enrollment, and a host
+    that rebooted onto a new tailnet IP left the root holding an address
+    nobody was listening on — with no way back, because the only address
+    the root had was the stale one.
+    """
+    private, public = _node_keypair()
+    assert (
+        _enroll(
+            active_client,
+            _mint(active_client),
+            "gpu-box",
+            url="http://100.64.0.7:8079",
+            signingPublicKey=public,
+        ).status_code
+        == 201
+    )
+
+    response = _announce(
+        active_client, "gpu-box", url="http://100.64.0.9:8079", sequence=1, private=private
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["changed"] is True
+    assert body["url"].rstrip("/") == "http://100.64.0.9:8079"
+    assert body["sequence"] == 1
+
+    node = active_client.get("/v1/nodes/gpu-box").json()
+    assert node["url"].rstrip("/") == "http://100.64.0.9:8079"
+    assert node["advertiseSequence"] == 1
+
+
+def test_an_unchanged_announcement_writes_nothing_to_the_log(
+    active_client: TestClient,
+) -> None:
+    """The common case is a restart that announces the address it already
+    had. If that appended, every reboot of every node would grow the log
+    for no information — so it must be visibly free, not merely
+    idempotent."""
+    private, public = _node_keypair()
+    _enroll(
+        active_client,
+        _mint(active_client),
+        "gpu-box",
+        url="http://100.64.0.7:8079",
+        signingPublicKey=public,
+    )
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    before = machine.state.index
+
+    response = _announce(
+        active_client, "gpu-box", url="http://100.64.0.7:8079", sequence=1, private=private
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["changed"] is False
+    assert machine.state.index == before
+
+
+def test_an_announcement_signed_by_the_wrong_node_is_refused(
+    active_client: TestClient,
+) -> None:
+    """A service token names a *kind*, not a host, which is why this is
+    signed at all. The signature covers `name`, so one node's
+    announcement cannot be replayed against another's record."""
+    private_a, public_a = _node_keypair()
+    private_b, _public_b = _node_keypair()
+    _enroll(
+        active_client,
+        _mint(active_client),
+        "gpu-box",
+        url="http://100.64.0.7:8079",
+        signingPublicKey=public_a,
+    )
+    assert public_a  # the key the root holds for gpu-box
+
+    response = _announce(
+        active_client, "gpu-box", url="http://evil:8079", sequence=1, private=private_b
+    )
+    assert response.status_code == 401, response.text
+    assert active_client.get("/v1/nodes/gpu-box").json()["url"].rstrip("/") == (
+        "http://100.64.0.7:8079"
+    )
+    # And the right key still works, so the refusal was about the signer.
+    assert (
+        _announce(
+            active_client, "gpu-box", url="http://evil:8079", sequence=1, private=private_a
+        ).status_code
+        == 200
+    )
+
+
+def test_a_replayed_announcement_cannot_move_a_node_back(active_client: TestClient) -> None:
+    """Without the sequence, a captured announcement pins a node to an
+    address it has left — a denial of service that costs an attacker
+    nothing but a packet capture."""
+    private, public = _node_keypair()
+    _enroll(
+        active_client,
+        _mint(active_client),
+        "gpu-box",
+        url="http://100.64.0.7:8079",
+        signingPublicKey=public,
+    )
+    old = sealing.address_message(name="gpu-box", sequence=1, url="http://100.64.0.7:8079")
+    old_signature = sealing.sign_address(private, old)
+
+    assert (
+        _announce(
+            active_client, "gpu-box", url="http://100.64.0.9:8079", sequence=2, private=private
+        ).status_code
+        == 200
+    )
+
+    replay = active_client.patch(
+        "/v1/nodes/gpu-box",
+        json={
+            "url": "http://100.64.0.7:8079",
+            "sequence": 1,
+            "signature": old_signature,
+        },
+    )
+    assert replay.status_code == 409, replay.text
+    assert active_client.get("/v1/nodes/gpu-box").json()["url"].rstrip("/") == (
+        "http://100.64.0.9:8079"
+    )
+
+
+def test_a_node_enrolled_before_signing_keys_is_told_to_re_enroll(
+    active_client: TestClient,
+) -> None:
+    """`signingPublicKey` is optional on the wire so an older agent still
+    enrolls. The cost lands here, and it is named rather than left to be
+    inferred from a bare 401."""
+    private, _public = _node_keypair()
+    _enroll(active_client, _mint(active_client), "gpu-box", url="http://100.64.0.7:8079")
+    assert active_client.get("/v1/nodes/gpu-box").json().get("signingPublicKey") is None
+
+    response = _announce(
+        active_client, "gpu-box", url="http://100.64.0.9:8079", sequence=1, private=private
+    )
+    assert response.status_code == 401, response.text
+    assert "re-enroll" in response.json()["detail"]["detail"].lower()
+
+
+def test_re_enrollment_resets_the_sequence(active_client: TestClient) -> None:
+    """A rebuilt host presents a fresh identity file with its counter at
+    zero. If the root kept the old high-water mark, that host could never
+    re-advertise — so `enrollNode` replacing the record wholesale is
+    load-bearing, not incidental."""
+    private, public = _node_keypair()
+    _enroll(
+        active_client,
+        _mint(active_client),
+        "gpu-box",
+        url="http://a:8079",
+        signingPublicKey=public,
+    )
+    assert (
+        _announce(
+            active_client, "gpu-box", url="http://b:8079", sequence=7, private=private
+        ).status_code
+        == 200
+    )
+
+    private2, public2 = _node_keypair()
+    assert (
+        _enroll(
+            active_client,
+            _mint(active_client),
+            "gpu-box",
+            url="http://c:8079",
+            signingPublicKey=public2,
+        ).status_code
+        == 201
+    )
+    assert active_client.get("/v1/nodes/gpu-box").json()["advertiseSequence"] == 0
+    assert (
+        _announce(
+            active_client, "gpu-box", url="http://d:8079", sequence=1, private=private2
+        ).status_code
+        == 200
+    )
+
+
+def test_announcing_to_an_unknown_node_is_404(active_client: TestClient) -> None:
+    private, _public = _node_keypair()
+    response = _announce(active_client, "nobody", url="http://a:8079", sequence=1, private=private)
+    assert response.status_code == 404, response.text

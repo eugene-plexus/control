@@ -76,6 +76,7 @@ from typing import Any
 # of anything that could pull in a dependency with an opinion about the
 # clock — and so the apply function reads as a closed set.
 OP_ENROLL_NODE = "enrollNode"
+OP_UPDATE_NODE = "updateNode"
 OP_REVOKE_NODE = "revokeNode"
 OP_PUT_COMPONENT = "putComponent"
 OP_DELETE_COMPONENT = "deleteComponent"
@@ -88,6 +89,7 @@ OP_PROMOTE = "promote"
 ALL_OPS: frozenset[str] = frozenset(
     {
         OP_ENROLL_NODE,
+        OP_UPDATE_NODE,
         OP_REVOKE_NODE,
         OP_PUT_COMPONENT,
         OP_DELETE_COMPONENT,
@@ -150,6 +152,13 @@ class NodeRecord:
     role: str = ROLE_AGENT
     url: str | None = None
     publicKey: str | None = None
+    signingPublicKey: str | None = None
+    """Ed25519, and the only thing it is for is verifying that a
+    `PATCH /v1/nodes/{name}` came from this node. `publicKey` is X25519
+    and cannot sign. Absent on a node enrolled before M9."""
+    advertiseSequence: int = 0
+    """Highest announcement sequence accepted. Applied state, so a
+    promoted standby refuses the same replays this root would."""
     agentVersion: str | None = None
     os: str | None = None
     arch: str | None = None
@@ -365,6 +374,7 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
         role=role,
         url=_optional_str(payload, "url"),
         publicKey=_optional_str(payload, "publicKey"),
+        signingPublicKey=_optional_str(payload, "signingPublicKey"),
         agentVersion=_optional_str(payload, "agentVersion"),
         os=_optional_str(payload, "os"),
         arch=_optional_str(payload, "arch"),
@@ -376,6 +386,36 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
     # and refusing that would make "reinstall the OS on the GPU box" an
     # operation with no path through the API.
     return replace(state, nodes={**state.nodes, name: record})
+
+
+def _apply_update_node(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    """A node has moved. Only the address and the sequence change.
+
+    Deliberately narrow: this op exists because `Node.url` is applied
+    state a node must be able to change with no operator present, and
+    widening it into a general node patch would let the one credential
+    that can reach it — a signature over `{name, sequence, url}` —
+    cover fields it does not name.
+
+    The sequence is checked *here* as well as in the route, because
+    apply is the only thing a standby runs. A replay that got into the
+    log would otherwise be re-applied on every replica and on every
+    replay, which is the thing the counter exists to stop.
+    """
+    name = _require_str(payload, "name", index)
+    record = state.nodes.get(name)
+    if record is None:
+        raise ApplyError(f"entry {index}: cannot update unknown node {name!r}")
+    sequence = payload.get("sequence")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+        raise ApplyError(f"entry {index}: 'sequence' must be a positive integer, got {sequence!r}")
+    if sequence <= record.advertiseSequence:
+        raise ApplyError(
+            f"entry {index}: sequence {sequence} does not advance node {name!r} past "
+            f"{record.advertiseSequence}"
+        )
+    updated = replace(record, url=_optional_str(payload, "url"), advertiseSequence=sequence)
+    return replace(state, nodes={**state.nodes, name: updated})
 
 
 def _apply_revoke_node(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
@@ -488,6 +528,7 @@ _Handler = Callable[["AppliedState", dict[str, Any], int], "AppliedState"]
 
 _HANDLERS: dict[str, _Handler] = {
     OP_ENROLL_NODE: _apply_enroll_node,
+    OP_UPDATE_NODE: _apply_update_node,
     OP_REVOKE_NODE: _apply_revoke_node,
     OP_PUT_COMPONENT: _apply_put_component,
     OP_DELETE_COMPONENT: _apply_delete_component,
@@ -533,6 +574,8 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
                 "url": n.url,
                 "reachable": False,
                 "publicKey": n.publicKey,
+                "signingPublicKey": n.signingPublicKey,
+                "advertiseSequence": n.advertiseSequence,
                 "agentVersion": n.agentVersion,
                 "os": n.os,
                 "arch": n.arch,
@@ -602,6 +645,8 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
                 role=str(n.get("role") or ROLE_AGENT),
                 url=n.get("url"),
                 publicKey=n.get("publicKey"),
+                signingPublicKey=n.get("signingPublicKey"),
+                advertiseSequence=int(n.get("advertiseSequence") or 0),
                 agentVersion=n.get("agentVersion"),
                 os=n.get("os"),
                 arch=n.get("arch"),

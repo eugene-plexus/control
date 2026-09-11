@@ -39,6 +39,7 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_control.app import create_app
 from eugene_plexus_control.applied import (
+    ALL_OPS,
     OP_DELETE_COMPONENT,
     OP_DELETE_RUNTIME,
     OP_ENROLL_NODE,
@@ -48,6 +49,7 @@ from eugene_plexus_control.applied import (
     OP_PUT_RUNTIME,
     OP_REVOKE_NODE,
     OP_ROTATE_SIGNING_KEY,
+    OP_UPDATE_NODE,
     AppliedState,
     ApplyError,
     apply,
@@ -64,6 +66,7 @@ from .conftest import PASSPHRASE, machine_at, settings_for, standby_at
 # two that are not here are absent by design and asserted so below.
 EXERCISED_OPS = {
     OP_ENROLL_NODE,
+    OP_UPDATE_NODE,
     OP_REVOKE_NODE,
     OP_PUT_COMPONENT,
     OP_DELETE_COMPONENT,
@@ -125,6 +128,7 @@ def _write_history(machine: StateMachine) -> None:
             "role": "agent",
             "url": "http://10.0.0.7:8079",
             "publicKey": "bm9kZS1wdWJsaWMta2V5LWJ5dGVzLTMyLWxvbmc=",
+            "signingPublicKey": "bm9kZS1zaWduaW5nLXB1YmxpYy1rZXktMzItbG9uZw==",
             "agentVersion": "0.1.0",
             "os": "linux",
             "arch": "x64",
@@ -180,6 +184,12 @@ def _write_history(machine: StateMachine) -> None:
             "node": "attic",
             "spec": {"name": "small", "engine": "llama_cpp", "modelPath": "C:/m/small.gguf"},
         },
+    )
+    # The node moved house — a new tailnet IP after a reboot. Another
+    # URL with no path, so the trailing-slash normalization is exercised
+    # on the update path and not only on enrollment.
+    machine.append(
+        OP_UPDATE_NODE, {"name": "gpu-büro", "url": "http://10.0.0.11:8079/", "sequence": 3}
     )
     machine.append(OP_PATCH_CONFIG, {"values": {"uiTheme": "dark", "nodePollIntervalSeconds": 30}})
     machine.append(
@@ -389,6 +399,11 @@ def test_the_history_exercises_every_replicated_op(tmp_path: Path) -> None:
     _seed_identity(active)
     _write_history(active)
     assert _ops_in(_entries(active)) == EXERCISED_OPS
+    # **And the set above is the closed set, not a list someone keeps in
+    # step by hand.** Without this line the docstring is false: M9 added
+    # `updateNode` to `ALL_OPS` and the whole suite stayed green, because
+    # nothing compared the two. Found by doing exactly that.
+    assert set(ALL_OPS) == EXERCISED_OPS
 
 
 def test_initialization_and_join_tokens_are_not_log_ops(tmp_path: Path) -> None:

@@ -32,11 +32,14 @@ from .._generated.models import (
     JoinTokenRequest,
     KeyRotation,
     Node,
+    NodeAddressAck,
+    NodeAddressAnnouncement,
     NodeList,
 )
 from ..applied import (
     OP_ENROLL_NODE,
     OP_REVOKE_NODE,
+    OP_UPDATE_NODE,
     NodeRecord,
     normalize_url,
 )
@@ -77,6 +80,124 @@ async def get_node(request: Request, name: str) -> Node:
         )
     probes = getattr(request.app.state, "node_probes", {})
     return _to_node(record, probes.get(name))
+
+
+@router.patch("/v1/nodes/{name}", response_model=NodeAddressAck)
+async def announce_node_address(
+    request: Request, name: str, body: NodeAddressAnnouncement
+) -> NodeAddressAck:
+    """A node tells this root its address changed. **No bearer** — the
+    credential is the signature.
+
+    The mirror image of `POST /v1/node/rekey` on the agent, and the
+    symmetry is the argument: this root proves itself to a node with its
+    identity key, a node proves itself to this root with its own, and
+    neither uses a bearer because a bearer does not survive the rotation
+    that makes both operations necessary.
+
+    A service token would have been the obvious choice and cannot do the
+    job twice over — it names a *kind*, not a host, so any agent could
+    re-address any node; and it would have been the first mutation here
+    authenticated by a service credential, against a rule this module's
+    neighbours state explicitly. Operator auth is no use either: the case
+    that matters is a host that rebooted at 3am onto a new address, with
+    nobody watching.
+
+    Idempotent and deliberately silent when nothing changed: a restart
+    that announces the address it already had appends nothing, because
+    otherwise every reboot of every node grows the log for no
+    information.
+    """
+    machine: StateMachine = request.app.state.machine
+    record = machine.state.nodes.get(name)
+    if record is None:
+        raise problem(
+            status.HTTP_404_NOT_FOUND, "No such node", f"No node named {name!r} is enrolled."
+        )
+    if not record.signingPublicKey:
+        raise problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Node has no signing key",
+            f"Node {name!r} enrolled before nodes carried an Ed25519 signing identity, so "
+            f"there is nothing here to verify its announcement against. Re-enroll it; its "
+            f"model files and runtimes are untouched by that.",
+        )
+
+    # **The signed field is read from the raw body, never from `body.url`.**
+    # `AnyUrl` appends a trailing slash to an authority-only URL, so
+    # `str(body.url)` is not the string the node signed and every
+    # announcement would 401 — which is exactly M5's serializer finding
+    # ("any byte-identity claim that crosses a serializer is a claim
+    # about the serializer") arriving a second time, in a place where it
+    # reads as a crypto bug rather than a formatting one. A signature is
+    # over bytes on the wire; anything that parses first is a different
+    # claim. `format: uri` stays on the schema because the validation and
+    # the generated clients are still worth having.
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = None
+    announced_url = raw.get("url") if isinstance(raw, dict) else None
+    if not isinstance(announced_url, str):
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Malformed announcement",
+            "`url` must be present in the request body as a string.",
+        )
+    message = sealing.address_message(name=name, sequence=int(body.sequence), url=announced_url)
+    if not sealing.verify_address(record.signingPublicKey, message, body.signature):
+        log.warning("refused an address announcement for %s: signature did not verify", name)
+        raise problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Signature rejected",
+            f"The announcement is not signed by the identity node {name!r} enrolled with.",
+        )
+
+    normalized = normalize_url(announced_url)
+    if normalized == record.url:
+        # Nothing to record. Note that the sequence is deliberately NOT
+        # advanced here: it lives in applied state, and advancing it
+        # would need a log entry, which is exactly what this branch
+        # exists to avoid. A replay of this same message stays a no-op.
+        return NodeAddressAck(
+            name=name,
+            url=record.url,  # type: ignore[arg-type]
+            sequence=record.advertiseSequence,
+            changed=False,
+        )
+
+    if int(body.sequence) <= record.advertiseSequence:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "Stale announcement",
+            f"Sequence {int(body.sequence)} does not advance node {name!r} past "
+            f"{record.advertiseSequence}. Either this is a replay, or the node's identity "
+            f"file was restored from a backup — in which case re-enroll it rather than "
+            f"raising the counter here.",
+        )
+
+    try:
+        machine.append(
+            OP_UPDATE_NODE,
+            {"name": name, "url": normalized, "sequence": int(body.sequence)},
+        )
+    except NotActive as exc:
+        raise _not_active(machine) from exc
+
+    log.info(
+        "node %s re-advertised: %s -> %s (sequence %d)",
+        name,
+        record.url,
+        normalized,
+        int(body.sequence),
+    )
+    updated = machine.state.nodes[name]
+    return NodeAddressAck(
+        name=name,
+        url=updated.url,  # type: ignore[arg-type]
+        sequence=updated.advertiseSequence,
+        changed=True,
+    )
 
 
 @router.delete(
@@ -228,6 +349,7 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         "name": body.name,
         "role": "agent",
         "publicKey": body.publicKey,
+        "signingPublicKey": body.signingPublicKey,
         "url": normalize_url(str(body.url)) if body.url else None,
         "agentVersion": body.agentVersion,
         "os": body.os.value if body.os else None,
@@ -275,6 +397,8 @@ def _to_node(record: NodeRecord, probe: Any | None) -> Node:
             "role": record.role,
             "reachable": bool(probe.reachable) if probe is not None else False,
             "publicKey": record.publicKey,
+            "signingPublicKey": record.signingPublicKey,
+            "advertiseSequence": record.advertiseSequence,
             "lastSeenEpoch": probe.epoch if probe is not None else None,
             "agentVersion": (probe.agent_version if probe is not None else None)
             or record.agentVersion,
