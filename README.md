@@ -64,11 +64,18 @@ install bearer tokens; per-node sealing does not isolate signing authority.
 **M5 core and M7 integration built (2026-09-10).** Landed and tested: the single-writer ordered log, deterministic apply, snapshots and compaction, standby replication, epoch fencing, promotion, enrollment and revocation-as-rotation, two-recipient sealing, auth, config, and union topology views. M7 adds node-provided URLs, control-identity-signed rekeying and epoch announcements after promotion. All six consumers pin the M7 contracts.
 
 M5 verified inference surviving a killed control root. M7 verified enrollment and
-rotation with two agents on one host. Real two-machine partitions, an offline
-node during rotation, and clock-skew behavior remain unverified; see the
-[M7 acceptance record](https://github.com/eugene-plexus/specs/blob/main/docs/acceptance/m7-two-agent-run.md).
+rotation **on two real machines** — Windows and WSL2 Ubuntu across NAT and a host
+firewall, including a full signing-key rotation and a signed epoch-0 re-key fenced
+409 ([record](https://github.com/eugene-plexus/specs/blob/main/docs/acceptance/m7-two-host-run.md)). M9 added
+`PATCH /v1/nodes/{name}`, so a node whose address changes tells this root —
+signed with its own identity key, because a service token names a *kind* and not
+a host ([record](https://github.com/eugene-plexus/specs/blob/main/docs/acceptance/m9-onboarding-run.md)).
 
-Not here yet: serving the UI (assets remain with the agent; ownership is undecided), dedicated control-root screens, the log-shaped side of `securityMode: os_keyring` auto-unlock on a standby, recovery-from-a-dead-node as an operator flow, and wizard copy explaining keyring/HA. `POST /v1/runtimes` forwards to a node's agent; a node that is `down` during key rotation is re-keyed on reconnect.
+Still unverified: a **partitioned** rather than shut-down old root, an offline
+node during rotation, and clock-skew behaviour. The first is reachable on the
+existing pair by dropping the firewall rule mid-run and is the next experiment.
+
+Not here yet: serving the UI (assets remain with the agent; ownership is undecided), control-root screens past M9's `/nodes` (mint a join token, render the `join` command), the log-shaped side of `securityMode: os_keyring` auto-unlock on a standby, recovery-from-a-dead-node as an operator flow, and wizard copy explaining keyring/HA. `POST /v1/runtimes` forwards to a node's agent; a node that is `down` during key rotation is re-keyed on reconnect.
 
 **Explicitly out of scope, by decision and not by neglect:** Raft, quorum, automatic promotion, multi-writer control state, and migrating an existing single-host install.
 
