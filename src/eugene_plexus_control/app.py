@@ -25,10 +25,11 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
 from fastapi import FastAPI
 
-from . import __version__, keyring_store
+from . import __version__, keyring_store, passphrase_file, security
 from . import config as config_module
 from .applied import normalize_url
 from .auth_state import AuthState
@@ -86,22 +87,26 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not hasattr(app.state, "auth_state"):
         app.state.auth_state = AuthState()
 
-    # OS keyring auto-unlock, when the operator opted in. Without it a
-    # trust root comes back from a restart holding its keys sealed and
-    # locked - correct, and also an install that cannot recover from a
-    # power cut without a person present, which is what this field
-    # promises.
+    # Auto-unlock, when the operator opted into one of the two ways.
+    # Without it a trust root comes back from a restart holding its keys
+    # sealed and locked - correct, and also an install that cannot
+    # recover from a power cut without a person present, which is what
+    # these fields promise.
     #
-    # Safe mode skips it deliberately: safe mode exists to get a broken
-    # config back to an endpoint, and a hanging keyring backend is one
-    # more thing between the operator and that.
+    # Safe mode skips both deliberately: safe mode exists to get a broken
+    # config back to an endpoint, and a hanging keyring backend or a
+    # missing secret mount is one more thing between the operator and
+    # that.
     if (
         not settings.safe_mode
         and machine.state.identity.salt is not None
         and not app.state.auth_state.has_master_key()
-        and config_module.effective(machine.state.config)["securityMode"] == "os_keyring"
     ):
-        _auto_unlock(app, machine)
+        mode = config_module.effective(machine.state.config)["securityMode"]
+        if mode == "os_keyring":
+            _auto_unlock(app, machine)
+        elif mode == "passphrase_file":
+            _auto_unlock_from_file(app, machine, settings.passphrase_file)
 
     app.state.join_tokens = JoinTokenStore()
     app.state.rotation = RotationTracker()
@@ -191,6 +196,60 @@ def _auto_unlock(app: FastAPI, machine: StateMachine) -> None:
         )
         return
     log.info("master key recovered from the OS keyring; this root is unlocked")
+
+
+def _auto_unlock_from_file(app: FastAPI, machine: StateMachine, path: Path | None) -> None:
+    """Open the sealed values with a passphrase read from a mounted file.
+
+    The sibling of `_auto_unlock`, for hosts with no OS keyring — which
+    is every container, and why this exists at all. Same contract: never
+    fatal, every failure degrades to the passphrase prompt, which is the
+    behaviour with the field unset.
+
+    **Two ways it deliberately differs from the keyring path.**
+
+    It verifies the passphrase before deriving. The keyring holds a
+    derived key and can only find out it is wrong by failing to open
+    something; here the install's own verifier can say so directly, so a
+    wrong passphrase is reported as a wrong passphrase instead of as a
+    sealed value that would not open. Those call for different actions
+    and an operator reading a log at 3am should not have to guess which.
+
+    And **it never deletes the file.** `keyring_store` discards a stored
+    key that does not open the install, correctly: the agent wrote that
+    entry, it outlives the install directory, and a stale one fails as
+    "auto-unlock appeared to work". This file is the operator's, placed
+    by a secret mount or by hand, and quite possibly read-only. Deleting
+    it would destroy configuration we did not create in order to report
+    a mistake we can simply describe.
+    """
+    passphrase = passphrase_file.read_passphrase(path)
+    if passphrase is None:
+        # read_passphrase logged which of the four things went wrong.
+        return
+
+    verifier = machine.state.identity.passphraseVerifier
+    if verifier is not None and not security.verify_passphrase(passphrase, verifier):
+        log.error(
+            "the passphrase in %s is not this install's passphrase; the root stays locked. "
+            "The file is left alone. This is what pointing a new container at an older "
+            "install's secret looks like.",
+            path,
+        )
+        return
+
+    try:
+        auth_routes.unseal_into(app.state.auth_state, machine, passphrase)
+    except Exception as exc:
+        app.state.auth_state.forget_master_key()
+        log.error(
+            "the passphrase in %s verified but did not open this install's sealed values "
+            "(%s); the root stays locked and the file is left alone.",
+            path,
+            exc,
+        )
+        return
+    log.info("master key derived from %s; this root is unlocked", path)
 
 
 async def _poll_nodes(app: FastAPI) -> None:

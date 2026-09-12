@@ -81,6 +81,19 @@ class Settings(BaseSettings):
     than being pushed to is what keeps one writer and lets the standby
     measure its own lag honestly."""
 
+    passphrase_file: Path | None = None
+    """Where to read the operator passphrase for unattended unlock.
+
+    Read only when `securityMode` is `passphrase_file`; see that module
+    for why this is a path and not the passphrase itself. Bootstrap
+    rather than config because it has to be known before the root is
+    unlocked, and because in a container it is fixed by the image and
+    the secret mount rather than chosen at runtime — the same reason
+    `state_dir` and `bind_host` live here.
+
+    The config field's own description names this variable, so an
+    operator who flips the mode in the UI is told what else to set."""
+
 
 def load_settings() -> Settings:
     return Settings()

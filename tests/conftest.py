@@ -30,7 +30,11 @@ PASSPHRASE = "correct-horse-battery-staple"
 
 
 def settings_for(
-    tmp_path: Path, *, role: str = "control", active_url: str | None = None
+    tmp_path: Path,
+    *,
+    role: str = "control",
+    active_url: str | None = None,
+    passphrase_file: Path | None = None,
 ) -> Settings:
     return Settings(
         config_file=tmp_path / "control.yaml",
@@ -38,6 +42,7 @@ def settings_for(
         role=role,
         active_url=active_url,
         follow_interval_seconds=0.05,
+        passphrase_file=passphrase_file,
     )
 
 

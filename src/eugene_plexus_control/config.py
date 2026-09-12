@@ -76,19 +76,38 @@ FIELDS: list[ConfigField] = [
             "only, so a restart needs the passphrase again. 'OS keyring' "
             "stores it in this machine's Credential Manager, Keychain or "
             "Secret Service for auto-unlock.\n\n"
+            "'Passphrase file' reads it from a file you mount, for hosts "
+            "that have no keyring at all — which is every container.\n\n"
             "Worth knowing before you pick: **OS keyring is host-bound.** "
             "The key lives in *this* machine's store, so a standby "
             "control root on another host cannot inherit auto-unlock and "
             "will ask for the passphrase when you promote it. That is "
             "consistent with promotion being something a person does "
             "anyway — but it is better read here than discovered during "
-            "a failover."
+            "a failover. **A passphrase file is not host-bound**: mount "
+            "the same secret on the standby and a failover needs nobody "
+            "either.\n\n"
+            "'Passphrase file' also needs "
+            "`EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE` set to the path, "
+            "because the root has to find it before it is unlocked. "
+            "Selecting this mode without that variable leaves the root "
+            "locked and says so in the log.\n\n"
+            "Both auto-unlock modes trade the same thing away: whoever "
+            "can read the store — this machine's keyring, or that file — "
+            "can unlock the install without knowing the passphrase. "
+            "They buy an install that comes back from a power cut with "
+            "nobody present, which is why they exist and why neither is "
+            "the default."
         ),
         category="security",
         valueType=ConfigValueType.enum,
         default="prompt_on_startup",
-        enumValues=["prompt_on_startup", "os_keyring"],
-        enumLabels=["Prompt on startup", "OS keyring auto-unlock"],
+        enumValues=["prompt_on_startup", "os_keyring", "passphrase_file"],
+        enumLabels=[
+            "Prompt on startup",
+            "OS keyring auto-unlock",
+            "Passphrase file auto-unlock",
+        ],
         requiresRestart=True,
     ),
     ConfigField(
