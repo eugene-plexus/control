@@ -265,6 +265,7 @@ async def _poll_nodes(app: FastAPI) -> None:
     """
     machine: StateMachine = app.state.machine
     client: NodesClient = app.state.nodes_client
+    announced_locked = False
 
     while True:
         try:
@@ -272,8 +273,43 @@ async def _poll_nodes(app: FastAPI) -> None:
             targets = [
                 (record.name, normalize_url(record.url)) for record in machine.state.nodes.values()
             ]
+
+            # **A locked root does not poll.** It cannot mint a service
+            # token without the install's signing key, and probing anyway
+            # is worse than not probing: every node answers 401, once per
+            # interval, forever. The operator then reads
+            # `"GET /v1/node HTTP/1.1" 401 Unauthorized` on a worker and
+            # goes looking at enrollment and tokens, which are fine --
+            # while the actual cause, a sealed trust root on the other
+            # machine, says nothing anywhere. Reported exactly that way
+            # on 2026-09-12.
+            #
+            # The probes are useless while locked in any case: every
+            # surface that would report them answers 503.
+            token = _service_token(app)
+            if token is None:
+                # Two reasons for no signing key, and they are not the
+                # same situation -- `dependencies.py` takes care to
+                # separate them because "run first-run setup" is advice
+                # to wipe an install that already exists. An install that
+                # has never been set up has no nodes to poll either, so
+                # it is not worth a word.
+                if machine.state.identity.salt is not None and not announced_locked:
+                    log.warning(
+                        "not polling %d node(s): this root is locked, so it cannot present a "
+                        "service token and they would all answer 401. POST /v1/auth/login, "
+                        "or set securityMode so it unlocks without a person present.",
+                        len(targets),
+                    )
+                    announced_locked = True
+                await asyncio.sleep(float(values["nodePollIntervalSeconds"]))
+                continue
+            if announced_locked:
+                log.info("unlocked; resuming node polling")
+                announced_locked = False
+
             if targets:
-                app.state.node_probes = await client.probe_all(targets, _service_token(app))
+                app.state.node_probes = await client.probe_all(targets, token)
             await asyncio.sleep(float(values["nodePollIntervalSeconds"]))
         except asyncio.CancelledError:
             raise

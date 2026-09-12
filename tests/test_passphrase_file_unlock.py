@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from eugene_plexus_control import passphrase_file
@@ -230,3 +231,81 @@ def test_an_empty_file_is_not_an_empty_passphrase(tmp_path: Path) -> None:
     assert passphrase_file.read_passphrase(secret) is None
     secret.write_text("\n", encoding="utf-8", newline="")
     assert passphrase_file.read_passphrase(secret) is None
+
+
+def test_a_locked_root_does_not_probe_its_nodes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**A locked root cannot authenticate, so it must not call anybody.**
+
+    `node_service_token` returns None without the install's signing key,
+    and `probe_all` took a `str | None` and probed anyway — so every
+    enrolled node answered `401 Unauthorized`, once per poll interval,
+    forever.
+
+    That is worse than not probing, because of where it sends the
+    operator: you read `"GET /v1/node HTTP/1.1" 401 Unauthorized` in a
+    worker's log and go looking at enrollment and tokens, which are fine.
+    The cause is a sealed trust root on a different machine, and it said
+    so nowhere. Reported exactly that way on 2026-09-12, next to the
+    gateway's own "did not answer /v1/nodes" — one cause, two symptoms,
+    neither naming it.
+
+    **The install needs a node in it or this passes vacuously**, since
+    the poller skips `probe_all` entirely when there are no targets.
+    """
+    import logging
+    import time
+
+    from eugene_plexus_control.nodes_client import NodesClient
+
+    calls: list[object] = []
+
+    async def spy(self: object, targets: object, token: object) -> dict[str, object]:
+        calls.append(token)
+        return {}
+
+    monkeypatch.setattr(NodesClient, "probe_all", spy)
+
+    directory = tmp_path / "install"
+    secret = tmp_path / "passphrase"
+    secret.write_text(PASSPHRASE, encoding="utf-8")
+
+    with _boot(directory, secret) as client:
+        _initialize_and_enable(client)
+        # The poller re-reads this every pass, and the default is long
+        # enough that the first (empty) pass would be the only one this
+        # test ever saw.
+        assert client.patch("/v1/config", json={"nodePollIntervalSeconds": 0.1}).status_code == 200
+        minted = client.post("/v1/nodes/join-token", json={"nodeName": "worker"}).json()
+        enrolled = client.post(
+            "/v1/nodes/enroll",
+            json={
+                "token": minted["token"],
+                "name": "worker",
+                "publicKey": "0" * 43 + "=",
+                "url": "http://192.0.2.10:8079",
+            },
+        )
+        assert enrolled.status_code in (200, 201), enrolled.text
+
+    # Now boot the same install with the secret gone: initialized,
+    # locked, and still holding that node.
+    secret.unlink()
+    with (
+        caplog.at_level(logging.WARNING, logger="eugene_plexus_control.app"),
+        _boot(directory, secret) as locked,
+    ):
+        assert locked.get("/v1/control/status").status_code == 503
+        time.sleep(0.4)
+
+    assert calls == [], f"a locked root called its nodes with {calls!r}"
+
+    # **The anti-vacuity guard.** The poller skips `probe_all` entirely
+    # when there are no targets, so "it did not call anyone" is also true
+    # of an empty install. The message has to say it had one node and
+    # chose not to.
+    said = [r.getMessage() for r in caplog.records]
+    assert any("not polling 1 node(s)" in m for m in said), (
+        f"expected the root to say it is locked and name the node it skipped; got {said!r}"
+    )
