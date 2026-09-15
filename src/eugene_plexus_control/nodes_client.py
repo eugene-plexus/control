@@ -248,10 +248,31 @@ class NodesClient:
 
 def _describe(exc: BaseException) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
-        return f"HTTP {exc.response.status_code}"
+        return f"HTTP {exc.response.status_code}{_problem_words(exc.response)}"
     if isinstance(exc, httpx.TimeoutException):
         return "timed out"
     return f"{type(exc).__name__}: {exc}"
+
+
+def _problem_words(response: httpx.Response) -> str:
+    """`: <title>: <detail>` from a Problem body, or nothing.
+
+    "HTTP 401" alone was the whole record of a node refusing this root's
+    tokens as "not yet valid (iat)"; the refusing agent had written the
+    reason into the body every time. Bounded, because a body is what the
+    far side chose to send.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return ""
+    problem = body.get("detail") if isinstance(body, dict) else None
+    if not isinstance(problem, dict):
+        return ""
+    words = ": ".join(
+        str(problem[key]) for key in ("title", "detail") if isinstance(problem.get(key), str)
+    )
+    return f": {words[:240]}" if words else ""
 
 
 def _str_or_none(value: Any) -> str | None:

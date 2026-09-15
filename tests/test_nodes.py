@@ -428,3 +428,54 @@ def test_announcing_to_an_unknown_node_is_404(active_client: TestClient) -> None
     private, _public = _node_keypair()
     response = _announce(active_client, "nobody", url="http://a:8079", sequence=1, private=private)
     assert response.status_code == 404, response.text
+
+
+def test_the_node_list_says_why_a_probe_failed(active_client: TestClient) -> None:
+    """Found 2026-09-15: a worker refused this root's tokens as "not yet
+    valid (iat)" over half a second of clock skew, the probe client
+    recorded exactly that, and the list said only `reachable: false`.
+    The reason travels now, as an observation beside `lastSeenAt`."""
+    from eugene_plexus_control.nodes_client import NodeProbe
+
+    _enroll(active_client, _mint(active_client), "gpu-box", os="windows", arch="x64")
+    active_client.app.state.node_probes = {
+        "gpu-box": NodeProbe(
+            name="gpu-box",
+            reachable=False,
+            error="HTTP 401: Invalid token: Bearer token rejected: The token is not yet valid (iat)",
+        )
+    }
+    node = active_client.get("/v1/nodes").json()["nodes"][0]
+    assert node["reachable"] is False
+    assert "not yet valid (iat)" in node["lastError"]
+
+    active_client.app.state.node_probes = {"gpu-box": NodeProbe(name="gpu-box", reachable=True)}
+    assert active_client.get("/v1/nodes").json()["nodes"][0]["lastError"] is None
+
+
+def test_a_probe_error_carries_the_refusing_agents_own_words() -> None:
+    """`_describe` used to stop at the status code."""
+    import httpx
+
+    from eugene_plexus_control.nodes_client import _describe
+
+    request = httpx.Request("GET", "http://node:8079/v1/node")
+    problem = httpx.Response(
+        401,
+        json={
+            "detail": {
+                "title": "Invalid token",
+                "detail": "Bearer token rejected: The token is not yet valid (iat)",
+                "status": 401,
+            }
+        },
+        request=request,
+    )
+    described = _describe(httpx.HTTPStatusError("401", request=request, response=problem))
+    assert (
+        described
+        == "HTTP 401: Invalid token: Bearer token rejected: The token is not yet valid (iat)"
+    )
+
+    bare = httpx.Response(502, text="<html>bad gateway</html>", request=request)
+    assert _describe(httpx.HTTPStatusError("502", request=request, response=bare)) == "HTTP 502"

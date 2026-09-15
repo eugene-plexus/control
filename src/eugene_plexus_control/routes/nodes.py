@@ -407,6 +407,11 @@ def _to_node(record: NodeRecord, probe: Any | None) -> Node:
             "devices": [dict(d) for d in record.devices],
             "enrolledAt": record.enrolledAt,
             "lastSeenAt": probe.last_seen_at if probe is not None else None,
+            # The probe client has always had the reason; until 2026-09-15
+            # this view dropped it, and `reachable: false` sent an operator
+            # to enrollment and keys when the cause was half a second of
+            # clock skew on a worker refusing this root's tokens.
+            "lastError": probe.error if probe is not None else None,
         }
     )
 

@@ -1257,6 +1257,10 @@ class Node(BaseModel):
     )
     enrolledAt: AwareDatetime | None = None
     lastSeenAt: AwareDatetime | None = None
+    lastError: str | None = Field(
+        None,
+        description='Why the last probe of this node did not come back with an\nidentity, in the probe client\'s words -- an HTTP status and\nthe body\'s title, or a transport error. `null` when the node\nanswered, and when nothing has polled yet.\n\nAdded 2026-09-15 because `reachable: false` on its own sent an\noperator looking at enrollment, keys and firewalls when the\ncause was a worker refusing this root\'s tokens as "not yet\nvalid (iat)" over half a second of clock skew. The probe\nclient had the reason the whole time; this surface dropped\nit. Observation, not applied state: a standby has not seen\nwhat this root saw, so it is never replicated.\n',
+    )
 
 
 class DirectoryListing(BaseModel):
