@@ -29,7 +29,12 @@ def test_a_fresh_install_reports_uninitialized_without_a_token(
     """What the UI asks before it has anything to ask with."""
     response = uninitialized_client.get("/v1/auth/status")
     assert response.status_code == 200
-    assert response.json() == {"initialized": False}
+    body = response.json()
+    assert body["initialized"] is False
+    # S0: a fresh root is also not unlocked, and it says whether this
+    # host's keyring could keep it unlocked (memoised False under test).
+    assert body["unlocked"] is False
+    assert body["keyringAvailable"] is False
 
 
 def test_an_uninitialized_root_refuses_rather_than_opening_up(

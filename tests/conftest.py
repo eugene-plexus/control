@@ -63,6 +63,20 @@ def active_client(tmp_path: Path) -> Iterator[TestClient]:
         yield client
 
 
+@pytest.fixture(autouse=True)
+def _memoise_keyring_probe() -> Iterator[None]:
+    """`GET /v1/auth/status` probes the OS keyring once per process; a test
+    must not reach the developer's real one. Memoised to False for every
+    test; a test about the probe resets the cache after installing its
+    fake."""
+    from eugene_plexus_control import keyring_store
+
+    keyring_store._probe_result = False
+    keyring_store._probe_done = True
+    yield
+    keyring_store.reset_probe_cache()
+
+
 @pytest.fixture
 def uninitialized_client(tmp_path: Path) -> Iterator[TestClient]:
     app = create_app(settings_for(tmp_path / "fresh"))

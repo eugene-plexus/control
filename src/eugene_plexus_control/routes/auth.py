@@ -25,6 +25,7 @@ that inherited a lockout would be a denial of service with extra steps.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from datetime import UTC, datetime
@@ -57,16 +58,51 @@ _RATE_LIMIT_MAX_FAILURES = 5
 _INITIAL_KEY_ID = "1"
 
 
+# How long `GET /v1/auth/status` waits for the keyring probe before
+# answering without it. A locked Secret Service can block on a prompt
+# nobody will answer; a status endpoint must not hang with it.
+KEYRING_PROBE_BUDGET_SECONDS = 3.0
+
+
+def install_id_of(machine: StateMachine) -> str:
+    """The keyring scope for this install — a fingerprint of its master-key
+    salt. Callers run past the `salt is None` checks; the empty fallback
+    only keeps a corrupt state from raising inside a keyring call."""
+    salt = machine.state.identity.salt
+    return keyring_store.install_id_for(salt) if salt else ""
+
+
 @router.get("/v1/auth/status", response_model=AuthStatus)
 async def auth_status(request: Request) -> AuthStatus:
-    """Has this install been through first-run setup?
+    """Has this install been through first-run setup, is it unlocked, and
+    can this host's keyring keep it that way?
 
     Unauthenticated by necessity — it is what the UI asks *before* it
     has a token, on every page load, to tell a fresh install from a
-    logged-out one. One boolean, no secrets, no rate limit.
+    logged-out one. `unlocked` is the sealed root said in a word instead
+    of a 503, for the Issues list; `keyringAvailable` is what the wizard
+    reads to default `securityMode`. No secrets, no rate limit. The probe
+    runs once per process, in a thread, with a deadline — past it the
+    field is absent, not False.
     """
     machine: StateMachine = request.app.state.machine
-    return AuthStatus(initialized=machine.state.identity.salt is not None)
+    auth: AuthState = request.app.state.auth_state
+    try:
+        available: bool | None = await asyncio.wait_for(
+            asyncio.to_thread(keyring_store.probe_sync), timeout=KEYRING_PROBE_BUDGET_SECONDS
+        )
+    except TimeoutError:
+        log.warning(
+            "the OS keyring probe did not finish within %.0fs; reporting keyringAvailable "
+            "as unknown",
+            KEYRING_PROBE_BUDGET_SECONDS,
+        )
+        available = None
+    return AuthStatus(
+        initialized=machine.state.identity.salt is not None,
+        unlocked=auth.master_key is not None,
+        keyringAvailable=available,
+    )
 
 
 @router.post("/v1/auth/initialize", status_code=204)
@@ -194,7 +230,9 @@ async def login(request: Request, body: AuthInitializeRequest) -> AuthLoginRespo
     # the root is locked (there is nothing to store yet) - both paths
     # converge on "the next restart auto-recovers".
     if config_module.effective(machine.state.config)["securityMode"] == "os_keyring":
-        if auth.master_key is not None and keyring_store.set_master_key(auth.master_key):
+        if auth.master_key is not None and keyring_store.set_master_key(
+            auth.master_key, install_id_of(machine)
+        ):
             log.info("master key persisted to the OS keyring for auto-unlock")
         else:
             log.warning(

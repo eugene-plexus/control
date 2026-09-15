@@ -172,7 +172,8 @@ def _auto_unlock(app: FastAPI, machine: StateMachine) -> None:
     secret whose failure mode is "auto-unlock appeared to work" is worse
     than no secret.
     """
-    stored = keyring_store.get_master_key()
+    install_id = auth_routes.install_id_of(machine)
+    stored = keyring_store.get_master_key(install_id)
     if stored is None:
         log.warning(
             "securityMode is os_keyring but no key was retrievable from the OS keyring; "
@@ -187,7 +188,7 @@ def _auto_unlock(app: FastAPI, machine: StateMachine) -> None:
         # raises for an unreadable signing key. At startup that is not
         # an HTTP concern, it is a locked root.
         app.state.auth_state.forget_master_key()
-        keyring_store.delete_master_key()
+        keyring_store.delete_master_key(install_id)
         log.error(
             "the key stored in the OS keyring did not open this install's sealed values "
             "(%s). The stored key has been discarded; log in with the passphrase. This is "

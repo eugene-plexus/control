@@ -30,6 +30,7 @@ from ..applied import OP_PATCH_CONFIG
 from ..auth_state import AuthState
 from ..dependencies import require_authorized, require_operator
 from ..state_machine import NotActive, StateMachine
+from .auth import install_id_of
 
 log = logging.getLogger(__name__)
 
@@ -98,14 +99,16 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
         # The operator moved to the stronger boundary, so the stored
         # auto-unlock secret has to go - otherwise the root would still
         # come back unlocked, contradicting the mode it now reports.
-        if keyring_store.delete_master_key():
+        if keyring_store.delete_master_key(install_id_of(machine)):
             log.info(
                 "securityMode changed from os_keyring to %s; discarded the stored master key",
                 new_mode,
             )
     elif prior_mode != "os_keyring" and new_mode == "os_keyring":
         auth: AuthState = request.app.state.auth_state
-        if auth.master_key is not None and keyring_store.set_master_key(auth.master_key):
+        if auth.master_key is not None and keyring_store.set_master_key(
+            auth.master_key, install_id_of(machine)
+        ):
             log.info("securityMode changed to os_keyring; stored the master key for auto-unlock")
         else:
             # Flipping it while locked is legitimate - a standby is

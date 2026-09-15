@@ -965,9 +965,28 @@ class RuntimePlacementSpec(BaseModel):
 
 
 class AuthStatus(BaseModel):
+    """
+    Whether this trust root has been through first-run setup,
+    whether its sealed values are open right now, and whether this
+    host's OS keyring can keep them open across a restart. Same
+    shape as the agent's, for the same reader: the first-run wizard
+    writes `securityMode` to both processes on this host, and the
+    UI's Issues list reads `unlocked` here to say "sealed" in words
+    instead of a 503.
+
+    """
+
     initialized: bool = Field(
         ...,
         description='True once a passphrase has been set. False means every\nendpoint except this one, `/healthz` and\n`POST /v1/auth/initialize` will refuse.\n',
+    )
+    unlocked: bool | None = Field(
+        None,
+        description="True while the master key is in memory and the install's\nsigning key is open. False is the sealed root that answers\n`503 Locked` across its surface — the state a container comes\nback in after every restart under `prompt_on_startup`.\nAbsent from a root that predates the field.\n",
+    )
+    keyringAvailable: bool | None = Field(
+        None,
+        description="Whether this host's OS keyring accepted a write, read and\ndelete of a probe entry from this process — measured once per\nprocess run. False in a container or on a headless box, where\n`passphrase_file` is the unattended answer. Absent when the\nprobe was not run or did not finish within its budget.\n",
     )
 
 
