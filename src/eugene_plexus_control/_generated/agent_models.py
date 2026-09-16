@@ -820,6 +820,96 @@ class AuthStatus(BaseModel):
     )
 
 
+class ClientKey(BaseModel):
+    """
+    A long-lived bearer this install minted for an app outside it
+    (hobbyist UX S4, 2026-09-15) — as a *record*, never as the token.
+
+    Before these existed the only key a person could paste into
+    Continue or Open WebUI was the operator session token: full
+    authority, expired in fourteen days, and shown only inside the
+    playground's diagnostic panel. A client key carries
+    `aud: client`, which the gateway accepts on its three
+    OpenAI-compatible paths and nothing else accepts anywhere.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="The token's `jti` claim, and what `DELETE` takes. Random per\nkey; the only thing the gateway needs in order to refuse one.\n",
+    )
+    name: str = Field(
+        ...,
+        description='What the operator called it — "Continue on the laptop",\n"phone". Not unique: two keys for the same app are a normal\nthing to want, and refusing the second would be a rule\ninvented for the list\'s benefit rather than the person\'s.\n',
+    )
+    tail: str = Field(
+        ...,
+        description='The last few characters of the token, so a key in this list\ncan be matched against one already pasted into an app.\n\n**Deliberately the tail and not a prefix.** The token is a\nJWT: every key this install mints begins with the same\n`eyJhbGciOiJIUzI1NiIs…` header, so a prefix identifies\nnothing. Short enough to be useless on its own.\n',
+    )
+    createdAt: AwareDatetime
+    expiresAt: AwareDatetime = Field(
+        ...,
+        description='The `exp` claim. Past it the gateway refuses the token on\nsignature validation alone, with no list to consult.\n',
+    )
+    revokedAt: AwareDatetime | None = Field(
+        None,
+        description='Set once the key has been revoked. The record is kept until\n`expiresAt` passes so the list can say "turned off" rather\nthan going silent.\n',
+    )
+    lastUsedAt: AwareDatetime | None = Field(
+        None,
+        description='Reserved. Nothing writes it: the agent never sees a client\nkey — the gateway does — and reporting a *last used* the\ninstall cannot observe would be worse than reporting none.\nKept in the shape so a future gateway-side counter has\nsomewhere to land.\n',
+    )
+
+
+class ClientKeyList(BaseModel):
+    keys: list[ClientKey]
+
+
+class ClientKeyCreateRequest(BaseModel):
+    name: str = Field(
+        ...,
+        description="What this key is for, in the operator's words. Shown in the\nlist and nowhere else; it is not part of the token.\n",
+        max_length=64,
+        min_length=1,
+    )
+    ttlDays: int | None = Field(
+        365,
+        description='How long the key lives. A year by default: long enough that\na person who set up Continue once does not come back to a\ndead key, short enough that a key forgotten in a config file\neventually stops working. **No "never expires" option** —\nthe revocation path here is a bounded-staleness list, and a\ntoken with no expiry at all leans on it entirely.\n',
+        ge=1,
+        le=3650,
+    )
+
+
+class ClientKeyCreated(BaseModel):
+    """
+    The one and only time the token is on the wire from this agent.
+
+    """
+
+    key: ClientKey
+    token: str = Field(
+        ...,
+        description='The bearer itself. Not stored: the agent keeps the record\nand forgets this. A caller that does not keep it mints\nanother.\n',
+    )
+
+
+class ClientKeyRevocations(BaseModel):
+    """
+    What the gateway polls. Ids only, and the revision at which the
+    set last changed.
+
+    """
+
+    ids: list[str] = Field(
+        ...,
+        description='`jti`s to refuse. Excludes keys whose `expiresAt` has passed:\nthose are refused by expiry, and keeping them here would\nmake this list grow forever.\n',
+    )
+    revision: int = Field(
+        ...,
+        description='Increments whenever the set changes. A reader logs on a\nchange rather than on every poll.\n',
+    )
+
+
 class AuthInitializeRequest(BaseModel):
     passphrase: SecretStr = Field(
         ...,
@@ -949,7 +1039,7 @@ class HostAccelerator(BaseModel):
     )
     acceleratorVersion: str | None = Field(
         None,
-        description='For CUDA, the highest version the installed driver supports.\nSelection takes the highest published build whose major\nmatches and whose minor is no greater than this; a higher\nmajor is never chosen.\n',
+        description="For CUDA, the highest version the installed driver supports.\nSelection takes the highest published build whose major\nmatches and whose minor is no greater than this. When the\nrelease publishes no such build — upstream moved from 13.3\nto 13.4 on 2026-09-15 and stopped shipping 13.3 — the lowest\npublished minor **above** it within the same major is taken\ninstead, under CUDA's minor-version compatibility (an\napplication built with any 13.x toolkit runs on any 13.x\ndriver, minus PTX JIT for newer PTX and APIs the driver\nlacks; verified live with b10990's 13.4 build on a 13.3\ndriver), and the agent logs the choice. A different major\nis never chosen, and the refusal says so. The candidate\nminors are read from the release's own asset names, not a\ntable: the table this replaced went stale in a day.\n",
     )
 
 
