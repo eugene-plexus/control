@@ -131,7 +131,7 @@ def test_a_root_that_predates_scoping_still_auto_unlocks(
         _initialize_and_enable(client)
     # Move the stored key back to the pre-scoping slot, as an older build
     # would have left it.
-    ((service, username), value), = dict_keyring.store.items()
+    (((service, username), value),) = dict_keyring.store.items()
     dict_keyring.store = {(service, keyring_store.LEGACY_USERNAME): value}
 
     with _boot(directory) as restarted:
@@ -161,7 +161,9 @@ def test_status_says_unlocked_and_whether_a_keyring_exists(
     with _boot(tmp_path / "install") as client:
         fresh = client.get("/v1/auth/status").json()
         assert fresh == {"initialized": False, "unlocked": False, "keyringAvailable": True}
-        assert client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
+        assert (
+            client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
+        )
         after = client.get("/v1/auth/status").json()
         assert after["initialized"] is True
         assert after["unlocked"] is True
@@ -172,7 +174,9 @@ def test_a_sealed_root_says_so_in_a_word(tmp_path: Path, dict_keyring: DictKeyri
     locked; the Issues list reads this instead of parsing a 503."""
     directory = tmp_path / "install"
     with _boot(directory) as client:
-        assert client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
+        assert (
+            client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
+        )
     with _boot(directory) as restarted:
         body = restarted.get("/v1/auth/status").json()
         assert body["initialized"] is True
