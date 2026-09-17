@@ -16,6 +16,7 @@ stayed compromised.
 from __future__ import annotations
 
 import base64
+import pathlib
 
 import pytest
 from fastapi.testclient import TestClient
@@ -453,6 +454,59 @@ def test_the_node_list_says_why_a_probe_failed(active_client: TestClient) -> Non
     assert active_client.get("/v1/nodes").json()["nodes"][0]["lastError"] is None
 
 
+def test_a_node_nothing_has_polled_yet_is_distinguishable_from_one_that_is_down() -> None:
+    """Reported 2026-09-17: update the container, unlock the root, and
+    every node reads as down for the next fifteen seconds.
+
+    `reachable: false` is the honest default for the field -- nothing is
+    reassigned on the strength of it -- but a console cannot print
+    "down" from it alone, because a root that has never polled says
+    exactly the same thing as one whose probes all failed. The signature
+    that separates them is on the wire and is asserted here, because it
+    is what the Nodes page renders as "checking" rather than "down":
+
+        never polled   reachable=false, lastError=null, lastSeenAt=null
+        probe failed   reachable=false, lastError=<why>
+
+    A failed probe ALWAYS carries a reason -- every `reachable=False`
+    return in `nodes_client` sets one -- which is what makes the absence
+    of a reason mean "no observation" rather than "no explanation".
+    """
+    from eugene_plexus_control.nodes_client import NodeProbe
+
+    assert NodeProbe(name="x", reachable=False, error="connection refused").error
+    # And the one the route synthesises when there is no probe at all.
+    from eugene_plexus_control.applied import NodeRecord
+    from eugene_plexus_control.routes.nodes import _to_node
+
+    unpolled = _to_node(NodeRecord(name="gpu-box", url="http://a:8079"), None)
+    assert unpolled.reachable is False
+    assert unpolled.lastError is None
+    assert unpolled.lastSeenAt is None
+
+
+def test_a_locked_root_notices_an_unlock_without_waiting_a_poll_interval() -> None:
+    """The other half of the same report.
+
+    While locked the poller does nothing but re-read a local variable,
+    and sleeping the full interval there is the operator's wait AFTER
+    unlocking before any node has been observed at all. A second of
+    no-op iterations costs nothing and covers every unlock route there
+    is, including ones added later -- an event set by the login handler
+    would have to be remembered by each of them.
+    """
+    from eugene_plexus_control.app import _LOCKED_POLL_SLEEP_SECONDS
+
+    assert _LOCKED_POLL_SLEEP_SECONDS <= 1.0
+    source = (
+        pathlib.Path(__file__).resolve().parents[1] / "src" / "eugene_plexus_control" / "app.py"
+    ).read_text(encoding="utf-8")
+    locked_branch = source.split("announced_locked = True", 1)[1].split("continue", 1)[0]
+    # The locked branch must not sleep the poll interval on its own.
+    assert "_LOCKED_POLL_SLEEP_SECONDS" in locked_branch
+    assert "min(" in locked_branch
+
+
 def test_a_probe_error_carries_the_refusing_agents_own_words() -> None:
     """`_describe` used to stop at the status code."""
     import httpx
@@ -479,3 +533,102 @@ def test_a_probe_error_carries_the_refusing_agents_own_words() -> None:
 
     bare = httpx.Response(502, text="<html>bad gateway</html>", request=request)
     assert _describe(httpx.HTTPStatusError("502", request=request, response=bare)) == "HTTP 502"
+
+
+def test_a_minted_token_can_be_listed_and_withdrawn(active_client: TestClient) -> None:
+    """The half that did not exist until 2026-09-17.
+
+    Minting was the only verb: a token pasted into the wrong window
+    stayed live for the rest of its TTL and the only remedy was to wait.
+    """
+    minted = active_client.post("/v1/nodes/join-token", json={"nodeName": "attic"})
+    assert minted.status_code == 201, minted.text
+    token_id = minted.json()["id"]
+    token = minted.json()["token"]
+
+    listed = active_client.get("/v1/nodes/join-tokens")
+    assert listed.status_code == 200, listed.text
+    rows = listed.json()["tokens"]
+    assert [r["id"] for r in rows] == [token_id]
+    assert rows[0]["nodeName"] == "attic"
+    assert rows[0]["used"] is False
+
+    assert active_client.delete(f"/v1/nodes/join-tokens/{token_id}").status_code == 204
+    assert active_client.get("/v1/nodes/join-tokens").json()["tokens"] == []
+    # And it is dead, not merely hidden.
+    assert _enroll(active_client, token, "attic").status_code == 401
+
+
+def test_the_listing_carries_no_token(active_client: TestClient) -> None:
+    """The store keeps a hash and never the secret, so there is nothing
+    here to steal and nothing to re-read a lost token from. A listing
+    that leaked one would quietly undo the property the whole store is
+    built on."""
+    token = _mint(active_client)
+    body = active_client.get("/v1/nodes/join-tokens").text
+    assert token not in body
+    assert "token" not in active_client.get("/v1/nodes/join-tokens").json()["tokens"][0]
+
+
+def test_an_id_is_not_derived_from_the_token(active_client: TestClient) -> None:
+    """A handle that were a prefix or a hash of the secret would mean
+    listing moves the credential's verifier around. It is a separate
+    random value, and this is the assertion that says so."""
+    minted = active_client.post("/v1/nodes/join-token").json()
+    token, token_id = minted["token"], minted["id"]
+    assert token_id not in token
+    assert token[: len(token_id)] != token_id
+    from eugene_plexus_control import security
+
+    assert token_id not in security.hash_join_token(token)
+
+
+def test_a_revoked_token_is_forgotten_rather_than_flagged(active_client: TestClient) -> None:
+    """Presenting a withdrawn token is indistinguishable from presenting
+    one that never existed. A revoked credential should not confirm it
+    was ever real."""
+    minted = active_client.post("/v1/nodes/join-token").json()
+    active_client.delete(f"/v1/nodes/join-tokens/{minted['id']}")
+
+    withdrawn = _enroll(active_client, minted["token"], "attic")
+    invented = _enroll(active_client, "eptk_" + "0" * 40, "attic")
+    assert withdrawn.status_code == invented.status_code == 401
+    assert withdrawn.json()["detail"] == invented.json()["detail"]
+
+
+def test_revoking_an_unknown_id_is_404_not_a_silent_success(active_client: TestClient) -> None:
+    """ "Already gone" and "you are revoking the wrong thing" want
+    different next moves, and the operator is looking at a list this
+    root just served."""
+    response = active_client.delete("/v1/nodes/join-tokens/deadbeefdeadbeef")
+    assert response.status_code == 404
+    assert "expired" in response.text
+
+
+def test_a_spent_token_is_listed_and_can_be_cleared(active_client: TestClient) -> None:
+    """The sweep keeps a used token until it expires on purpose, so a
+    replay answers 409 rather than 401 — which means the listing has to
+    show it, and revoking it has to be allowed and pointless rather than
+    refused. Membership is in the replicated log and is untouched."""
+    token = _mint(active_client)
+    assert _enroll(active_client, token, "gpu-box").status_code == 201
+
+    rows = active_client.get("/v1/nodes/join-tokens").json()["tokens"]
+    assert len(rows) == 1 and rows[0]["used"] is True
+
+    assert active_client.delete(f"/v1/nodes/join-tokens/{rows[0]['id']}").status_code == 204
+    assert active_client.get("/v1/nodes/gpu-box").status_code == 200
+
+
+def test_listing_and_revoking_are_operator_only(active_client: TestClient) -> None:
+    """What a token is bound to and when it dies is a picture of who is
+    being invited into this install, which is not a service's business."""
+    from eugene_plexus_control import security
+
+    auth = active_client.app.state.auth_state  # type: ignore[attr-defined]
+    service = security.issue_service_token(
+        kind="gateway", signing_key=auth.signing_key, ttl_seconds=60
+    )
+    headers = {"Authorization": f"Bearer {service}"}
+    assert active_client.get("/v1/nodes/join-tokens", headers=headers).status_code == 401
+    assert active_client.delete("/v1/nodes/join-tokens/x", headers=headers).status_code == 401

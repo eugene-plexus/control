@@ -15,6 +15,13 @@ That keeps `LogOp` closed at nine, which is the property that makes "an
 operation absent from the list is an operation that would not replicate"
 a true statement rather than an aspiration.
 
+**Minted is not the only verb, since 2026-09-17.** A token can be
+listed and withdrawn by an `id` that is a separate random value rather
+than any function of the secret — so the listing carries nothing worth
+stealing and revoking moves no credential. A revoked token is
+*forgotten* rather than flagged, because a withdrawn credential should
+not confirm it was ever real.
+
 Consequence worth stating: **a token does not survive a promotion.** An
 operator who minted one, lost the host, and promoted a standby has to
 mint another. That is the right trade — the alternative is replicating a
@@ -27,6 +34,7 @@ with this one about when a token died.
 
 from __future__ import annotations
 
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -51,13 +59,30 @@ class JoinTokenConsumed(JoinTokenError):
 class MintedToken:
     """What the operator sees, exactly once."""
 
+    id: str
     token: str
     expires_at: float
     node_name: str | None
 
 
 @dataclass(frozen=True)
+class TokenRecord:
+    """One outstanding token, **without the token**.
+
+    Everything that can honestly be said about a minted token after the
+    one moment it was shown: what it was for, when it dies, and whether
+    it has been spent.
+    """
+
+    id: str
+    expires_at: float
+    node_name: str | None
+    used: bool
+
+
+@dataclass(frozen=True)
 class _Record:
+    id: str
     token_hash: str
     expires_at: float
     node_name: str | None
@@ -81,14 +106,54 @@ class JoinTokenStore:
         token = security.generate_join_token()
         token_hash = security.hash_join_token(token)
         expires_at = time.time() + ttl_seconds
+        # **Not derived from the token.** A handle that were a prefix, a
+        # hash or any function of the secret would mean listing and
+        # revoking move the credential or its verifier around, and the
+        # one property this store has is that the secret exists in
+        # exactly one place for exactly one moment.
+        token_id = secrets.token_hex(8)
         with self._lock:
             self._sweep_locked()
             self._records[token_hash] = _Record(
-                token_hash=token_hash, expires_at=expires_at, node_name=node_name
+                id=token_id, token_hash=token_hash, expires_at=expires_at, node_name=node_name
             )
         # Returned once and never stored in recoverable form. A lost
         # token is re-minted, not looked up.
-        return MintedToken(token=token, expires_at=expires_at, node_name=node_name)
+        return MintedToken(id=token_id, token=token, expires_at=expires_at, node_name=node_name)
+
+    def list(self) -> list[TokenRecord]:
+        """Outstanding tokens, soonest to expire first.
+
+        Spent ones included: the sweep keeps them until expiry on
+        purpose, so a replay answers 409 rather than 401, and a listing
+        that hid them would leave an operator wondering where the token
+        they just used went.
+        """
+        with self._lock:
+            self._sweep_locked()
+            records = list(self._records.values())
+        records.sort(key=lambda r: (r.expires_at, r.id))
+        return [
+            TokenRecord(id=r.id, expires_at=r.expires_at, node_name=r.node_name, used=r.used)
+            for r in records
+        ]
+
+    def revoke(self, token_id: str) -> bool:
+        """Forget a token by its handle. False when there was no such id.
+
+        **Forgotten, not marked revoked.** Presenting it afterwards is
+        then indistinguishable from presenting one that never existed,
+        which is the right answer: a withdrawn credential should not
+        confirm it was ever real. `consume` already answers "unknown or
+        expired" for that case.
+        """
+        with self._lock:
+            self._sweep_locked()
+            for token_hash, record in self._records.items():
+                if record.id == token_id:
+                    del self._records[token_hash]
+                    return True
+        return False
 
     def consume(self, token: str, *, node_name: str) -> None:
         """Spend a token for one node name. Raises on any problem.
@@ -116,6 +181,7 @@ class JoinTokenStore:
                     f"enroll {node_name!r}"
                 )
             self._records[token_hash] = _Record(
+                id=record.id,
                 token_hash=record.token_hash,
                 expires_at=record.expires_at,
                 node_name=record.node_name,

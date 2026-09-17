@@ -731,6 +731,10 @@ class JoinTokenRequest(BaseModel):
 
 
 class JoinToken(BaseModel):
+    id: str = Field(
+        ...,
+        description='A handle for this token that is **not** the token and not\nderived from it — a separate random value, so listing and\nrevoking never move the credential or its verifier.\n\nIt exists because minting was the only thing an operator\ncould do to a join token. A token pasted into the wrong\nwindow could not be withdrawn; it simply stayed live for the\nrest of its TTL, and the only remedy was to wait.\n',
+    )
     token: str = Field(
         ...,
         description='**Shown once.** Not retrievable afterwards and not stored in\nrecoverable form — a lost token is re-minted, never looked\nup.\n',
@@ -739,6 +743,32 @@ class JoinToken(BaseModel):
     nodeName: str | None = Field(
         None, description='The node name this token is bound to, when it is bound.'
     )
+
+
+class JoinTokenRecord(BaseModel):
+    """
+    One outstanding join token, **without the token**.
+
+    The store keeps a hash and never the secret, so this is
+    everything that can honestly be said about a minted token after
+    the one moment it was shown: what it was for, when it dies, and
+    whether it has been spent.
+
+    """
+
+    id: str = Field(..., description='The handle to revoke it by.')
+    expiresAt: AwareDatetime
+    nodeName: str | None = Field(
+        None, description='The node name this token is bound to, when it is bound.'
+    )
+    used: bool = Field(
+        ...,
+        description='True once this token has enrolled a node. A spent token is\nkept until it expires so a replay answers 409 "already\nspent" rather than 401 "unknown" — so a listing shows it,\nand revoking it is allowed and pointless rather than\nrefused.\n',
+    )
+
+
+class JoinTokenList(BaseModel):
+    tokens: list[JoinTokenRecord]
 
 
 class NodeAddressAnnouncement(BaseModel):

@@ -29,6 +29,8 @@ from .._generated.models import (
     Enrollment,
     EnrollmentRequest,
     JoinToken,
+    JoinTokenList,
+    JoinTokenRecord,
     JoinTokenRequest,
     KeyRotation,
     Node,
@@ -68,6 +70,70 @@ async def list_nodes(request: Request) -> NodeList:
             for record in sorted(machine.state.nodes.values(), key=lambda r: r.name)
         ]
     )
+
+
+# **Declared before `/v1/nodes/{name}`, and that is load-bearing.**
+# Starlette matches in declaration order, so a literal segment that could
+# be read as a node name has to come first or the parameterised route
+# swallows it -- which it did, and `GET /v1/nodes/join-tokens` answered
+# `404 No such node named 'join-tokens'` until a test asked for the list.
+# `DELETE /v1/nodes/join-tokens/{id}` never collided (two segments), which
+# is exactly why the defect was half-invisible.
+@router.get(
+    "/v1/nodes/join-tokens",
+    response_model=JoinTokenList,
+    dependencies=[Depends(require_operator)],
+)
+async def list_join_tokens(request: Request) -> JoinTokenList:
+    """What is outstanding. **No tokens in it** — there are none to give.
+
+    Operator-only rather than merely authorized: what a token is bound
+    to and when it dies is a picture of who is being invited into this
+    install, which is not a service's business.
+    """
+    store: JoinTokenStore = request.app.state.join_tokens
+    return JoinTokenList(
+        tokens=[
+            JoinTokenRecord(
+                id=record.id,
+                expiresAt=datetime.fromtimestamp(record.expires_at, tz=UTC),
+                nodeName=record.node_name,
+                used=record.used,
+            )
+            for record in store.list()
+        ]
+    )
+
+
+@router.delete(
+    "/v1/nodes/join-tokens/{id}",
+    status_code=204,
+    dependencies=[Depends(require_operator)],
+)
+async def revoke_join_token(request: Request, id: str) -> None:
+    """Withdraw a token before it expires.
+
+    **Not gated on `is_active`**, unlike minting. A standby holds no
+    join tokens of its own, so this can only ever act on the store of
+    the root it is addressed to — and refusing to withdraw a credential
+    because of a role check would be the wrong way round: taking one
+    away is the safe direction, and an operator who can reach this port
+    with an operator token should never be told to go somewhere else
+    first.
+
+    404 on an unknown id rather than a silent 204, because "already
+    gone" and "you are revoking the wrong thing" want different next
+    moves and the operator is looking at a list this root just served.
+    """
+    store: JoinTokenStore = request.app.state.join_tokens
+    if not store.revoke(id):
+        raise problem(
+            status.HTTP_404_NOT_FOUND,
+            "No such join token",
+            f"No outstanding join token has id {id!r}. It may have expired, been used and "
+            "swept, or already been revoked.",
+        )
+    log.info("join token %s revoked", id)
 
 
 @router.get("/v1/nodes/{name}", response_model=Node, dependencies=[Depends(require_authorized)])
@@ -276,6 +342,7 @@ async def mint_join_token(request: Request, body: JoinTokenRequest | None = None
         ttl,
     )
     return JoinToken(
+        id=minted.id,
         token=minted.token,
         expiresAt=datetime.fromtimestamp(minted.expires_at, tz=UTC),
         nodeName=minted.node_name,

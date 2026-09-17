@@ -253,6 +253,11 @@ def _auto_unlock_from_file(app: FastAPI, machine: StateMachine, path: Path | Non
     log.info("master key derived from %s; this root is unlocked", path)
 
 
+_LOCKED_POLL_SLEEP_SECONDS = 1.0
+"""How long the node poller waits between checks while this root is
+sealed. Not the poll interval: see the locked branch below."""
+
+
 async def _poll_nodes(app: FastAPI) -> None:
     """Ask each node whether it is reachable and which epoch it has seen.
 
@@ -303,7 +308,21 @@ async def _poll_nodes(app: FastAPI) -> None:
                         len(targets),
                     )
                     announced_locked = True
-                await asyncio.sleep(float(values["nodePollIntervalSeconds"]))
+                # **A short sleep, not the poll interval.** While locked
+                # this loop does nothing but re-read a local variable, and
+                # the interval is what the operator waits AFTER unlocking
+                # before any node has been observed at all -- during which
+                # `/v1/nodes` reports every one of them with no probe,
+                # which the console has to render as "not checked yet".
+                # Reported on 2026-09-17: update the container, unlock,
+                # and every node reads as down for the next fifteen
+                # seconds. A second of no-op iterations costs nothing and
+                # covers every unlock route there is, including ones added
+                # later -- an event set by the login handler would have to
+                # be remembered by each of them.
+                await asyncio.sleep(
+                    min(_LOCKED_POLL_SLEEP_SECONDS, float(values["nodePollIntervalSeconds"]))
+                )
                 continue
             if announced_locked:
                 log.info("unlocked; resuming node polling")
