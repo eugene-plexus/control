@@ -626,8 +626,15 @@ def test_listing_and_revoking_are_operator_only(active_client: TestClient) -> No
     from eugene_plexus_control import security
 
     auth = active_client.app.state.auth_state  # type: ignore[attr-defined]
+    # Argument order is load-bearing for the SECRET SCAN, which is a silly
+    # sentence and is true: gitleaks' `generic-api-key` rule matches a
+    # `*_key=` keyword followed by more arguments on the same line, so this
+    # call read as a hard-coded credential and turned this repo's CI red on
+    # 2026-09-17 without anyone noticing. `signing_key` last is the shape
+    # `test_auth.py` already uses and the scan already accepts. An allowlist
+    # would have been the worse fix -- it is the rule earning its keep.
     service = security.issue_service_token(
-        kind="gateway", signing_key=auth.signing_key, ttl_seconds=60
+        kind="gateway", ttl_seconds=60, signing_key=auth.signing_key
     )
     headers = {"Authorization": f"Bearer {service}"}
     assert active_client.get("/v1/nodes/join-tokens", headers=headers).status_code == 401
