@@ -38,6 +38,8 @@ from typing import Any
 
 import httpx
 
+from ._http import internal_client
+
 log = logging.getLogger(__name__)
 
 
@@ -79,7 +81,11 @@ class NodesClient:
     """
 
     def __init__(self, *, timeout_provider: Any) -> None:
-        self._client = httpx.AsyncClient()
+        # `internal_client`: the shared SSL context (a bare constructor
+        # parses certifi's PEM bundle, ~104 ms of synchronous CPU on the
+        # event loop) and no proxy, because every node of this install
+        # is loopback or the operator's own LAN.
+        self._client = internal_client()
         self._timeout_provider = timeout_provider
 
     async def aclose(self) -> None:

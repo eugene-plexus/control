@@ -117,14 +117,14 @@ class AuthState:
     def is_login_rate_limited(
         self, source: str, *, window_seconds: int, max_in_window: int
     ) -> bool:
-        now = time.monotonic()
+        now = time.perf_counter()
         with self._lock:
             recent = [t for t in self._failures.get(source, []) if now - t < window_seconds]
             self._failures[source] = recent
             return len(recent) >= max_in_window
 
     def record_login_failure(self, source: str, *, window_seconds: int, max_in_window: int) -> None:
-        now = time.monotonic()
+        now = time.perf_counter()
         with self._lock:
             recent = [t for t in self._failures.get(source, []) if now - t < window_seconds]
             recent.append(now)

@@ -41,8 +41,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx
-
+from ._http import internal_client
 from .applied import ApplyError
 from .state_machine import StateMachine
 
@@ -97,7 +96,9 @@ class Follower:
     ) -> None:
         self._machine = machine
         self._interval = interval_seconds
-        self._client = httpx.AsyncClient()
+        # See `_http`: shared SSL context, and no proxy between a
+        # standby and the active root.
+        self._client = internal_client()
         self._token_provider = token_provider
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
