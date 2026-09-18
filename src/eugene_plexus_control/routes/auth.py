@@ -34,7 +34,7 @@ from fastapi import APIRouter, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .. import config as config_module
-from .. import keyring_store, sealing, security
+from .. import keyring_store, peer, sealing, security
 from .._generated.models import (
     AuthInitializeRequest,
     AuthLoginResponse,
@@ -185,7 +185,19 @@ async def login(request: Request, body: AuthInitializeRequest) -> AuthLoginRespo
     machine: StateMachine = request.app.state.machine
     auth: AuthState = request.app.state.auth_state
     identity = machine.state.identity
-    remote = request.client.host if request.client else "unknown"
+    # **The browser's address, not the proxy's.** Every login here
+    # arrives through a node agent's `/api/proxy/control/...`, so the
+    # peer is loopback for every caller there has ever been: one bucket
+    # for the whole install, and until R1.2 a bucket the caller chose.
+    # `peer.py` says why this header can be believed and
+    # `X-Forwarded-For` could not.
+    remote = (
+        peer.peer_of(
+            request.client.host if request.client else None,
+            request.headers.get(peer.PEER_HEADER),
+        )
+        or "unknown"
+    )
 
     if identity.salt is None or identity.passphraseVerifier is None:
         raise problem(

@@ -58,6 +58,14 @@ def main() -> None:
         host=settings.bind_host,
         port=_resolve_port(),
         log_level=log_level.lower(),
+        # **Trust no forwarding header from anyone.** uvicorn's default
+        # is `"127.0.0.1"`, and every browser reaches this root through
+        # a node agent's loopback proxy -- so the default trusted
+        # `X-Forwarded-For` from exactly the peer that is always ours,
+        # and any caller could pick the login limiter's bucket. What the
+        # proxy saw arrives as `peer.PEER_HEADER` instead. See `peer.py`;
+        # review §6.1 #1, roadmap R1.2.
+        forwarded_allow_ips=[],
     )
 
 
