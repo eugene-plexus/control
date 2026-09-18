@@ -43,6 +43,7 @@ import base64
 import logging
 import secrets
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -369,12 +370,25 @@ def decode_token(
     signing_key: bytes,
     accept_operator: bool = True,
     accept_any_service: bool = True,
+    accept_service_kinds: Collection[str] | None = None,
 ) -> TokenPayload:
     """Verify signature and expiry, then check the audience class.
 
     Raises `jwt.InvalidTokenError` or a subclass on any failure, so the
-    caller can collapse every rejection path into one branch."""
-    if not (accept_operator or accept_any_service):
+    caller can collapse every rejection path into one branch.
+
+    `accept_service_kinds` names the exact `service:<kind>` audiences
+    that are acceptable, for the endpoints where "any component of this
+    install" is too wide a door. It exists because the replication
+    surface hands out the sealed signing key, the Argon2id salt and the
+    passphrase verifier, and every `service:*` holder could read it --
+    including the ones that hold no master key and so have something to
+    gain from an offline attack on the verifier. Set it *with*
+    `accept_any_service=False`; passing both means "any service, and
+    also these", which is the wider of the two and almost never what a
+    caller wants.
+    """
+    if not (accept_operator or accept_any_service or accept_service_kinds):
         raise ValueError("must accept at least one audience class")
 
     options: Any = {
@@ -396,6 +410,8 @@ def decode_token(
     aud = str(claims["aud"])
     is_operator = accept_operator and aud == AUDIENCE_OPERATOR
     is_service = accept_any_service and aud.startswith(SERVICE_AUDIENCE_PREFIX)
+    if not is_service and accept_service_kinds and aud.startswith(SERVICE_AUDIENCE_PREFIX):
+        is_service = aud.removeprefix(SERVICE_AUDIENCE_PREFIX) in set(accept_service_kinds)
     if not (is_operator or is_service):
         raise jwt.InvalidAudienceError(f"audience {aud!r} not accepted")
 

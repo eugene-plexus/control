@@ -24,7 +24,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request, status
 
-from .. import sealing, security
+from .. import node_address, sealing, security
 from .._generated.models import (
     Enrollment,
     EnrollmentRequest,
@@ -173,6 +173,16 @@ async def announce_node_address(
     that announces the address it already had appends nothing, because
     otherwise every reboot of every node grows the log for no
     information.
+
+    **What the signature does not settle is which address (R2.4).** The
+    authentication here was always sound and was the whole of the check:
+    a correctly authenticated worker could name any URL at all, with
+    `is_loopback_host` as the only filter, so a cloud instance-metadata
+    address was a valid answer. Two rules sit after the signature now --
+    an address that can never be a node is a 400, and a node putting
+    itself on the open internet is a 409 naming re-enrollment as the
+    confirmation. See `node_address` for why the classes are built from
+    `is_global` rather than `is_private`.
     """
     machine: StateMachine = request.app.state.machine
     record = machine.state.nodes.get(name)
@@ -219,6 +229,21 @@ async def announce_node_address(
             f"The announcement is not signed by the identity node {name!r} enrolled with.",
         )
 
+    reason = node_address.rejection(announced_url)
+    if reason is not None:
+        log.warning(
+            "refused an address announcement for %s: %s cannot be a node's address (%s)",
+            name,
+            announced_url,
+            reason,
+        )
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Address cannot be a node",
+            f"{announced_url} cannot be node {name!r}'s address: {reason}. The "
+            "announcement was correctly signed; what is refused is the address.",
+        )
+
     normalized = normalize_url(announced_url)
     if normalized == record.url:
         # Nothing to record. Note that the sequence is deliberately NOT
@@ -230,6 +255,34 @@ async def announce_node_address(
             url=record.url,  # type: ignore[arg-type]
             sequence=record.advertiseSequence,
             changed=False,
+        )
+
+    if node_address.goes_public(record.url, normalized):
+        # Signed, sequenced, from the right node -- and still refused,
+        # because this is the one transition a homelab node never makes
+        # by itself and the one an attacker holding a leaked signing key
+        # needs. After it, this root probes the new address every poll
+        # and every console proxy hop hands it the operator's bearer.
+        log.warning(
+            "refused an address announcement for %s: %s -> %s moves it from %s onto the "
+            "open internet (%s)",
+            name,
+            record.url,
+            normalized,
+            node_address.classify(record.url),
+            node_address.classify(normalized),
+        )
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "Address puts this node on the open internet",
+            f"Node {name!r} is enrolled at {record.url}, which is "
+            f"{node_address.classify(record.url)}, and announced {normalized}, which is "
+            f"{node_address.classify(normalized)}. Moving between loopback and the LAN "
+            "is ordinary -- that is the Reach switch, and a new LAN address after a "
+            "reboot -- but a node may not put itself on the open internet, because "
+            "nothing here could tell that apart from a leaked signing key doing it. "
+            "Re-enroll the node to confirm the new address; its model files and "
+            "runtimes are untouched by that.",
         )
 
     if int(body.sequence) <= record.advertiseSequence:
@@ -374,6 +427,14 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
     wrong behind anything else. M7 — before it, every really-enrolled
     node had no address and the tests were appending a second
     `enrollNode` entry by hand.
+
+    **Verbatim, but not unexamined** (R2.4): the address still has to be
+    one a node could be at — http(s), not the bind wildcard, not
+    multicast, not link-local. Enrollment is where a node's reachability
+    *class* is set, and it is allowed to be any of them, because a join
+    token is operator-minted and the operator is therefore present. What
+    a node may not do is put *itself* on the open internet later; see
+    `announce_node_address`.
     """
     machine: StateMachine = request.app.state.machine
     auth: AuthState = request.app.state.auth_state
@@ -390,6 +451,18 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
             "Malformed public key",
             f"publicKey must be base64 ({exc}).",
         ) from exc
+
+    announced_url = normalize_url(str(body.url)) if body.url else None
+    reason = node_address.rejection(announced_url) if announced_url else None
+    if reason is not None:
+        # Checked **before** the join token is consumed: a single-use
+        # credential spent on a request that was never going to be
+        # recorded is an operator minting a second one for no reason.
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Address cannot be a node",
+            f"{body.url} cannot be this node's address: {reason}.",
+        )
 
     try:
         store.consume(body.token, node_name=body.name)
@@ -417,7 +490,7 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         "role": "agent",
         "publicKey": body.publicKey,
         "signingPublicKey": body.signingPublicKey,
-        "url": normalize_url(str(body.url)) if body.url else None,
+        "url": announced_url,
         "agentVersion": body.agentVersion,
         "os": body.os.value if body.os else None,
         "arch": body.arch.value if body.arch else None,

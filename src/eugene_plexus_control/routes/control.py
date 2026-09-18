@@ -33,7 +33,7 @@ from .._generated.models import (
 )
 from ..applied import OP_ROTATE_SIGNING_KEY
 from ..auth_state import AuthState
-from ..dependencies import problem, require_authorized, require_operator
+from ..dependencies import problem, require_authorized, require_operator, require_replica
 from ..rotation import (
     REASON_OPERATOR,
     REASON_REVOCATION,
@@ -87,7 +87,7 @@ async def control_status(request: Request) -> ControlStatus:
     "/v1/control/log",
     response_model=None,
     responses={200: {"model": LogPage}, 409: {"description": "Entries compacted"}},
-    dependencies=[Depends(require_authorized)],
+    dependencies=[Depends(require_replica)],
 )
 async def read_log(
     request: Request,
@@ -108,6 +108,10 @@ async def read_log(
     round trip through the response model rewrites values in ways that
     are semantically identical and byte-different, and a replica must
     hold what the writer wrote.
+
+    **Operator or `service:control` only**, not any service token: the
+    entries include the ones that wrote the install's key material, so
+    this is the same door as the snapshot and takes the same level.
     """
     machine: StateMachine = request.app.state.machine
     first_available = machine.first_available_index()
@@ -137,7 +141,7 @@ async def read_log(
     "/v1/control/snapshot",
     response_model=None,
     responses={200: {"model": Snapshot}},
-    dependencies=[Depends(require_authorized)],
+    dependencies=[Depends(require_replica)],
 )
 async def read_snapshot(request: Request) -> Response:
     """Applied state as of one index, for bootstrapping a standby.
@@ -162,6 +166,15 @@ async def read_snapshot(request: Request) -> Response:
     `tests/test_contract_shape.py` asserts this document validates
     against `Snapshot`, which is the assertion that actually matters —
     conformance without letting the serializer rewrite the payload.
+
+    **Operator or `service:control` only** (`require_replica`), which is
+    narrower than every other read here and deliberately so. What this
+    returns includes `sealedSigningKey`, `salt` and
+    `passphraseVerifier`; a `service:*` holder that has no master key —
+    a gateway, a library, a driver, an agent that has not unlocked —
+    gains an offline attack on the operator's passphrase by reading it,
+    and none of them has a reason to. A standby does, and presents
+    `service:control`.
     """
     machine: StateMachine = request.app.state.machine
     return Response(content=machine.canonical(), media_type="application/json")

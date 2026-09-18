@@ -316,8 +316,13 @@ def test_an_announcement_signed_by_the_wrong_node_is_refused(
     )
     assert public_a  # the key the root holds for gpu-box
 
+    # R2.4: the address is on the same side of the network as the one
+    # gpu-box enrolled with, because this test's subject is the SIGNER.
+    # An address that also crosses onto the open internet would be
+    # refused for two reasons at once and prove neither -- see
+    # `test_node_address.py` for that rule on its own.
     response = _announce(
-        active_client, "gpu-box", url="http://evil:8079", sequence=1, private=private_b
+        active_client, "gpu-box", url="http://100.64.0.66:8079", sequence=1, private=private_b
     )
     assert response.status_code == 401, response.text
     assert active_client.get("/v1/nodes/gpu-box").json()["url"].rstrip("/") == (
@@ -326,7 +331,7 @@ def test_an_announcement_signed_by_the_wrong_node_is_refused(
     # And the right key still works, so the refusal was about the signer.
     assert (
         _announce(
-            active_client, "gpu-box", url="http://evil:8079", sequence=1, private=private_a
+            active_client, "gpu-box", url="http://100.64.0.66:8079", sequence=1, private=private_a
         ).status_code
         == 200
     )

@@ -145,6 +145,12 @@ def test_a_service_token_can_read_but_not_mutate(active_client: TestClient) -> N
     assert active_client.get("/v1/control/status", headers=headers).status_code == 200
     assert active_client.get("/v1/nodes", headers=headers).status_code == 200
 
+    # And it stops at the replication surface, which is not a read like
+    # the two above: it carries the install's key material. This
+    # assertion is the one that was missing -- the test asserted the two
+    # 200s and stopped one endpoint short of the door that mattered.
+    assert active_client.get("/v1/control/snapshot", headers=headers).status_code == 401
+
     assert active_client.post("/v1/nodes/join-token", headers=headers).status_code == 401
     assert active_client.post("/v1/control/rotate-key", headers=headers).status_code == 401
     assert (
@@ -193,3 +199,54 @@ def test_the_master_key_is_derived_not_stored(tmp_path: Path) -> None:
     # which is what a standby does at promotion.
     identity = app.state.machine.state.identity
     assert security.derive_master_key(PASSPHRASE, base64.b64decode(identity.salt)) == master
+
+
+def test_a_service_token_that_is_not_the_standby_cannot_pull_key_material(
+    active_client: TestClient,
+) -> None:
+    """R2.4 / review §6.2 #12.
+
+    `/v1/control/snapshot` carries the install's **sealed signing key,
+    the Argon2id salt and the passphrase verifier**, and `/v1/control/log`
+    carries the entries those values were written in. Read-level auth
+    accepted *any* `service:*` audience, so a gateway, library or driver
+    token holder that does not hold the master key -- the
+    configured-but-locked window, a restarted agent, a node whose agent
+    never unlocked -- could pull the verifier and the salt and run an
+    offline passphrase attack against them.
+
+    The one caller that legitimately pulls both is a **standby**, which
+    presents `service:control`. Nothing else has business here, and the
+    audience already says which is which.
+
+    The test that should have caught this asserted a `service:gateway`
+    token gets 200 on status and nodes and stopped one endpoint short of
+    the two carrying key material.
+    """
+    auth = active_client.app.state.auth_state  # type: ignore[attr-defined]
+    gateway = {
+        "Authorization": "Bearer "
+        + security.issue_service_token(signing_key=auth.signing_key, kind="gateway")
+    }
+    standby = {
+        "Authorization": "Bearer "
+        + security.issue_service_token(signing_key=auth.signing_key, kind="control")
+    }
+
+    # The material is really there, so the refusal below is about
+    # something rather than about an empty document.
+    snapshot = active_client.get("/v1/control/snapshot").json()
+    assert snapshot["passphraseVerifier"].startswith("$argon2")
+    assert snapshot["salt"]
+    assert snapshot["sealedSigningKey"]
+
+    assert active_client.get("/v1/control/snapshot", headers=gateway).status_code == 401
+    assert active_client.get("/v1/control/log?after=0", headers=gateway).status_code == 401
+
+    # And replication still works, or the fix would have cost failover.
+    assert active_client.get("/v1/control/snapshot", headers=standby).status_code == 200
+    assert active_client.get("/v1/control/log?after=0", headers=standby).status_code == 200
+
+    # What a non-standby service token keeps: the epoch, and the node list.
+    assert active_client.get("/v1/control/status", headers=gateway).status_code == 200
+    assert active_client.get("/v1/nodes", headers=gateway).status_code == 200
