@@ -35,6 +35,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from . import security
+
 log = logging.getLogger(__name__)
 
 
@@ -85,8 +87,7 @@ class AuthState:
         return self.master_key is not None
 
     def set_signing_key(self, key: bytes) -> None:
-        if len(key) != 32:
-            raise ValueError("signing key must be 32 bytes")
+        security.validate_signing_key(key)
         self.signing_key = key
 
     def set_master_key(self, key: bytes) -> None:

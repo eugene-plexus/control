@@ -1,40 +1,7 @@
-"""Trust-root primitives: passphrase, master key, tokens, envelopes.
-
-This moved here from the agent, which held it only because it used to be
-the single process in the install. The control root is the trust root
-now, and there is exactly one active.
-
-What this module owns:
-
-  * **Passphrase verification** via Argon2id-PHC. Parameters and salt are
-    embedded in the stored hash, so verifying needs no out-of-band
-    context.
-
-  * **Master-key derivation** via Argon2id raw mode, from the passphrase
-    plus a separately stored 16-byte salt. Deterministic, so the same
-    passphrase always derives the same key — which is what lets a
-    standby derive it at promotion from a salt it replicated rather than
-    from a key it was shipped. The master key never lands on disk in
-    plaintext.
-
-  * **Session and service token issuance** via JWT-HS256. HS256 because
-    the signing key is shared with components that must validate
-    independently; asymmetric would force every component to hold a
-    public key or make a round trip, neither of which simplifies
-    anything.
-
-  * **At-rest envelopes** via libsodium secretbox, wire-identical to
-    `MasterKeyEnvelope` in common.yaml so an envelope written by one
-    component opens in another given the same key.
-
-The one behavioural change from the agent's version: **a restart is no
-longer a re-key.** Through M4 service tokens were "rotated on each
-watchdog restart", which was harmless when one process spawned
-everything and is an outage once there are N nodes — a restart that
-re-keys the install breaks every component that has not yet been told.
-Rotation is now an explicit operation with its own log entry
-(`rotateSigningKey`), and the key is persisted sealed under the master
-key so a restart keeps it.
+"""Token minter for the install: Ed25519 for new keys and rotations.
+Trusted agents/control retain private PEM; children receive public PEM.
+Existing 32-byte HS256 keys remain usable until an explicit rotation.
+The token-signing key is independent of the master encryption key.
 """
 
 from __future__ import annotations
@@ -53,6 +20,8 @@ import jwt
 import nacl.exceptions
 import nacl.secret
 import nacl.utils
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +32,43 @@ _ARGON2_MEMORY_COST = 65_536  # KiB
 _ARGON2_PARALLELISM = 4
 _ARGON2_HASH_LEN = 32  # bytes — drives the secretbox key length
 
-_JWT_ALG = "HS256"
+
+def validate_signing_key(key: bytes) -> None:
+    """Minters accept Ed25519 PKCS8 PEM or the existing legacy HMAC key."""
+    if len(key) == 32:
+        return
+    parsed = serialization.load_pem_private_key(key, password=None)
+    if not isinstance(parsed, Ed25519PrivateKey):
+        raise ValueError("token signing requires an Ed25519 private key")
+
+
+def signing_algorithm(key: bytes) -> str:
+    validate_signing_key(key)
+    return "HS256" if len(key) == 32 else "EdDSA"
+
+
+def verification_key(key: bytes) -> bytes:
+    """Validate public Ed25519 PEM, or an explicitly legacy 32-byte HMAC key."""
+    if len(key) == 32:
+        return key
+    if key.startswith(b"-----BEGIN PRIVATE KEY-----"):
+        parsed_private = serialization.load_pem_private_key(key, password=None)
+        if not isinstance(parsed_private, Ed25519PrivateKey):
+            raise ValueError("token signing requires an Ed25519 private key")
+        key = parsed_private.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+    parsed = serialization.load_pem_public_key(key)
+    if not isinstance(parsed, Ed25519PublicKey):
+        raise ValueError("token verification requires an Ed25519 public key")
+    return key
+
+
+def verification_algorithm(key: bytes) -> str:
+    """Select from trusted key material, never an untrusted JWT header."""
+    return "HS256" if len(key) == 32 else "EdDSA"
+
+
 _DEFAULT_SESSION_TTL_SECONDS = 14 * 24 * 3600
 _DEFAULT_SERVICE_TTL_SECONDS = 365 * 24 * 3600
 
@@ -261,13 +266,12 @@ class TokenPayload:
 
 
 def generate_signing_key() -> bytes:
-    """32 random bytes, used as the HMAC key for JWT signing.
-
-    One per install, not one per process. Every node's components verify
-    against this, which is precisely what a single-watchdog install could
-    not do: a driver spawned on one host rejected a gateway's token from
-    another because the keys were unrelated."""
-    return secrets.token_bytes(32)
+    """New installs and explicit rotations use Ed25519, never a new HMAC key."""
+    return Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
 
 
 def issue_operator_token(
@@ -280,7 +284,7 @@ def issue_operator_token(
 
     The `jti` is not decoration. Without it, two logins in the same
     second produce byte-identical tokens — same claims, deterministic
-    HS256 — so logging out and logging straight back in hands the
+    signature — so logging out and logging straight back in hands the
     operator the token they just revoked, and they are locked out until
     the clock ticks over. A random session id makes revocation mean
     "this session" rather than "every session issued this second".
@@ -294,7 +298,7 @@ def issue_operator_token(
         "exp": expires_at,
         "jti": secrets.token_urlsafe(12),
     }
-    return jwt.encode(claims, signing_key, algorithm=_JWT_ALG), expires_at
+    return jwt.encode(claims, signing_key, algorithm=signing_algorithm(signing_key)), expires_at
 
 
 def issue_service_token(
@@ -316,7 +320,7 @@ def issue_service_token(
         "iat": issued_at,
         "exp": issued_at + ttl_seconds,
     }
-    return jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
+    return jwt.encode(claims, signing_key, algorithm=signing_algorithm(signing_key))
 
 
 CLOCK_SKEW_LEEWAY_SECONDS = 300
@@ -400,8 +404,8 @@ def decode_token(
     }
     claims = jwt.decode(
         token,
-        key=signing_key,
-        algorithms=[_JWT_ALG],
+        key=verification_key(signing_key),
+        algorithms=[verification_algorithm(signing_key)],
         options=options,
         leeway=CLOCK_SKEW_LEEWAY_SECONDS,
     )

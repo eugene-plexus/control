@@ -569,7 +569,7 @@ class AuthLoginResponse(BaseModel):
 
     sessionToken: str = Field(
         ...,
-        description='Opaque bearer token. Signed and validated server-side; the\nUI should never inspect its contents. Lifetime is bounded\nby `expiresAt`.\n',
+        description='Opaque bearer token. Signed and validated server-side; the\nUI should never inspect its contents. Lifetime is bounded\nby `expiresAt`. New installs and key rotations use JWT\n`alg: EdDSA` with Ed25519. Existing HS256 installs retain\ntheir 32-byte key until explicit rotation. Agent and control\nhold private signing keys; gateway, library and driver hold\npublic verification keys after migration. Verifiers select\nexactly one algorithm from trusted key material, not from\ntoken headers. Rotation invalidates all prior tokens;\nthere is no simultaneous HS256/EdDSA acceptance window.\n',
     )
     expiresAt: AwareDatetime
     operatorName: str | None = Field(
@@ -890,7 +890,7 @@ class Enrollment(BaseModel):
     )
     signingKey: str = Field(
         ...,
-        description="The current service-token signing key, so this node's\ncomponents can verify tokens minted anywhere in the install.\n**This is what a single-watchdog install could not do**: a\ndriver spawned on one host used to reject a gateway's token\nfrom another because the keys were unrelated.\n",
+        description="Base64 of the install's unencrypted Ed25519 private key in\nPKCS8 PEM format. This trusted agent is a token minter, so\nenrollment transfers private material to it. It derives\nSubjectPublicKeyInfo public PEM for gateway, library and\ninference-driver children; those receive `AUTH_VERIFY_KEY`\nand their own service token, never this private key.\nNew installs and rotations sign JWTs with `alg: EdDSA`.\nAn upgraded install retains its existing base64 32-byte\nHS256 key until explicit rotation; no re-enrollment is needed.\nThe format selects the algorithm, independently of JWT headers.\n",
     )
     signingKeyId: str | None = Field(
         None,
