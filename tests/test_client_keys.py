@@ -89,10 +89,26 @@ def test_signed_import_is_idempotent_and_cannot_clear_revocation(active_client: 
     before = client.app.state.machine.state.index
     assert send([key]).status_code == 200
     assert client.app.state.machine.state.index == before
+    assert client.get("/v1/auth/client-keys").json()["keys"][0].get("limits") is None
+    assert (
+        client.put(
+            "/v1/auth/client-keys/legacy-key/limits",
+            json={
+                "limits": {
+                    "allowedModels": ["chosen"],
+                    "maxConcurrentRequests": 1,
+                    "requestsPerMinute": 3,
+                }
+            },
+        ).status_code
+        == 200
+    )
     assert client.delete("/v1/auth/client-keys/legacy-key").status_code == 204
     assert send([{**key, "name": "changed"}]).status_code == 200
     listed = client.get("/v1/auth/client-keys").json()["keys"][0]
     assert listed["revokedAt"] and listed["originNode"] == "legacy" and listed["migrated"]
+    assert listed["limits"]["allowedModels"] == ["chosen"]
+    assert listed["limits"]["requestsPerMinute"] == 3
     assert send([{**key, "tail": "other"}]).status_code == 409
     assert (
         client.post(

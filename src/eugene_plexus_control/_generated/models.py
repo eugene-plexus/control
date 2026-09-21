@@ -17,6 +17,23 @@ from pydantic import (
 )
 
 
+class AllowedModel(RootModel[str]):
+    root: str = Field(..., max_length=256, min_length=1)
+
+
+class ClientKeyLimits(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    allowedModels: list[AllowedModel] | None = Field(
+        None,
+        description='Null permits all. Empty permits none. Exact alias and actual target IDs must both be allowed.',
+        max_length=100,
+    )
+    maxConcurrentRequests: int | None = Field(2, ge=1, le=64)
+    requestsPerMinute: int | None = Field(60, ge=1, le=10000)
+
+
 class ClientKey(BaseModel):
     id: str = Field(..., max_length=128, min_length=1)
     name: str = Field(..., max_length=64, min_length=1)
@@ -28,6 +45,10 @@ class ClientKey(BaseModel):
         None, description='Reserved; not currently measured.'
     )
     originNode: str | None = None
+    limits: ClientKeyLimits | None = Field(
+        None,
+        description='Absent on legacy keys (all models, no per-key limits); new keys receive bounded defaults.',
+    )
     migrated: bool | None = Field(
         None,
         description='True for a record imported from a pre-A3 node-local registry.',
@@ -56,8 +77,46 @@ class ClientKeyList(BaseModel):
 
 
 class ClientKeyCreateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
     name: str = Field(..., max_length=64, min_length=1)
     ttlDays: int | None = Field(365, ge=1, le=3650)
+    limits: ClientKeyLimits | None = None
+
+
+class ClientKeyUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    limits: ClientKeyLimits
+
+
+class Action(StrEnum):
+    check = 'check'
+    acquire = 'acquire'
+    renew = 'renew'
+    release = 'release'
+
+
+class ClientAdmissionRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    action: Action
+    keyId: str = Field(..., max_length=128, min_length=1)
+    requestId: str = Field(..., max_length=128, min_length=1)
+    model: str | None = Field(None, max_length=256, min_length=1)
+
+
+class ClientAdmissionResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keyId: str
+    keyName: str
+    limits: ClientKeyLimits | None = None
+    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
 
 
 class ClientKeyCreated(BaseModel):
@@ -1062,6 +1121,8 @@ class LogOp(StrEnum):
     putClientKey = 'putClientKey'
     importClientKeys = 'importClientKeys'
     revokeClientKey = 'revokeClientKey'
+    setClientKeyLimits = 'setClientKeyLimits'
+    putClientAdmission = 'putClientAdmission'
     rotateSigningKey = 'rotateSigningKey'
     promote = 'promote'
 
@@ -1583,6 +1644,10 @@ class Snapshot(BaseModel):
 
     """
 
+    clientAdmission: dict[str, Any] | None = Field(
+        None,
+        description='Durable logical clock and per-key admission buckets; replayed verbatim with leases and rolling-window charges.',
+    )
     clientKeys: list[ClientKey] | None = None
     clientKeyImports: dict[str, str] | None = Field(
         None,

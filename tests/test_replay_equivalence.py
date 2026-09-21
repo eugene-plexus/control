@@ -46,12 +46,14 @@ from eugene_plexus_control.applied import (
     OP_IMPORT_CLIENT_KEYS,
     OP_PATCH_CONFIG,
     OP_PROMOTE,
+    OP_PUT_CLIENT_ADMISSION,
     OP_PUT_CLIENT_KEY,
     OP_PUT_COMPONENT,
     OP_PUT_RUNTIME,
     OP_REVOKE_CLIENT_KEY,
     OP_REVOKE_NODE,
     OP_ROTATE_SIGNING_KEY,
+    OP_SET_CLIENT_KEY_LIMITS,
     OP_UPDATE_NODE,
     AppliedState,
     ApplyError,
@@ -77,6 +79,8 @@ EXERCISED_OPS = {
     OP_DELETE_RUNTIME,
     OP_PATCH_CONFIG,
     OP_PUT_CLIENT_KEY,
+    OP_SET_CLIENT_KEY_LIMITS,
+    OP_PUT_CLIENT_ADMISSION,
     OP_IMPORT_CLIENT_KEYS,
     OP_REVOKE_CLIENT_KEY,
     OP_ROTATE_SIGNING_KEY,
@@ -165,6 +169,35 @@ def _write_history(machine: StateMachine) -> None:
         "expiresAt": "2027-09-09T11:20:00+00:00",
     }
     machine.append(OP_PUT_CLIENT_KEY, {"key": key})
+    machine.append(
+        OP_SET_CLIENT_KEY_LIMITS,
+        {
+            "id": "app-key",
+            "limits": {
+                "allowedModels": ["chosen"],
+                "maxConcurrentRequests": 1,
+                "requestsPerMinute": 4,
+            },
+        },
+    )
+    machine.append(
+        OP_PUT_CLIENT_ADMISSION,
+        {
+            "clock": 10.0,
+            "keyId": "app-key",
+            "bucket": {
+                "request": {
+                    "started": 10.0,
+                    "until": 40.0,
+                    "active": True,
+                    "charged": True,
+                    "model": "chosen",
+                    "policyDigest": "example-digest",
+                },
+            },
+        },
+    )
+
     machine.append(
         OP_IMPORT_CLIENT_KEYS,
         {
