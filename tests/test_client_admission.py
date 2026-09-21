@@ -65,6 +65,18 @@ def test_idempotency_late_acquire_and_separate_keys(active_client):
     assert call(c, a, "acquire", "two").status_code == 429
 
 
+def test_local_only_survives_snapshot_and_policy_edit_invalidates_lease(active_client, tmp_path):
+    c = active_client
+    key = mint(c, localOnly=True)["key"]["id"]
+    assert call(c, key, "acquire").json()["limits"]["localOnly"] is True
+    c.app.state.machine.snapshot_now()
+    c.app.state.machine = machine_at(tmp_path / "active" / "state")
+    assert call(c, key, "check").json()["limits"]["localOnly"] is True
+    edited = c.put(f"/v1/auth/client-keys/{key}/limits", json={"limits": {"localOnly": False}})
+    assert edited.status_code == 200
+    assert call(c, key, "renew").status_code == 409
+
+
 def test_lease_expiration_does_not_reset_request_rate(active_client):
     c = active_client
     key = mint(c, maxConcurrentRequests=1, requestsPerMinute=2)["key"]["id"]
