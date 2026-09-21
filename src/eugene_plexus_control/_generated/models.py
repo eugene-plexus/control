@@ -9,6 +9,98 @@ from typing import Any
 from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, SecretStr
 
 
+class ClientKey(BaseModel):
+    id: str = Field(..., max_length=128, min_length=1)
+    name: str = Field(..., max_length=64, min_length=1)
+    tail: str = Field(..., max_length=6)
+    createdAt: AwareDatetime
+    expiresAt: AwareDatetime
+    revokedAt: AwareDatetime | None = None
+    lastUsedAt: AwareDatetime | None = Field(
+        None, description='Reserved; not currently measured.'
+    )
+    originNode: str | None = None
+    migrated: bool | None = Field(
+        None,
+        description='True for a record imported from a pre-A3 node-local registry.',
+    )
+
+
+class Scope(StrEnum):
+    install = 'install'
+    standalone = 'standalone'
+
+
+class Migration(StrEnum):
+    complete = 'complete'
+    pending = 'pending'
+    error = 'error'
+    standalone = 'standalone'
+
+
+class ClientKeyList(BaseModel):
+    keys: list[ClientKey]
+    authority: str | None = None
+    revision: int | None = Field(None, ge=0)
+    scope: Scope | None = None
+    migration: Migration | None = None
+    detail: str | None = None
+
+
+class ClientKeyCreateRequest(BaseModel):
+    name: str = Field(..., max_length=64, min_length=1)
+    ttlDays: int | None = Field(365, ge=1, le=3650)
+
+
+class ClientKeyCreated(BaseModel):
+    key: ClientKey
+    token: str = Field(
+        ...,
+        description='Returned once; never persisted in the registry or gateway cache.',
+    )
+
+
+class ClientKeyPolicyEntry(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=128, min_length=1)
+    expiresAt: AwareDatetime
+    revokedAt: AwareDatetime | None = None
+
+
+class ClientKeyPolicy(BaseModel):
+    """
+    Positive registry: only listed, unrevoked, unexpired identifiers may be
+    authorized. Default refresh 15 seconds, maximum age 60 seconds (up to
+    five seconds clock tolerance). Missing/stale policy causes client-only
+    503; known revoked keys remain refused. Operator/service auth is unaffected.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    authority: str = Field(..., min_length=1)
+    revision: int = Field(..., ge=0)
+    generatedAt: float = Field(
+        ...,
+        description='Authority UTC Unix timestamp. Intermediaries must not renew it.',
+    )
+    keys: list[ClientKeyPolicyEntry]
+
+
+class ClientKeyImport(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keys: list[ClientKey] = Field(..., max_length=10000)
+    signature: str = Field(
+        ...,
+        description='Base64 Ed25519 signature by the enrolled node over UTF-8\n\'eugene-plexus/client-keys/import/v1\\n\' followed by canonical JSON\n{"node":name,"keys":keys}, sorted keys, compact separators, ensure_ascii=false.\nIdempotent; imported revocations cannot be cleared by replay.\n',
+    )
+
+
 class Os(StrEnum):
     windows = 'windows'
     linux = 'linux'
@@ -947,6 +1039,9 @@ class LogOp(StrEnum):
     putRuntime = 'putRuntime'
     deleteRuntime = 'deleteRuntime'
     patchConfig = 'patchConfig'
+    putClientKey = 'putClientKey'
+    importClientKeys = 'importClientKeys'
+    revokeClientKey = 'revokeClientKey'
     rotateSigningKey = 'rotateSigningKey'
     promote = 'promote'
 
@@ -1460,6 +1555,11 @@ class Snapshot(BaseModel):
 
     """
 
+    clientKeys: list[ClientKey] | None = None
+    clientKeyImports: dict[str, str] | None = Field(
+        None,
+        description='Node-to-digest map of committed legacy imports, replicated with the registry.',
+    )
     index: int
     epoch: int
     nodes: list[Node] | None = None
