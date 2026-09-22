@@ -94,6 +94,17 @@ class Settings(BaseSettings):
     The config field's own description names this variable, so an
     operator who flips the mode in the UI is told what else to set."""
 
+    allowed_hosts: str | None = None
+    """Extra names first-run setup and sign-in answer to, comma-separated;
+    `*` for any. See `trusted_host` for the rule and why it exists.
+
+    Bootstrap rather than config for two reasons: the routes it guards
+    are the ones an install that has no config yet must answer, and in
+    normal use nobody needs it -- the browser reaches this root through
+    an agent's proxy, which dials it by address. It is the override for
+    an operator who points something straight at this port by a DNS
+    name of their own."""
+
 
 def load_settings() -> Settings:
     return Settings()

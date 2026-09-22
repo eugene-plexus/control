@@ -30,7 +30,7 @@ import base64
 import logging
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Depends, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .. import config as config_module
@@ -43,6 +43,7 @@ from .._generated.models import (
 from ..auth_state import AuthState
 from ..dependencies import problem, require_operator
 from ..state_machine import AlreadyActive, NotActive, StateMachine
+from ..trusted_host import require_trusted_host
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +118,14 @@ async def auth_status(request: Request) -> AuthStatus:
     )
 
 
-@router.post("/v1/auth/initialize", status_code=204)
+# The two unauthenticated doors a browser uses, and the only routes here
+# that check `Host`: first-run is first-come, so a page that rebinds its
+# own name to this machine could otherwise claim the install. See
+# `trusted_host` for the rule and for why the machine routes are exempt.
+_BROWSER_DOOR = [Depends(require_trusted_host)]
+
+
+@router.post("/v1/auth/initialize", status_code=204, dependencies=_BROWSER_DOOR)
 async def initialize(request: Request, body: AuthInitializeRequest) -> None:
     """First-run only. Establishes the whole trust root.
 
@@ -194,7 +202,7 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
     )
 
 
-@router.post("/v1/auth/login", response_model=AuthLoginResponse)
+@router.post("/v1/auth/login", response_model=AuthLoginResponse, dependencies=_BROWSER_DOOR)
 async def login(request: Request, body: AuthInitializeRequest) -> AuthLoginResponse:
     """Verify the passphrase, unseal the keys, issue a session token.
 
