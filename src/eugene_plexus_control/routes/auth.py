@@ -58,6 +58,18 @@ _RATE_LIMIT_MAX_FAILURES = 5
 _INITIAL_KEY_ID = "1"
 
 
+MIN_PASSPHRASE_LENGTH = 12
+"""The shortest passphrase first-run setup accepts, in characters.
+
+The same number as the agent's and the UI's, deliberately: the wizard
+posts one passphrase to both the agent and this root, and three
+different minimums would be a form that passes on one screen and is
+refused by the next. Applied where a passphrase is **chosen** and never
+where one is presented -- an install that already has a shorter one
+still signs in and still unlocks, because there is no way to change it
+and refusing it would be a lockout."""
+
+
 # How long `GET /v1/auth/status` waits for the keyring probe before
 # answering without it. A locked Secret Service can block on a prompt
 # nobody will answer; a status endpoint must not hang with it.
@@ -121,6 +133,16 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
     passphrase = body.passphrase.get_secret_value()
     if not passphrase:
         raise problem(status.HTTP_400_BAD_REQUEST, "Empty passphrase", "A passphrase is required.")
+    # Before anything is minted: a refusal here leaves a fresh install,
+    # so the next try is first-run again rather than "already initialized".
+    if len(passphrase) < MIN_PASSPHRASE_LENGTH:
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Passphrase too short",
+            f"Choose a passphrase of at least {MIN_PASSPHRASE_LENGTH} characters. It locks "
+            "every secret this install keeps and it can never be reset, so a short one is "
+            "the easiest part of the install to guess. A few ordinary words in a row works.",
+        )
 
     salt = security.generate_master_key_salt()
     master_key = security.derive_master_key(passphrase, salt)
