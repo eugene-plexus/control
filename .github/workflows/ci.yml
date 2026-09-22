@@ -98,16 +98,19 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_ACTOR:-}" == "dependabot[bot]" ]]; then
-            echo "Dependabot commits are exempt from DCO sign-off."
-            exit 0
-          fi
           status=0
           while IFS= read -r sha; do
             [[ -z "$sha" ]] && continue
             name=$(git log -1 --format=%an "$sha")
             email=$(git log -1 --format=%ae "$sha")
             expected="Signed-off-by: ${name} <${email}>"
+            # Dependabot signs with support@github.com rather than its author
+            # address. Match the commit, not the actor who refreshed the PR;
+            # human commits on a bot PR must still carry their own sign-off.
+            if [[ "$name" == "dependabot[bot]" &&
+                  "$email" == "49699333+dependabot[bot]@users.noreply.github.com" ]]; then
+              expected="Signed-off-by: dependabot[bot] <support@github.com>"
+            fi
             msg=$(git log -1 --format=%B "$sha")
             if ! grep -Fxq "$expected" <<<"$msg"; then
               echo "::error::Commit $sha by ${name} <${email}> is missing a matching DCO sign-off."
