@@ -449,3 +449,13 @@ def hash_join_token(token: str) -> str:
     import hashlib
 
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def issue_client_token(
+    *, signing_key: bytes, key_id: str, name: str, issued: int, expires: int
+) -> str:
+    return jwt.encode(
+        {"sub": name, "aud": "client", "iat": issued, "exp": expires, "jti": key_id},
+        signing_key,
+        algorithm=signing_algorithm(signing_key),
+    )

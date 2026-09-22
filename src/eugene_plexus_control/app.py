@@ -40,6 +40,7 @@ from .replication import Follower
 from .rotation import RotationTracker
 from .routes import admin as admin_routes
 from .routes import auth as auth_routes
+from .routes import client_keys as client_key_routes
 from .routes import config as config_routes
 from .routes import control as control_routes
 from .routes import health as health_routes
@@ -378,6 +379,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # per-router level would have let a service token revoke a host.
     app.include_router(health_routes.router)
     app.include_router(auth_routes.router)
+    app.include_router(client_key_routes.router)
     app.include_router(node_routes.router)
     app.include_router(control_routes.router)
     app.include_router(topology_routes.router)

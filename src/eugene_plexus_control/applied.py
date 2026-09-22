@@ -85,6 +85,11 @@ OP_DELETE_RUNTIME = "deleteRuntime"
 OP_PATCH_CONFIG = "patchConfig"
 OP_ROTATE_SIGNING_KEY = "rotateSigningKey"
 OP_PROMOTE = "promote"
+OP_PUT_CLIENT_KEY = "putClientKey"
+OP_IMPORT_CLIENT_KEYS = "importClientKeys"
+OP_REVOKE_CLIENT_KEY = "revokeClientKey"
+OP_SET_CLIENT_KEY_LIMITS = "setClientKeyLimits"
+OP_PUT_CLIENT_ADMISSION = "putClientAdmission"
 
 ALL_OPS: frozenset[str] = frozenset(
     {
@@ -98,6 +103,11 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_PATCH_CONFIG,
         OP_ROTATE_SIGNING_KEY,
         OP_PROMOTE,
+        OP_PUT_CLIENT_KEY,
+        OP_IMPORT_CLIENT_KEYS,
+        OP_REVOKE_CLIENT_KEY,
+        OP_SET_CLIENT_KEY_LIMITS,
+        OP_PUT_CLIENT_ADMISSION,
     }
 )
 
@@ -292,6 +302,9 @@ class AppliedState:
     been active all along — a promoted standby with no `standbyUrls`
     silently has no standbys of its own."""
     identity: InstallIdentity = field(default_factory=InstallIdentity)
+    client_keys: dict[str, dict[str, Any]] = field(default_factory=dict)
+    client_admission: dict[str, Any] = field(default_factory=lambda: {"clock": 0.0, "buckets": {}})
+    client_key_imports: dict[str, str] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -524,6 +537,138 @@ def _apply_promote(state: AppliedState, payload: dict[str, Any], index: int) -> 
     return replace(state, nodes=nodes)
 
 
+def _key_record(raw: Any) -> dict[str, Any]:
+    from datetime import datetime
+
+    if not isinstance(raw, dict):
+        raise ApplyError("client-key record must be an object")
+    for key in ("id", "name", "tail", "createdAt", "expiresAt"):
+        if not isinstance(raw.get(key), str) or (not raw[key] and key != "tail"):
+            raise ApplyError(f"invalid client-key {key}")
+    for key in ("createdAt", "expiresAt", "revokedAt"):
+        if raw.get(key) is not None:
+            try:
+                parsed = datetime.fromisoformat(raw[key])
+                if parsed.utcoffset() is None:
+                    raise ValueError("timezone missing")
+            except (ValueError, TypeError) as exc:
+                raise ApplyError(f"invalid client-key {key}") from exc
+    # A log entry/snapshot must never retain a token or an unexpected secret field.
+    allowed = {
+        "id",
+        "name",
+        "tail",
+        "createdAt",
+        "expiresAt",
+        "revokedAt",
+        "originNode",
+        "migrated",
+        "lastUsedAt",
+        "limits",
+    }
+    if raw.keys() - allowed:
+        raise ApplyError("unexpected client-key property")
+    from .client_admission import validate_limits
+
+    try:
+        validate_limits(raw.get("limits"))
+    except ValueError as exc:
+        raise ApplyError("invalid client-key limits") from exc
+    return dict(raw)
+
+
+def _key_records(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, list):
+        raise ApplyError("client-key records must be a list")
+    records = {}
+    for item in raw:
+        record = _key_record(item)
+        if record["id"] in records:
+            raise ApplyError("duplicate client-key identifier")
+        records[record["id"]] = record
+    return records
+
+
+def _apply_put_client_key(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    record = _key_record(payload.get("key"))
+    if record["id"] in state.client_keys:
+        raise ApplyError("client-key identifier already exists")
+    return replace(state, client_keys={**state.client_keys, record["id"]: record})
+
+
+def _apply_import_client_keys(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    node = payload.get("node")
+    if node not in state.nodes or not isinstance(payload.get("digest"), str):
+        raise ApplyError("invalid client-key import origin")
+    imported = _key_records(payload.get("keys"))
+    keys = dict(state.client_keys)
+    for record in imported.values():
+        record = dict(record)
+        record.update(originNode=node, migrated=True)
+        previous = keys.get(record["id"])
+        if previous is not None:
+            if previous.get("originNode") != node or any(
+                previous.get(k) != record.get(k) for k in ("tail", "createdAt", "expiresAt")
+            ):
+                raise ApplyError("client-key import conflicts with an existing record")
+            if "limits" in previous:
+                record["limits"] = previous["limits"]
+            else:
+                record.pop("limits", None)
+            if previous.get("revokedAt") is not None:
+                record["revokedAt"] = previous["revokedAt"]
+        keys[record["id"]] = record
+    return replace(
+        state,
+        client_keys=keys,
+        client_key_imports={**state.client_key_imports, node: payload["digest"]},
+    )
+
+
+def _apply_set_client_key_limits(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    key_id = payload.get("id")
+    if key_id not in state.client_keys or not isinstance(payload.get("limits"), dict):
+        raise ApplyError("unknown key or missing limits")
+    record = _key_record({**state.client_keys[key_id], "limits": payload["limits"]})
+    return replace(state, client_keys={**state.client_keys, key_id: record})
+
+
+def _apply_put_client_admission(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    from .client_admission import clean_buckets, validate_ledger
+
+    try:
+        now = payload["clock"]
+        if now < state.client_admission["clock"]:
+            raise ValueError("admission clock regressed")
+        buckets = clean_buckets(state.client_admission["buckets"], now)
+        buckets[payload["keyId"]] = payload["bucket"]
+        ledger = validate_ledger({"clock": now, "buckets": buckets})
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ApplyError("invalid admission update") from exc
+    return replace(state, client_admission=ledger)
+
+
+def _apply_revoke_client_key(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    key_id = payload.get("id")
+    if key_id not in state.client_keys:
+        raise ApplyError("unknown client-key identifier")
+    previous = state.client_keys[key_id]
+    record = _key_record(
+        {**previous, "revokedAt": previous.get("revokedAt") or payload.get("revokedAt")}
+    )
+    if record.get("revokedAt") is None:
+        raise ApplyError("revocation timestamp required")
+    return replace(state, client_keys={**state.client_keys, key_id: record})
+
+
 _Handler = Callable[["AppliedState", dict[str, Any], int], "AppliedState"]
 
 _HANDLERS: dict[str, _Handler] = {
@@ -537,6 +682,11 @@ _HANDLERS: dict[str, _Handler] = {
     OP_PATCH_CONFIG: _apply_patch_config,
     OP_ROTATE_SIGNING_KEY: _apply_rotate_signing_key,
     OP_PROMOTE: _apply_promote,
+    OP_PUT_CLIENT_KEY: _apply_put_client_key,
+    OP_IMPORT_CLIENT_KEYS: _apply_import_client_keys,
+    OP_REVOKE_CLIENT_KEY: _apply_revoke_client_key,
+    OP_SET_CLIENT_KEY_LIMITS: _apply_set_client_key_limits,
+    OP_PUT_CLIENT_ADMISSION: _apply_put_client_admission,
 }
 
 
@@ -593,6 +743,9 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
             for r in sorted(state.runtimes.values(), key=lambda r: (r.node, r.name))
         ],
         "config": dict(state.config),
+        "clientKeys": [state.client_keys[key] for key in sorted(state.client_keys)],
+        "clientAdmission": state.client_admission,
+        "clientKeyImports": dict(state.client_key_imports),
         "salt": identity.salt,
         "passphraseVerifier": identity.passphraseVerifier,
         "sealedSigningKey": identity.sealedSigningKey,
@@ -629,6 +782,8 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
     snapshotted, so anything this drops is a divergence waiting for a
     promotion to reveal it.
     """
+    from .client_admission import validate_ledger
+
     runtimes: dict[str, RuntimeRecord] = {}
     for entry in raw.get("runtimes") or []:
         spec = entry.get("spec") or {}
@@ -666,6 +821,9 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         },
         runtimes=runtimes,
         config=dict(raw.get("config") or {}),
+        client_admission=validate_ledger(raw.get("clientAdmission")),
+        client_keys=_key_records(raw.get("clientKeys", [])),
+        client_key_imports=dict(raw.get("clientKeyImports") or {}),
         identity=InstallIdentity(
             salt=raw.get("salt"),
             passphraseVerifier=raw.get("passphraseVerifier"),

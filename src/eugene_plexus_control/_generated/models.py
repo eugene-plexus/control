@@ -4,9 +4,172 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, SecretStr
+from pydantic import (
+    AnyUrl,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    SecretStr,
+)
+
+
+class AllowedModel(RootModel[str]):
+    root: str = Field(..., max_length=256, min_length=1)
+
+
+class ClientKeyLimits(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    localOnly: bool | None = Field(
+        False,
+        description='Permit only backends explicitly classified local by drivers enforcing\nthe local-only request policy. External, unknown and older drivers\nare ineligible, including through aliases, fallback and wake. The\ncaller cannot relax this restriction. Local is a configured trust\nboundary, not a promise to sandbox a malicious backend.\n',
+    )
+    allowedModels: list[AllowedModel] | None = Field(
+        None,
+        description='Null permits all. Empty permits none. Exact alias and actual target IDs must both be allowed.',
+        max_length=100,
+    )
+    maxConcurrentRequests: int | None = Field(2, ge=1, le=64)
+    requestsPerMinute: int | None = Field(60, ge=1, le=10000)
+
+
+class ClientKey(BaseModel):
+    id: str = Field(..., max_length=128, min_length=1)
+    name: str = Field(..., max_length=64, min_length=1)
+    tail: str = Field(..., max_length=6)
+    createdAt: AwareDatetime
+    expiresAt: AwareDatetime
+    revokedAt: AwareDatetime | None = None
+    lastUsedAt: AwareDatetime | None = Field(
+        None, description='Reserved; not currently measured.'
+    )
+    originNode: str | None = None
+    limits: ClientKeyLimits | None = Field(
+        None,
+        description='Absent on legacy keys (all models, no per-key limits); new keys receive bounded defaults.',
+    )
+    migrated: bool | None = Field(
+        None,
+        description='True for a record imported from a pre-A3 node-local registry.',
+    )
+
+
+class Scope(StrEnum):
+    install = 'install'
+    standalone = 'standalone'
+
+
+class Migration(StrEnum):
+    complete = 'complete'
+    pending = 'pending'
+    error = 'error'
+    standalone = 'standalone'
+
+
+class ClientKeyList(BaseModel):
+    keys: list[ClientKey]
+    authority: str | None = None
+    revision: int | None = Field(None, ge=0)
+    scope: Scope | None = None
+    migration: Migration | None = None
+    detail: str | None = None
+
+
+class ClientKeyCreateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=64, min_length=1)
+    ttlDays: int | None = Field(365, ge=1, le=3650)
+    limits: ClientKeyLimits | None = None
+
+
+class ClientKeyUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    limits: ClientKeyLimits
+
+
+class Action(StrEnum):
+    check = 'check'
+    acquire = 'acquire'
+    renew = 'renew'
+    release = 'release'
+
+
+class ClientAdmissionRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    action: Action
+    keyId: str = Field(..., max_length=128, min_length=1)
+    requestId: str = Field(..., max_length=128, min_length=1)
+    model: str | None = Field(None, max_length=256, min_length=1)
+
+
+class ClientAdmissionResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keyId: str
+    keyName: str
+    limits: ClientKeyLimits | None = None
+    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
+
+
+class ClientKeyCreated(BaseModel):
+    key: ClientKey
+    token: str = Field(
+        ...,
+        description='Returned once; never persisted in the registry or gateway cache.',
+    )
+
+
+class ClientKeyPolicyEntry(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=128, min_length=1)
+    expiresAt: AwareDatetime
+    revokedAt: AwareDatetime | None = None
+
+
+class ClientKeyPolicy(BaseModel):
+    """
+    Positive registry: only listed, unrevoked, unexpired identifiers may be
+    authorized. Default refresh 15 seconds, maximum age 60 seconds (up to
+    five seconds clock tolerance). Missing/stale policy causes client-only
+    503; known revoked keys remain refused. Operator/service auth is unaffected.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    authority: str = Field(..., min_length=1)
+    revision: int = Field(..., ge=0)
+    generatedAt: float = Field(
+        ...,
+        description='Authority UTC Unix timestamp. Intermediaries must not renew it.',
+    )
+    keys: list[ClientKeyPolicyEntry]
+
+
+class ClientKeyImport(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keys: list[ClientKey] = Field(..., max_length=10000)
+    signature: str = Field(
+        ...,
+        description='Base64 Ed25519 signature by the enrolled node over UTF-8\n\'eugene-plexus/client-keys/import/v1\\n\' followed by canonical JSON\n{"node":name,"keys":keys}, sorted keys, compact separators, ensure_ascii=false.\nIdempotent; imported revocations cannot be cleared by replay.\n',
+    )
 
 
 class Os(StrEnum):
@@ -33,30 +196,42 @@ class Role(StrEnum):
     tool = 'tool'
 
 
-class Message(BaseModel):
-    """
-    A single message in a conversation. Deliberately close to the
-    OpenAI / Anthropic chat message format so drivers don't have to
-    re-shape on every hop.
+class TextContentPart(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['text']
+    text: str
 
+
+class Detail(StrEnum):
+    """
+    Explicit high/low processing modes are not supported.
     """
 
-    role: Role
-    content: str | None = Field(
-        None,
-        description='Message text. Text-only for now; multimodal extensions\ndeferred. **Nullable, and no longer required:** an assistant\nturn that only calls a tool has no text to carry, and the\nalternative — an empty string — would assert the model said\nnothing when in fact it said something that was not text.\n',
+    auto = 'auto'
+
+
+class ImageUrl(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
-    toolCalls: list[dict[str, Any]] | None = Field(
-        None,
-        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    url: str = Field(
+        ...,
+        description='Inline base64 PNG or JPEG data URL. No remote references.',
+        max_length=6990531,
     )
-    toolCallId: str | None = Field(
-        None,
-        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    detail: Detail | None = Field(
+        None, description='Explicit high/low processing modes are not supported.'
     )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
+
+
+class ImageContentPart(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
+    type: Literal['image_url']
+    image_url: ImageUrl
 
 
 class BackendKind(StrEnum):
@@ -212,6 +387,21 @@ class ModelFormat(StrEnum):
     safetensors = 'safetensors'
 
 
+class RetryDisposition(StrEnum):
+    """
+    Safe means this attempt did not accept application work and may
+    be replayed before any output. Terminal means the request must
+    be corrected. Indeterminate means work may have occurred; do not
+    replay automatically. Missing classification on a server failure
+    is indeterminate, never implicit permission to retry.
+
+    """
+
+    safe = 'safe'
+    terminal = 'terminal'
+    indeterminate = 'indeterminate'
+
+
 class Problem(BaseModel):
     """
     Error response shape, modeled on RFC 7807 (problem+json). Every
@@ -235,6 +425,15 @@ class Problem(BaseModel):
     component: str | None = Field(
         None,
         description='Eugene Plexus component name that originated the error\n(e.g. `"gateway"`, `"inference-driver:left"`).\n',
+    )
+    retryDisposition: RetryDisposition | None = Field(
+        None,
+        description='Safe means this attempt did not accept application work and may\nbe replayed before any output. Terminal means the request must\nbe corrected. Indeterminate means work may have occurred; do not\nreplay automatically. Missing classification on a server failure\nis indeterminate, never implicit permission to retry.\n',
+    )
+    retryAfterSeconds: float | None = Field(
+        None,
+        description='Parsed provider Retry-After delay; a scheduling hint, not permission to replay.',
+        ge=0.0,
     )
 
 
@@ -947,6 +1146,11 @@ class LogOp(StrEnum):
     putRuntime = 'putRuntime'
     deleteRuntime = 'deleteRuntime'
     patchConfig = 'patchConfig'
+    putClientKey = 'putClientKey'
+    importClientKeys = 'importClientKeys'
+    revokeClientKey = 'revokeClientKey'
+    setClientKeyLimits = 'setClientKeyLimits'
+    putClientAdmission = 'putClientAdmission'
     rotateSigningKey = 'rotateSigningKey'
     promote = 'promote'
 
@@ -1383,6 +1587,14 @@ class Node(BaseModel):
     )
 
 
+class MessageContent1(RootModel[list[TextContentPart | ImageContentPart]]):
+    root: list[TextContentPart | ImageContentPart] = Field(
+        ...,
+        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        min_length=1,
+    )
+
+
 class DirectoryListing(BaseModel):
     """
     One directory on the component's own host, listed for a picker.
@@ -1460,6 +1672,15 @@ class Snapshot(BaseModel):
 
     """
 
+    clientAdmission: dict[str, Any] | None = Field(
+        None,
+        description='Durable logical clock and per-key admission buckets; replayed verbatim with leases and rolling-window charges.',
+    )
+    clientKeys: list[ClientKey] | None = None
+    clientKeyImports: dict[str, str] | None = Field(
+        None,
+        description='Node-to-digest map of committed legacy imports, replicated with the registry.',
+    )
     index: int
     epoch: int
     nodes: list[Node] | None = None
@@ -1504,3 +1725,29 @@ class Snapshot(BaseModel):
 
 class NodeList(BaseModel):
     nodes: list[Node]
+
+
+class Message(BaseModel):
+    """
+    A single message in a conversation. Deliberately close to the
+    OpenAI / Anthropic chat message format so drivers don't have to
+    re-shape on every hop.
+
+    """
+
+    role: Role
+    content: str | MessageContent1 | None = Field(
+        None,
+        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+    )
+    toolCalls: list[dict[str, Any]] | None = Field(
+        None,
+        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    )
+    toolCallId: str | None = Field(
+        None,
+        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    )
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
+    )

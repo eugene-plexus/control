@@ -4,9 +4,39 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, SecretStr
+from pydantic import (
+    AnyUrl,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    SecretStr,
+)
+
+
+class Sample(RootModel[float]):
+    root: float = Field(..., gt=0.0)
+
+
+class BenchmarkPoint(BaseModel):
+    depth: int = Field(..., ge=0)
+    tokensPerSecond: float = Field(..., gt=0.0)
+    standardDeviation: float = Field(..., ge=0.0)
+    samples: list[Sample]
+
+
+class BenchmarkState(StrEnum):
+    running = 'running'
+    completed = 'completed'
+    failed = 'failed'
+    cancelled = 'cancelled'
+
+
+class Depth(RootModel[int]):
+    root: int = Field(..., ge=0)
 
 
 class ComponentKind(StrEnum):
@@ -62,30 +92,42 @@ class Role(StrEnum):
     tool = 'tool'
 
 
-class Message(BaseModel):
-    """
-    A single message in a conversation. Deliberately close to the
-    OpenAI / Anthropic chat message format so drivers don't have to
-    re-shape on every hop.
+class TextContentPart(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['text']
+    text: str
 
+
+class Detail(StrEnum):
+    """
+    Explicit high/low processing modes are not supported.
     """
 
-    role: Role
-    content: str | None = Field(
-        None,
-        description='Message text. Text-only for now; multimodal extensions\ndeferred. **Nullable, and no longer required:** an assistant\nturn that only calls a tool has no text to carry, and the\nalternative — an empty string — would assert the model said\nnothing when in fact it said something that was not text.\n',
+    auto = 'auto'
+
+
+class ImageUrl(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
-    toolCalls: list[dict[str, Any]] | None = Field(
-        None,
-        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    url: str = Field(
+        ...,
+        description='Inline base64 PNG or JPEG data URL. No remote references.',
+        max_length=6990531,
     )
-    toolCallId: str | None = Field(
-        None,
-        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    detail: Detail | None = Field(
+        None, description='Explicit high/low processing modes are not supported.'
     )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
+
+
+class ImageContentPart(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
+    type: Literal['image_url']
+    image_url: ImageUrl
 
 
 class BackendKind(StrEnum):
@@ -201,6 +243,21 @@ class ModelFormat(StrEnum):
     safetensors = 'safetensors'
 
 
+class RetryDisposition(StrEnum):
+    """
+    Safe means this attempt did not accept application work and may
+    be replayed before any output. Terminal means the request must
+    be corrected. Indeterminate means work may have occurred; do not
+    replay automatically. Missing classification on a server failure
+    is indeterminate, never implicit permission to retry.
+
+    """
+
+    safe = 'safe'
+    terminal = 'terminal'
+    indeterminate = 'indeterminate'
+
+
 class Problem(BaseModel):
     """
     Error response shape, modeled on RFC 7807 (problem+json). Every
@@ -224,6 +281,15 @@ class Problem(BaseModel):
     component: str | None = Field(
         None,
         description='Eugene Plexus component name that originated the error\n(e.g. `"gateway"`, `"inference-driver:left"`).\n',
+    )
+    retryDisposition: RetryDisposition | None = Field(
+        None,
+        description='Safe means this attempt did not accept application work and may\nbe replayed before any output. Terminal means the request must\nbe corrected. Indeterminate means work may have occurred; do not\nreplay automatically. Missing classification on a server failure\nis indeterminate, never implicit permission to retry.\n',
+    )
+    retryAfterSeconds: float | None = Field(
+        None,
+        description='Parsed provider Retry-After delay; a scheduling hint, not permission to replay.',
+        ge=0.0,
     )
 
 
@@ -1053,76 +1119,158 @@ class AuthStatus(BaseModel):
     )
 
 
+class AllowedModel(RootModel[str]):
+    root: str = Field(..., max_length=256, min_length=1)
+
+
+class ClientKeyLimits(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    localOnly: bool | None = Field(
+        False,
+        description='Permit only backends explicitly classified local by drivers enforcing\nthe local-only request policy. External, unknown and older drivers\nare ineligible, including through aliases, fallback and wake. The\ncaller cannot relax this restriction. Local is a configured trust\nboundary, not a promise to sandbox a malicious backend.\n',
+    )
+    allowedModels: list[AllowedModel] | None = Field(
+        None,
+        description='Null permits all. Empty permits none. Exact alias and actual target IDs must both be allowed.',
+        max_length=100,
+    )
+    maxConcurrentRequests: int | None = Field(2, ge=1, le=64)
+    requestsPerMinute: int | None = Field(60, ge=1, le=10000)
+
+
 class ClientKey(BaseModel):
-    """
-    A long-lived bearer this install minted for an app outside it
-    (hobbyist UX S4, 2026-09-15) — as a *record*, never as the token.
-
-    Before these existed the only key a person could paste into
-    Continue or Open WebUI was the operator session token: full
-    authority, expired in fourteen days, and shown only inside the
-    playground's diagnostic panel. A client key carries
-    `aud: client`, which the gateway accepts on its three
-    OpenAI-compatible paths and nothing else accepts anywhere.
-
-    """
-
-    id: str = Field(
-        ...,
-        description="The token's `jti` claim, and what `DELETE` takes. Random per\nkey; the only thing the gateway needs in order to refuse one.\n",
-    )
-    name: str = Field(
-        ...,
-        description='What the operator called it — "Continue on the laptop",\n"phone". Not unique: two keys for the same app are a normal\nthing to want, and refusing the second would be a rule\ninvented for the list\'s benefit rather than the person\'s.\n',
-    )
-    tail: str = Field(
-        ...,
-        description='The last few characters of the token, so a key in this list\ncan be matched against one already pasted into an app.\n\n**Deliberately the tail and not a prefix.** The token is a\nJWT: every key this install mints begins with the same\n`eyJhbGciOiJIUzI1NiIs…` header, so a prefix identifies\nnothing. Short enough to be useless on its own.\n',
-    )
+    id: str = Field(..., max_length=128, min_length=1)
+    name: str = Field(..., max_length=64, min_length=1)
+    tail: str = Field(..., max_length=6)
     createdAt: AwareDatetime
-    expiresAt: AwareDatetime = Field(
-        ...,
-        description='The `exp` claim. Past it the gateway refuses the token on\nsignature validation alone, with no list to consult.\n',
-    )
-    revokedAt: AwareDatetime | None = Field(
-        None,
-        description='Set once the key has been revoked. The record is kept until\n`expiresAt` passes so the list can say "turned off" rather\nthan going silent.\n',
-    )
+    expiresAt: AwareDatetime
+    revokedAt: AwareDatetime | None = None
     lastUsedAt: AwareDatetime | None = Field(
-        None,
-        description='Reserved. Nothing writes it: the agent never sees a client\nkey — the gateway does — and reporting a *last used* the\ninstall cannot observe would be worse than reporting none.\nKept in the shape so a future gateway-side counter has\nsomewhere to land.\n',
+        None, description='Reserved; not currently measured.'
     )
+    originNode: str | None = None
+    limits: ClientKeyLimits | None = Field(
+        None,
+        description='Absent on legacy keys (all models, no per-key limits); new keys receive bounded defaults.',
+    )
+    migrated: bool | None = Field(
+        None,
+        description='True for a record imported from a pre-A3 node-local registry.',
+    )
+
+
+class Scope1(StrEnum):
+    install = 'install'
+    standalone = 'standalone'
+
+
+class Migration(StrEnum):
+    complete = 'complete'
+    pending = 'pending'
+    error = 'error'
+    standalone = 'standalone'
 
 
 class ClientKeyList(BaseModel):
     keys: list[ClientKey]
+    authority: str | None = None
+    revision: int | None = Field(None, ge=0)
+    scope: Scope1 | None = None
+    migration: Migration | None = None
+    detail: str | None = None
 
 
 class ClientKeyCreateRequest(BaseModel):
-    name: str = Field(
-        ...,
-        description="What this key is for, in the operator's words. Shown in the\nlist and nowhere else; it is not part of the token.\n",
-        max_length=64,
-        min_length=1,
+    model_config = ConfigDict(
+        extra='forbid',
     )
-    ttlDays: int | None = Field(
-        365,
-        description='How long the key lives. A year by default: long enough that\na person who set up Continue once does not come back to a\ndead key, short enough that a key forgotten in a config file\neventually stops working. **No "never expires" option** —\nthe revocation path here is a bounded-staleness list, and a\ntoken with no expiry at all leans on it entirely.\n',
-        ge=1,
-        le=3650,
+    name: str = Field(..., max_length=64, min_length=1)
+    ttlDays: int | None = Field(365, ge=1, le=3650)
+    limits: ClientKeyLimits | None = None
+
+
+class ClientKeyUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
+    limits: ClientKeyLimits
+
+
+class Action(StrEnum):
+    check = 'check'
+    acquire = 'acquire'
+    renew = 'renew'
+    release = 'release'
+
+
+class ClientAdmissionRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    action: Action
+    keyId: str = Field(..., max_length=128, min_length=1)
+    requestId: str = Field(..., max_length=128, min_length=1)
+    model: str | None = Field(None, max_length=256, min_length=1)
+
+
+class ClientAdmissionResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keyId: str
+    keyName: str
+    limits: ClientKeyLimits | None = None
+    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
 
 
 class ClientKeyCreated(BaseModel):
-    """
-    The one and only time the token is on the wire from this agent.
-
-    """
-
     key: ClientKey
     token: str = Field(
         ...,
-        description='The bearer itself. Not stored: the agent keeps the record\nand forgets this. A caller that does not keep it mints\nanother.\n',
+        description='Returned once; never persisted in the registry or gateway cache.',
+    )
+
+
+class ClientKeyPolicyEntry(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=128, min_length=1)
+    expiresAt: AwareDatetime
+    revokedAt: AwareDatetime | None = None
+
+
+class ClientKeyPolicy(BaseModel):
+    """
+    Positive registry: only listed, unrevoked, unexpired identifiers may be
+    authorized. Default refresh 15 seconds, maximum age 60 seconds (up to
+    five seconds clock tolerance). Missing/stale policy causes client-only
+    503; known revoked keys remain refused. Operator/service auth is unaffected.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    authority: str = Field(..., min_length=1)
+    revision: int = Field(..., ge=0)
+    generatedAt: float = Field(
+        ...,
+        description='Authority UTC Unix timestamp. Intermediaries must not renew it.',
+    )
+    keys: list[ClientKeyPolicyEntry]
+
+
+class ClientKeyImport(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keys: list[ClientKey] = Field(..., max_length=10000)
+    signature: str = Field(
+        ...,
+        description='Base64 Ed25519 signature by the enrolled node over UTF-8\n\'eugene-plexus/client-keys/import/v1\\n\' followed by canonical JSON\n{"node":name,"keys":keys}, sorted keys, compact separators, ensure_ascii=false.\nIdempotent; imported revocations cannot be cleared by replay.\n',
     )
 
 
@@ -1731,6 +1879,9 @@ class RuntimeCapabilities(BaseModel):
     embeddings: bool | None = Field(
         None, description='Whether this runtime was started in embedding mode.'
     )
+    vision: bool | None = Field(
+        None, description='Whether the loaded runtime explicitly reports image input.'
+    )
     multimodal: bool | None = Field(
         None, description='Whether a projector was loaded alongside the model.'
     )
@@ -1893,6 +2044,45 @@ class FolderReachSource(StrEnum):
     same_path = 'same_path'
     inherited = 'inherited'
     override = 'override'
+
+
+class BenchmarkRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    modelId: str = Field(..., max_length=256, min_length=1)
+    profileId: str = Field(..., max_length=256, min_length=1)
+    profileName: str = Field(..., max_length=256, min_length=1)
+    runtime: RuntimeSpec
+    repetitions: int | None = Field(3, ge=1, le=5)
+    tokens: int | None = Field(128, ge=16, le=256)
+
+
+class Benchmark(BaseModel):
+    id: str
+    request: BenchmarkRequest
+    node: str
+    state: BenchmarkState
+    startedAt: AwareDatetime
+    finishedAt: AwareDatetime | None = None
+    progress: float = Field(..., ge=0.0, le=1.0)
+    detail: str
+    depths: list[Depth]
+    points: list[BenchmarkPoint]
+    binary: str | None = None
+    engineVersion: str | None = None
+    localPath: str | None = None
+    modelSizeBytes: int | None = Field(None, ge=0)
+    modelModifiedAt: AwareDatetime | None = None
+    command: list[str] | None = None
+    hardware: dict[str, str] | None = Field(
+        None,
+        description='CPU/GPU/backend identity reported by the benchmark executable.',
+    )
+
+
+class BenchmarkList(BaseModel):
+    benchmarks: list[Benchmark]
 
 
 class Component(BaseModel):
@@ -2431,6 +2621,14 @@ class ComponentList(BaseModel):
     )
 
 
+class MessageContent1(RootModel[list[TextContentPart | ImageContentPart]]):
+    root: list[TextContentPart | ImageContentPart] = Field(
+        ...,
+        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        min_length=1,
+    )
+
+
 class DirectoryListing(BaseModel):
     """
     One directory on the component's own host, listed for a picker.
@@ -2601,6 +2799,32 @@ class LibraryFolderReach(BaseModel):
         None, description='Where the library was, or was looked for.'
     )
     folders: list[LibraryFolderStatus]
+
+
+class Message(BaseModel):
+    """
+    A single message in a conversation. Deliberately close to the
+    OpenAI / Anthropic chat message format so drivers don't have to
+    re-shape on every hop.
+
+    """
+
+    role: Role
+    content: str | MessageContent1 | None = Field(
+        None,
+        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+    )
+    toolCalls: list[dict[str, Any]] | None = Field(
+        None,
+        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    )
+    toolCallId: str | None = Field(
+        None,
+        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    )
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
+    )
 
 
 class NodeIdentity(BaseModel):

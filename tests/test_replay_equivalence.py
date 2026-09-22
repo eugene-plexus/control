@@ -43,12 +43,17 @@ from eugene_plexus_control.applied import (
     OP_DELETE_COMPONENT,
     OP_DELETE_RUNTIME,
     OP_ENROLL_NODE,
+    OP_IMPORT_CLIENT_KEYS,
     OP_PATCH_CONFIG,
     OP_PROMOTE,
+    OP_PUT_CLIENT_ADMISSION,
+    OP_PUT_CLIENT_KEY,
     OP_PUT_COMPONENT,
     OP_PUT_RUNTIME,
+    OP_REVOKE_CLIENT_KEY,
     OP_REVOKE_NODE,
     OP_ROTATE_SIGNING_KEY,
+    OP_SET_CLIENT_KEY_LIMITS,
     OP_UPDATE_NODE,
     AppliedState,
     ApplyError,
@@ -73,6 +78,11 @@ EXERCISED_OPS = {
     OP_PUT_RUNTIME,
     OP_DELETE_RUNTIME,
     OP_PATCH_CONFIG,
+    OP_PUT_CLIENT_KEY,
+    OP_SET_CLIENT_KEY_LIMITS,
+    OP_PUT_CLIENT_ADMISSION,
+    OP_IMPORT_CLIENT_KEYS,
+    OP_REVOKE_CLIENT_KEY,
     OP_ROTATE_SIGNING_KEY,
     OP_PROMOTE,
 }
@@ -151,6 +161,54 @@ def _write_history(machine: StateMachine) -> None:
             "enrolledAt": "2026-09-09T11:20:00+00:00",
         },
     )
+    key = {
+        "id": "app-key",
+        "name": "Example",
+        "tail": "sample",
+        "createdAt": "2026-09-09T11:20:00+00:00",
+        "expiresAt": "2027-09-09T11:20:00+00:00",
+    }
+    machine.append(OP_PUT_CLIENT_KEY, {"key": key})
+    machine.append(
+        OP_SET_CLIENT_KEY_LIMITS,
+        {
+            "id": "app-key",
+            "limits": {
+                "allowedModels": ["chosen"],
+                "maxConcurrentRequests": 1,
+                "requestsPerMinute": 4,
+            },
+        },
+    )
+    machine.append(
+        OP_PUT_CLIENT_ADMISSION,
+        {
+            "clock": 10.0,
+            "keyId": "app-key",
+            "bucket": {
+                "request": {
+                    "started": 10.0,
+                    "until": 40.0,
+                    "active": True,
+                    "charged": True,
+                    "model": "chosen",
+                    "policyDigest": "example-digest",
+                },
+            },
+        },
+    )
+
+    machine.append(
+        OP_IMPORT_CLIENT_KEYS,
+        {
+            "node": "attic",
+            "digest": "example-digest",
+            "keys": [{**key, "id": "legacy-key", "revokedAt": "2026-09-09T11:21:00+00:00"}],
+        },
+    )
+    machine.append(
+        OP_REVOKE_CLIENT_KEY, {"id": "app-key", "revokedAt": "2026-09-09T11:22:00+00:00"}
+    )
     machine.append(
         OP_PUT_COMPONENT,
         {"node": "attic", "name": "gateway", "kind": "gateway", "url": "http://10.0.0.2:8080"},
@@ -193,7 +251,8 @@ def _write_history(machine: StateMachine) -> None:
     )
     machine.append(OP_PATCH_CONFIG, {"values": {"uiTheme": "dark", "nodePollIntervalSeconds": 30}})
     machine.append(
-        OP_PATCH_CONFIG, {"values": {"uiTheme": "light", "standbyUrls": ["http://10.0.0.9:8083/"]}}
+        OP_PATCH_CONFIG,
+        {"values": {"uiTheme": "light", "standbyUrls": ["http://10.0.0.9:8083/"]}},
     )
     machine.append(OP_DELETE_RUNTIME, {"node": "attic", "name": "small"})
     machine.append(OP_DELETE_COMPONENT, {"node": "attic", "name": "gateway"})
@@ -532,6 +591,8 @@ def _genesis(machine: StateMachine) -> dict[str, Any]:
         "components": [],
         "runtimes": [],
         "config": {},
+        "clientKeys": [],
+        "clientKeyImports": {},
         "signingKeyId": "1",
         "sealedSigningKey": placeholder("signing"),
     }

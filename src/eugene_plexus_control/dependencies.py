@@ -188,3 +188,16 @@ def require_operator(
     a service token must not be able to enroll a host or re-key the
     install."""
     return _validate(request, creds, accept_operator=True, accept_any_service=False)
+
+
+def require_key_policy(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> security.TokenPayload:
+    return _validate(
+        request,
+        creds,
+        accept_operator=True,
+        accept_any_service=False,
+        accept_service_kinds={"agent", "gateway"},
+    )
