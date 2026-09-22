@@ -33,6 +33,7 @@ from typing import Any
 
 import yaml
 
+from . import _private_files
 from ._generated.models import (
     ConfigDocument,
     ConfigField,
@@ -389,8 +390,14 @@ class BootstrapConfig:
             self._values = {**defaults(), **values}
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
-                with self._path.open("w", encoding="utf-8", newline="\n") as handle:
-                    yaml.safe_dump(self._values, handle, sort_keys=True, default_flow_style=False)
+                # Private and replaced rather than rewritten: see
+                # `_private_files`. Nothing here is sealed material, but
+                # it sits beside what is, and a truncate-then-write that
+                # is killed halfway leaves a boot reading an empty cache.
+                _private_files.write_private_text(
+                    self._path,
+                    yaml.safe_dump(self._values, sort_keys=True, default_flow_style=False),
+                )
             except OSError as exc:
                 log.warning(
                     "could not write the bootstrap config cache %s (%s); applied state is "

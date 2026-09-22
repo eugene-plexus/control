@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import _private_files
+
 log = logging.getLogger(__name__)
 
 LOG_FILENAME = "log.jsonl"
@@ -175,10 +177,14 @@ class LogStore:
         practice. On Windows `os.fsync` on a directory handle is not
         available, so the directory sync is skipped there — the file
         sync is what NTFS needs.
+
+        Opened `0600`: the log carries the salt and the passphrase
+        verifier, which together are an offline attack on the passphrase.
+        See `_private_files` for why that is set at creation.
         """
         self._dir.mkdir(parents=True, exist_ok=True)
         line = json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        with self._log_path.open("a", encoding="utf-8", newline="\n") as handle:
+        with _private_files.open_private_append(self._log_path) as handle:
             handle.write(line + "\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -200,6 +206,11 @@ class LogStore:
         # `os.replace` must happen after the file is closed, and the
         # name has to survive to be replaced. A context manager around
         # the whole thing cannot express an atomic rename.
+        #
+        # `tempfile` creates the file `0600` and `os.replace` keeps the
+        # mode, which is what keeps the snapshot -- sealed keys, salt,
+        # verifier -- private. Load-bearing, not incidental: a
+        # `test_private_files` case watches for it, here and in `_compact`.
         handle = tempfile.NamedTemporaryFile(  # noqa: SIM115
             mode="w",
             encoding="utf-8",
