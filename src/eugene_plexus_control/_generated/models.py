@@ -183,6 +183,28 @@ class Arch(StrEnum):
     arm64 = 'arm64'
 
 
+class TrustGrant(StrEnum):
+    """
+    What a key in a `TrustBundle` may issue. Checked by every
+    verifier against the token's `typ`, `sub` and `aud`:
+
+    * `authority`: the control root's token key, or a standalone
+      agent's own. Sessions, exchanged tokens, client keys, and
+      service tokens with `sub: control`, to any recipient.
+    * `node`: an enrolled agent's token key. Service tokens to **its
+      own machine** with any `sub`, and service tokens with
+      `sub: agent` to other machines and to `control`.
+    * `gateway`: given to a node by the operator's join token, never
+      claimed by the node. Service tokens with `sub: gateway` to
+      other machines and to `control`.
+
+    """
+
+    authority = 'authority'
+    node = 'node'
+    gateway = 'gateway'
+
+
 class Role(StrEnum):
     """
     The speaker of a single message in a conversation. Matches the
@@ -815,12 +837,119 @@ class AuthLoginResponse(BaseModel):
 
     sessionToken: str = Field(
         ...,
-        description='Opaque bearer token. Signed and validated server-side; the\nUI should never inspect its contents. Lifetime is bounded\nby `expiresAt`. New installs and key rotations use JWT\n`alg: EdDSA` with Ed25519. Existing HS256 installs retain\ntheir 32-byte key until explicit rotation. Agent and control\nhold private signing keys; gateway, library and driver hold\npublic verification keys after migration. Verifiers select\nexactly one algorithm from trusted key material, not from\ntoken headers. Rotation invalidates all prior tokens;\nthere is no simultaneous HS256/EdDSA acceptance window.\n',
+        description='Opaque bearer token; the UI should never inspect its\ncontents. Lifetime is bounded by `expiresAt`.\n\nAn `ep-session+jwt` (see `TrustBundle` for the profile),\nsigned by the control root\'s token key. It is addressed to\nthe machine the operator signed in on and to the control\nroot (`aud: ["node:<name>", "control"]`), or to the root\nalone for a login made there directly. A standalone agent\nthat has not joined an install signs its own. The console\nacts on other machines by exchanging it\n(`control.yaml`, `POST /v1/auth/token`), never by sending\nit on.\n',
     )
     expiresAt: AwareDatetime
     operatorName: str | None = Field(
         None,
         description='The operator\'s display name from the constitution\n(typically "operator" or whatever the operator set).\nEchoed for UI welcome strings.\n',
+    )
+
+
+class TrustKey(BaseModel):
+    """
+    One token-signing key a verifier may accept, and what it may issue.
+    """
+
+    kid: str = Field(
+        ...,
+        description='The RFC 7638 JWK thumbprint of the key: base64url, no\npadding, SHA-256 over\n`{"crv":"Ed25519","kty":"OKP","x":"<base64url public key>"}`.\nA token names its key by this in its `kid` header; a verifier\nrefuses a `kid` its bundle does not list.\n',
+    )
+    issuer: str = Field(
+        ...,
+        description='The `iss` a token signed by this key must carry: `control`\nfor the root, `node:<name>` for an enrolled agent, and\n`node:local` for a standalone one.\n',
+        pattern='^(control|node:.+)$',
+    )
+    publicKey: str = Field(
+        ..., description='Base64 of the raw 32-byte Ed25519 public key.'
+    )
+    grants: list[TrustGrant]
+
+
+class RevokedSession(BaseModel):
+    """
+    An operator session signed out anywhere in the install. A
+    verifier refuses a session whose `jti` is listed, and an
+    exchanged token whose `sid` is. Pruned once `exp` has passed.
+
+    """
+
+    jti: str
+    exp: int = Field(..., description="The session's own `exp`, unix seconds.")
+
+
+class TrustBundle(BaseModel):
+    """
+    The set of keys every verifier in the install trusts, and what
+    each may issue. Published by the control root, signed with its
+    identity key, carried as the claims of `SignedTrustBundle.jws`.
+    Design: `docs/design/per-node-token-keys.md`.
+
+    **The token profile it governs.** Every token is a JWS compact
+    JWT with header `{"alg": "EdDSA", "typ": <class>, "kid": <kid>}`
+    and claims `iss`, `sub`, `aud` (an array), `iat`, `exp` and
+    `jti`. There are three classes:
+
+    * `ep-session+jwt`: an operator session (`sub: operator`), or a
+      token obtained from one by exchange, which also carries `act`
+      (`{"sub": "node:<asking machine>"}`) and `sid` (the session's
+      `jti`).
+    * `ep-service+jwt`: a process calling another; `sub` is the
+      caller's kind.
+    * `ep-client+jwt`: a key an app outside the install holds;
+      `jti` is the key's id.
+
+    Recipients are `node:<name>` (every component on that machine),
+    `control` (the root), and `gateway` (the install's front door,
+    for client keys only).
+
+    **A verifier:**
+
+    1. finds the key by `kid` in the bundle it holds, and refuses an
+       unknown one;
+    2. takes the algorithm from the key, never from the header;
+    3. checks the signature, `exp` and `iat` with a 300 s leeway,
+       `typ` against the route's classes, `iss` against the key's
+       issuer, `aud` against itself, and the key's `grants` against
+       what the token claims;
+    4. refuses a token that lives longer than its class allows:
+       1 hour for a service token to another machine, 400 days to
+       the issuer's own, 14 days for a session, 10 minutes for an
+       exchanged token, and 400 days for a client key;
+    5. refuses a session that is listed in `revokedSessions`, or
+       whose `aud` names a node no longer in the bundle.
+
+    No hard expiry, deliberately. A bundle that stopped verifying
+    when the root was dead would end the data path's guarantee to
+    outlive it, so a verifier keeps the newest bundle it holds and
+    its age is reported instead.
+
+    """
+
+    version: int = Field(
+        ...,
+        description="The control root's replicated log index when this bundle was\nbuilt, so it only grows, including across a promotion. A\nverifier refuses a lower version than it holds (rollback)\nand replaces its bundle with an equal or higher one.\n",
+        ge=0,
+    )
+    epoch: int = Field(
+        ..., description="The control root's epoch; an agent refuses a lower one.", ge=0
+    )
+    iat: int = Field(
+        ...,
+        description='When the bundle was signed, unix seconds. Its age is reported, never enforced.',
+    )
+    authority: str = Field(
+        ...,
+        description="Base64 of the raw 32-byte Ed25519 public key that signed this\nbundle: the control root's identity key, which every node\npins at enrollment, or a standalone agent's own identity key.\nA verifier refuses a bundle whose `authority` is not the key\nit pinned.\n",
+    )
+    keys: list[TrustKey]
+    revokedSessions: list[RevokedSession]
+
+
+class SignedTrustBundle(BaseModel):
+    jws: str = Field(
+        ...,
+        description='A JWS compact serialization with header\n`{"alg": "EdDSA", "typ": "ep-trust-bundle+jwt"}`, whose\npayload is a `TrustBundle`, signed with the key its\n`authority` names. The signature covers the payload\'s exact\nbytes, so nothing has to be re-serialized to check it.\n',
     )
 
 
@@ -1034,6 +1163,10 @@ class NodeRole(StrEnum):
     agent = 'agent'
 
 
+class Grant(StrEnum):
+    gateway = 'gateway'
+
+
 class JoinTokenRequest(BaseModel):
     nodeName: str | None = Field(
         None,
@@ -1044,6 +1177,10 @@ class JoinTokenRequest(BaseModel):
         description='Short by default. A join token is the one credential that\ngrants membership, and the window in which it is useful is\nthe window in which it is dangerous.\n',
         ge=30,
         le=86400,
+    )
+    grants: list[Grant] | None = Field(
+        None,
+        description="Extra grants the node enrolled with this token receives in the\ntrust bundle. `gateway` lets it mint `sub: gateway` tokens to\nother machines, which the install's gateway needs in order to\nreach every node's drivers and agent. The wizard asks for it\non the machine that runs the gateway; `/nodes` does not.\n",
     )
 
 
@@ -1060,6 +1197,7 @@ class JoinToken(BaseModel):
     nodeName: str | None = Field(
         None, description='The node name this token is bound to, when it is bound.'
     )
+    grants: list[Grant] | None = None
 
 
 class JoinTokenRecord(BaseModel):
@@ -1077,6 +1215,9 @@ class JoinTokenRecord(BaseModel):
     expiresAt: AwareDatetime
     nodeName: str | None = Field(
         None, description='The node name this token is bound to, when it is bound.'
+    )
+    grants: list[Grant] | None = Field(
+        None, description='What the node it enrolls will be granted, as minted.'
     )
     used: bool = Field(
         ...,
@@ -1106,7 +1247,7 @@ class NodeAddressAnnouncement(BaseModel):
     )
     signature: str = Field(
         ...,
-        description='Detached Ed25519 signature, base64, by the node\'s identity\nsigning key over the **canonical message**: the UTF-8 bytes\nof the JSON object `{"name": "<name>", "sequence":\n<sequence>, "url": "<url>"}` with keys sorted and no\nwhitespace — `json.dumps(obj, sort_keys=True,\nseparators=(",", ":"))`. `name` is the path parameter and\n`url` is the value in this body, verbatim and unnormalized.\n\nSame construction as `RekeyRequest.signature` in\n`agent.yaml`, deliberately: three fields, one serializer,\nstated here so both sides implement it from one sentence.\nIncluding `name` is what stops one node\'s announcement being\nreplayed against another\'s record.\n\n**Verified against the raw request body, never against a\nparsed `url`.** An OpenAPI `format: uri` becomes a URL type\nin most generators, and those normalize — Pydantic\'s\n`AnyUrl` appends a trailing slash to an authority-only URL —\nso a verifier that parses first compares different bytes\nfrom the ones the node signed, and *every* announcement\nfails with what looks like a crypto error. Found by it\nhappening. A signature is over bytes on the wire; `format:\nuri` stays here because the validation and the generated\nclients are still worth having.\n',
+        description='Detached Ed25519 signature, base64, by the node\'s identity\nsigning key over the **canonical message**: the UTF-8 bytes\nof the JSON object `{"name": "<name>", "sequence":\n<sequence>, "url": "<url>"}` with keys sorted and no\nwhitespace — `json.dumps(obj, sort_keys=True,\nseparators=(",", ":"))`. `name` is the path parameter and\n`url` is the value in this body, verbatim and unnormalized.\n\nThree fields, one serializer, stated here so both sides\nimplement it from one sentence. Including `name` is what\nstops one node\'s announcement being replayed against\nanother\'s record.\n\n**Verified against the raw request body, never against a\nparsed `url`.** An OpenAPI `format: uri` becomes a URL type\nin most generators, and those normalize — Pydantic\'s\n`AnyUrl` appends a trailing slash to an authority-only URL —\nso a verifier that parses first compares different bytes\nfrom the ones the node signed, and *every* announcement\nfails with what looks like a crypto error. Found by it\nhappening. A signature is over bytes on the wire; `format:\nuri` stays here because the validation and the generated\nclients are still worth having.\n',
     )
 
 
@@ -1134,17 +1275,10 @@ class Enrollment(BaseModel):
         ...,
         description="The control root's current epoch. The node records it and\nfrom then on refuses any root presenting a lower one.\n",
     )
-    signingKey: str = Field(
+    trustBundle: SignedTrustBundle
+    controlPublicKey: str = Field(
         ...,
-        description="Base64 of the install's unencrypted Ed25519 private key in\nPKCS8 PEM format. This trusted agent is a token minter, so\nenrollment transfers private material to it. It derives\nSubjectPublicKeyInfo public PEM for gateway, library and\ninference-driver children; those receive `AUTH_VERIFY_KEY`\nand their own service token, never this private key.\nNew installs and rotations sign JWTs with `alg: EdDSA`.\nAn upgraded install retains its existing base64 32-byte\nHS256 key until explicit rotation; no re-enrollment is needed.\nThe format selects the algorithm, independently of JWT headers.\n",
-    )
-    signingKeyId: str | None = Field(
-        None,
-        description="The key's generation (`Snapshot.signingKeyId`), so the node\ncan tell a later `POST /v1/node/rekey` that is newer from one\nthat is a replay.\n",
-    )
-    controlPublicKey: str | None = Field(
-        None,
-        description="The control root's public key, so the node can verify that\nlater epoch changes come from a root it recognises rather\nthan from anything that can reach its port.\n",
+        description="Base64 of the control root's raw Ed25519 identity public key.\nThe node pins it and from then on accepts a trust bundle only\nif this key signed it. **No private key is in this\nresponse**: until 2026-09-25 it carried the install's signing\nkey in plaintext, which made every node the install.\n",
     )
     recoveryPublicKey: str | None = Field(
         None,
@@ -1183,6 +1317,16 @@ class LogOp(StrEnum):
     operators, and a node that moved house would appear to have
     enrolled again.
 
+    **`revokeSession` (2026-09-25)** records a sign-out, because the
+    trust bundle every machine checks sessions against is built
+    from applied state. A sign-out a standby had not seen would be a
+    session a promotion brought back.
+
+    **`rotateSigningKey` still carries `revokedNode`** in logs
+    written before 2026-09-25, when revoking a node rotated the
+    shared key. It removes that node if it is still enrolled. Nothing
+    writes it that way now: a revocation is one `revokeNode`.
+
     """
 
     enrollNode = 'enrollNode'
@@ -1199,6 +1343,7 @@ class LogOp(StrEnum):
     setClientKeyLimits = 'setClientKeyLimits'
     putClientAdmission = 'putClientAdmission'
     rotateSigningKey = 'rotateSigningKey'
+    revokeSession = 'revokeSession'
     promote = 'promote'
 
 
@@ -1213,53 +1358,47 @@ class PromoteRequest(BaseModel):
     )
 
 
-class State(StrEnum):
-    """
-    `distributing` is the interesting one: nodes that are `down`
-    hold a superseded key and are refused until they reconnect
-    and are re-keyed. That is why rotation has to be resumable
-    and idempotent rather than a single atomic act.
-
-    """
-
-    minting = 'minting'
-    distributing = 'distributing'
-    done = 'done'
-    failed = 'failed'
-
-
 class Reason(StrEnum):
-    operator = 'operator'
     revocation = 'revocation'
+    rotation = 'rotation'
 
 
-class KeyRotation(BaseModel):
+class TrustChange(BaseModel):
     """
-    Progress of a service-token signing-key rotation, whether
-    triggered explicitly or by revoking a node.
-
-    Phases are named rather than reduced to a percentage because a
-    rotation that stops partway leaves the install in a mixed-key
-    state, and the operator needs to know which nodes are on which
-    key rather than what fraction is done.
+    What a revocation or a root-key rotation changed. Both publish a
+    new trust bundle and push it. Nothing is re-keyed on any node,
+    so there is no mixed-key state to track. A node either holds the
+    new bundle or it does not yet, and it says which on every probe
+    (`Node.trustBundleVersion`).
 
     """
 
-    state: State = Field(
-        ...,
-        description='`distributing` is the interesting one: nodes that are `down`\nhold a superseded key and are refused until they reconnect\nand are re-keyed. That is why rotation has to be resumable\nand idempotent rather than a single atomic act.\n',
-    )
-    reason: Reason | None = None
+    version: int = Field(..., description='The bundle version this change produced.')
+    reason: Reason
     revokedNode: str | None = Field(None, description='Set when `reason: revocation`.')
-    nodesTotal: int | None = None
-    nodesRekeyed: int | None = None
-    nodesPending: list[str] | None = Field(
-        None,
-        description='Nodes that have not yet taken the new key, named rather than\ncounted, because "which host is stale" is the question an\noperator actually has.\n',
+    nodesBehind: list[str] = Field(
+        ...,
+        description='Nodes that had not acknowledged `version` when this answered:\nnamed, because "which host still trusts the old key" is the\nquestion an operator has. They take it from the push, or\nwhen they next pull.\n',
     )
-    error: str | None = None
-    startedAt: AwareDatetime | None = None
-    finishedAt: AwareDatetime | None = None
+
+
+class TokenExchangeRequest(BaseModel):
+    subjectToken: str = Field(
+        ..., description="The operator's session, addressed to the actor's machine."
+    )
+    audience: str = Field(
+        ...,
+        description='The one machine the exchanged token may be presented to.',
+        pattern='^node:.+$',
+    )
+
+
+class TokenExchangeResponse(BaseModel):
+    accessToken: str = Field(
+        ...,
+        description='An `ep-session+jwt` addressed to `audience`, with `act` and `sid`.',
+    )
+    expiresAt: AwareDatetime
 
 
 class ComponentPlacement(BaseModel):
@@ -1334,7 +1473,7 @@ class AuthStatus(BaseModel):
     )
     unlocked: bool | None = Field(
         None,
-        description="True while the master key is in memory and the install's\nsigning key is open. False is the sealed root that answers\n`503 Locked` across its surface — the state a container comes\nback in after every restart under `prompt_on_startup`.\nAbsent from a root that predates the field.\n",
+        description="True while the master key is in memory and this root's\ntoken key is open. False is the sealed root that answers\n`503 Locked` across its surface — the state a container comes\nback in after every restart under `prompt_on_startup`.\nAbsent from a root that predates the field.\n",
     )
     keyringAvailable: bool | None = Field(
         None,
@@ -1493,9 +1632,13 @@ class EnrollmentRequest(BaseModel):
         ...,
         description="The agent's identity public key. The private half stays on\nthe node; sending it would defeat the point of per-node\nsealing.\n",
     )
-    signingPublicKey: str | None = Field(
-        None,
-        description="The agent's Ed25519 public key, recorded as\n`Node.signingPublicKey` and used to verify later address\nannouncements. Optional so an older agent still enrolls; the\ncost of omitting it is that the node cannot re-advertise.\n",
+    signingPublicKey: str = Field(
+        ...,
+        description="The agent's Ed25519 identity public key, recorded as\n`Node.signingPublicKey` and used to verify later address\nannouncements.\n",
+    )
+    tokenPublicKey: str = Field(
+        ...,
+        description="Base64 of the agent's raw Ed25519 token public key, recorded\nas `Node.tokenPublicKey` and listed in the trust bundle. The\nagent generated the pair; the private half stays on it.\n",
     )
     url: AnyUrl | None = Field(
         None,
@@ -1608,6 +1751,18 @@ class Node(BaseModel):
     signingPublicKey: str | None = Field(
         None,
         description="The node's **Ed25519** public key, used for one thing: to\nverify that a `PATCH /v1/nodes/{name}` really came from this\nnode. `publicKey` cannot do it — that one is X25519 and\nexists so secrets can be sealed to the node — and a key that\nboth seals and signs is a key whose compromise costs twice.\n\nAbsent on a node enrolled before nodes had a signing\nidentity. Such a node cannot re-advertise and must re-enroll;\nsurfaced here rather than inferred from a 401.\n",
+    )
+    tokenPublicKey: str | None = Field(
+        None,
+        description="Base64 of this node's raw Ed25519 **token** public key, the\nkey its tokens are signed with. It is listed in the trust\nbundle as `node:<name>`. The private half was generated on\nthe node and has never been anywhere else. A third key,\nseparate from `publicKey` and `signingPublicKey`, because\neach key does one job.\n",
+    )
+    grants: list[TrustGrant] | None = Field(
+        None,
+        description="What this node's key may issue, as the trust bundle lists it:\nalways `node`, plus `gateway` when the join token that\nenrolled it said so. Given by the operator, never claimed by\nthe node.\n",
+    )
+    trustBundleVersion: int | None = Field(
+        None,
+        description='The trust bundle version this node reported holding on the\nlast probe. A value below the current one is a node that has\nnot yet taken a revocation or a rotation. Observation, not\napplied state, so never replicated; `null` until probed.\n',
     )
     advertiseSequence: int | None = Field(
         None,
@@ -1742,7 +1897,11 @@ class Snapshot(BaseModel):
     )
     signingKeyId: str | None = Field(
         None,
-        description='Names the current signing-key generation. Not a secret, and\nthe thing a node reports back so a rotation can tell which\nhosts are stale rather than counting how many are.\n',
+        description="Names the current generation of this root's token key. Not a\nsecret.\n",
+    )
+    revokedSessions: list[RevokedSession] | None = Field(
+        None,
+        description='Sessions signed out and not yet expired, as `revokeSession`\nwrote them. The trust bundle carries the same list.\n',
     )
     salt: str | None = Field(
         None,
@@ -1758,7 +1917,11 @@ class Snapshot(BaseModel):
     )
     sealedSigningKey: str | None = Field(
         None,
-        description='The current service-token signing key, sealed under the\npassphrase-derived key.\n\nThe design\'s replication set requires this — *"otherwise\nevery node must re-enroll after promotion"* — and the first\nimplementation found it missing here, which would have made\na snapshot-bootstrapped standby unpromotable without\nre-enrolling the install. It is **sealed** rather than\nplaintext because a snapshot is a file on a second host and\nthis key mints every service token in the install; the\nstandby has the salt and the verifier but no master key\nuntil the operator supplies the passphrase at promotion,\nwhich is exactly the moment it needs to open this.\n',
+        description="This root's token key, sealed under the passphrase-derived\nkey: what signs operator sessions, exchanged tokens and client\nkeys. It never leaves a root in any other form.\n\nReplicated so a promoted standby signs with the same key and\nnobody has to sign in again or reissue a client key. It is\n**sealed** because a snapshot is a file on a second host; the\nstandby has the salt and the verifier but no master key until\nthe operator supplies the passphrase at promotion, which is\nexactly the moment it needs to open this.\n",
+    )
+    rootTokenPublicKey: str | None = Field(
+        None,
+        description='Base64 of the raw public half of the above, in the clear, so a\nroot can publish a bundle naming it without unsealing\nanything.\n',
     )
     sealedControlKey: str | None = Field(
         None,

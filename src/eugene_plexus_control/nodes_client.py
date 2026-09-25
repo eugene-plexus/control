@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -61,6 +62,14 @@ class NodeProbe:
     devices: list[dict[str, Any]] | None = None
     last_seen_at: str | None = None
     error: str | None = None
+    trust_bundle_version: int | None = None
+    """The bundle version the node said it holds: how a revocation's
+    progress is read, node by node, without tracking anything here."""
+
+
+TokenFor = Callable[[str], str | None]
+"""The token for one named node. Each node gets its own, addressed to it
+alone (2026-09-25), so no node holds one it could replay at another."""
 
 
 @dataclass(frozen=True)
@@ -137,9 +146,11 @@ class NodesClient:
             return NodeProbe(name=name, reachable=False, error="malformed /v1/node response")
         epoch = body.get("epoch")
         devices = body.get("devices")
+        held = body.get("trustBundleVersion")
         return NodeProbe(
             name=name,
             reachable=True,
+            trust_bundle_version=held if isinstance(held, int) else None,
             epoch=int(epoch) if isinstance(epoch, int) else None,
             agent_version=_str_or_none(body.get("agentVersion")),
             os=_str_or_none(body.get("os")),
@@ -149,17 +160,18 @@ class NodesClient:
         )
 
     async def probe_all(
-        self, targets: list[tuple[str, str | None]], token: str | None
+        self, targets: list[tuple[str, str | None]], token_for: TokenFor
     ) -> dict[str, NodeProbe]:
         results = await asyncio.gather(
-            *(self.probe(name, url, token) for name, url in targets), return_exceptions=False
+            *(self.probe(name, url, token_for(name)) for name, url in targets),
+            return_exceptions=False,
         )
         return {probe.name: probe for probe in results}
 
     async def collect(
         self,
         targets: list[tuple[str, str | None]],
-        token: str | None,
+        token_for: TokenFor,
         *,
         path: str,
         key: str,
@@ -175,7 +187,7 @@ class NodesClient:
             if not url:
                 return name, None
             try:
-                body = await self._get(url, path, token)
+                body = await self._get(url, path, token_for(name))
             except (httpx.HTTPError, ValueError) as exc:
                 log.info("node %s did not answer %s: %s", name, path, _describe(exc))
                 return name, None
@@ -213,10 +225,9 @@ class NodesClient:
     async def post_json(self, url: str, path: str, token: str | None, body: dict[str, Any]) -> Any:
         """POST to one node and raise on anything but success.
 
-        Used by key rotation, where "did this host take the new key" has
-        to be a yes or a no — a host that answered 500 is stale in
-        exactly the way a host that timed out is stale, and both belong
-        in `nodesPending`.
+        Used to push the trust bundle, where "did this host take it" has
+        to be a yes or a no: a host that answered 500 is behind in exactly
+        the way a host that timed out is behind.
         """
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         response = await self._client.post(

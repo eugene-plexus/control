@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_control import passphrase_file
+from eugene_plexus_control import passphrase_file, tokens
 from eugene_plexus_control.app import create_app
 
 from .conftest import PASSPHRASE, login, settings_for
@@ -284,6 +284,8 @@ def test_a_locked_root_does_not_probe_its_nodes(
                 "token": minted["token"],
                 "name": "worker",
                 "publicKey": "0" * 43 + "=",
+                "signingPublicKey": "1" * 43 + "=",
+                "tokenPublicKey": tokens.public_b64(tokens.generate_private_key()),
                 "url": "http://192.0.2.10:8079",
             },
         )

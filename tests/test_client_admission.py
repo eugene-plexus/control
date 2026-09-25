@@ -3,9 +3,8 @@
 import pytest
 
 from eugene_plexus_control import client_admission as admission
-from eugene_plexus_control import security
 from eugene_plexus_control.applied import from_canonical, to_canonical
-from tests.conftest import machine_at
+from tests.conftest import enroll, machine_at
 
 
 def mint(client, **limits):
@@ -129,12 +128,9 @@ def test_admission_and_edit_audiences(active_client):
     c = active_client
     made = mint(c)
     key = made["key"]["id"]
-    private = c.app.state.auth_state.signing_key
+    node, _ = enroll(c, "nas", grants=["gateway"])
     for kind, expected in [("agent", 200), ("gateway", 200), ("library", 401)]:
-        h = {
-            "Authorization": "Bearer "
-            + security.issue_service_token(signing_key=private, kind=kind)
-        }
+        h = {"Authorization": "Bearer " + node.service_token(sub=kind)}
         assert call(c, key, "check", headers=h).status_code == expected
         assert (
             c.put(f"/v1/auth/client-keys/{key}/limits", json={"limits": {}}, headers=h).status_code

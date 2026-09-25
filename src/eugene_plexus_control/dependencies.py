@@ -1,37 +1,30 @@
-"""FastAPI dependencies for bearer auth.
+"""FastAPI dependencies for bearer auth, against the trust bundle.
 
-Same shape as every other component: `require_authorized` accepts
-operator OR any `service:*` audience; `require_replica` narrows that to
-operator or `service:control` for the replication surface; `require_operator`
-accepts operator only. All rejection paths produce RFC 7807 Problem JSON so the
-UI renders one error template across components.
+Every bearer is checked by `tokens.verify` against the keys this root's
+applied state names (`trust.view`), addressed to `control`. The route
+levels, per `specs/docs/design/per-node-token-keys.md` D5:
 
-Two differences from the other components, both because this one is the
-trust root:
+* `require_operator` — an operator session. Everything that changes
+  control state, and the replication surface.
+* `require_authorized` — a session, or a service token with `sub`
+  `agent` or `gateway` from a member node's key. The reads a node or the
+  gateway legitimately needs: the node list, topology, the epoch.
+* `require_key_policy` — the same two service kinds, for the client-key
+  policy the gateway and agents enforce.
+* `require_node_actor` — a service token with `sub: agent` from a member
+  node, and nothing else: the credential an agent presents when it asks
+  on its own behalf (token exchange, a forwarded sign-in).
 
-**There is no auth-disabled dev path.** Elsewhere a missing signing key
-means "running standalone, let everything through". Here a missing
-signing key means the install has not been initialized, and the answer
-is 503 with a pointer at `POST /v1/auth/initialize` — not open access. A
-trust root that waved requests through until it was configured would be
-a trust root with a window in it.
+**There is no auth-disabled dev path.** A missing token key means the
+install has not been initialized, or is sealed, and the answer is 503.
+A trust root that waved requests through until it was configured would
+be a trust root with a window in it.
 
-**Reads accept a service token; mutations do not.** An agent needs
-`GET /v1/control/status` to learn the current epoch, and a standby needs
-`GET /v1/control/log` to replicate, so reads have to accept a service
-audience. Everything that changes control state is operator-only,
-declared on the route rather than on the router so the level is visible
-next to the handler.
-
-**But "a read" was one level where it needed two.** The replication
-surface -- `GET /v1/control/log` and `GET /v1/control/snapshot` --
-carries the sealed signing key, the Argon2id salt and the passphrase
-verifier, and until 2026-09-18 any `service:*` token opened it. A
-gateway, library or driver token holds no master key, so reading the
-salt and the verifier buys it an offline attack on the passphrase it
-does not otherwise have. `require_replica` is that level: the standby
-that legitimately pulls both presents `service:control`, and the
-audience already says so.
+**Until 2026-09-25 "any `service:*`" opened every read here**, and this
+root handed each node a year-long `service:control` token on every poll,
+which opened the replication snapshot and its passphrase verifier. A
+service token is addressed to one machine now, and none is addressed
+here except by a node speaking for itself.
 """
 
 from __future__ import annotations
@@ -41,11 +34,13 @@ from collections.abc import Collection
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from . import security
+from . import tokens
 from ._generated.models import Problem
 from .auth_state import AuthState
 
 _bearer_scheme = HTTPBearer(auto_error=False)
+
+READ_SERVICE_SUBS = frozenset({tokens.SUB_AGENT, tokens.SUB_GATEWAY})
 
 
 def problem(status_code: int, title: str, detail: str) -> HTTPException:
@@ -62,142 +57,157 @@ def problem(status_code: int, title: str, detail: str) -> HTTPException:
     )
 
 
-def _validate(
-    request: Request,
-    creds: HTTPAuthorizationCredentials | None,
-    *,
-    accept_operator: bool,
-    accept_any_service: bool,
-    accept_service_kinds: Collection[str] | None = None,
-) -> security.TokenPayload:
-    auth: AuthState = request.app.state.auth_state
-
-    if auth.signing_key is None:
-        # Two different situations, and telling them apart matters most
-        # on the day it matters at all. A **standby** is normally in the
-        # second one: it holds the signing key sealed and cannot open it
-        # until someone supplies the passphrase, so an operator arriving
-        # to promote it needs to be told "log in", not "run first-run
-        # setup" — which would be advice to wipe the install.
-        initialized = request.app.state.machine.state.identity.salt is not None
-        if initialized:
-            raise problem(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "Locked",
-                "This control root is initialized but locked: it holds the install's "
-                "signing key sealed and has not been given the passphrase. Call "
-                "POST /v1/auth/login. (On a standby this is the normal state until "
-                "someone logs in — it is not a reason to re-initialize anything.)",
-            )
-        raise problem(
+def _locked_or_uninitialized(request: Request) -> HTTPException:
+    # Two different situations, and telling them apart matters most on
+    # the day it matters at all. A **standby** is normally in the second
+    # one: it holds the token key sealed and cannot open it until someone
+    # supplies the passphrase, so an operator arriving to promote it
+    # needs to be told "log in", not "run first-run setup" — which would
+    # be advice to wipe the install.
+    initialized = request.app.state.machine.state.identity.salt is not None
+    if initialized:
+        return problem(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Setup required",
-            "This install has no passphrase yet. Call POST /v1/auth/initialize first. "
-            "Until then the trust root has no key to verify anything against — it does "
-            "not fall back to accepting everything.",
+            "Locked",
+            "This control root is initialized but locked: it holds its token key sealed "
+            "and has not been given the passphrase. Call POST /v1/auth/login. (On a standby "
+            "this is the normal state until someone logs in — it is not a reason to "
+            "re-initialize anything.)",
         )
+    return problem(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        "Setup required",
+        "This install has no passphrase yet. Call POST /v1/auth/initialize first. Until "
+        "then the trust root has no key to verify anything against — it does not fall "
+        "back to accepting everything.",
+    )
 
+
+def verify_bearer(
+    request: Request,
+    token: str,
+    *,
+    classes: Collection[str],
+) -> tokens.Claims:
+    """Verify one bearer addressed to this root, or raise the 401 that says why."""
+    auth: AuthState = request.app.state.auth_state
+    if auth.signing_key is None:
+        raise _locked_or_uninitialized(request)
+    bundle = request.app.state.trust.view_for(request.app.state.machine.state)
+    try:
+        return tokens.verify(
+            token, bundle=bundle, recipient=tokens.RECIPIENT_CONTROL, classes=classes
+        )
+    except tokens.TokenError as exc:
+        raise problem(
+            status.HTTP_401_UNAUTHORIZED, "Invalid token", f"Bearer token rejected: {exc}"
+        ) from exc
+
+
+def _bearer(request: Request, creds: HTTPAuthorizationCredentials | None) -> str:
+    # Locked or uninitialized first: "log in" and "run setup" are the
+    # answers, and a missing token would otherwise hide them behind a 401.
+    if request.app.state.auth_state.signing_key is None:
+        raise _locked_or_uninitialized(request)
     if creds is None or not creds.credentials:
         raise problem(
             status.HTTP_401_UNAUTHORIZED,
             "Missing token",
             "Provide a bearer token via the Authorization: Bearer header.",
         )
+    return creds.credentials
 
-    if auth.is_revoked(creds.credentials):
-        raise problem(
-            status.HTTP_401_UNAUTHORIZED,
-            "Session revoked",
-            "This session was logged out. Log in again.",
-        )
 
-    try:
-        return security.decode_token(
-            token=creds.credentials,
-            signing_key=auth.signing_key,
-            accept_operator=accept_operator,
-            accept_any_service=accept_any_service,
-            accept_service_kinds=accept_service_kinds,
-        )
-    except Exception as exc:
+def _session_or_services(
+    request: Request, creds: HTTPAuthorizationCredentials | None, subs: frozenset[str]
+) -> tokens.Claims:
+    """The route's own list of service kinds, on top of the bundle's grants.
+
+    **Redundant today, and kept on purpose** (sabotage pass, 2026-09-25):
+    `tokens.verify` already refuses every `sub` but `agent` and a granted
+    `gateway` on a token that leaves its machine, so no token that exists
+    can tell this check from its absence. It stays as the route's policy,
+    stated where the route is, so that widening a grant later cannot
+    silently widen what this root accepts.
+    """
+    claims = verify_bearer(
+        request, _bearer(request, creds), classes=(tokens.TYP_SESSION, tokens.TYP_SERVICE)
+    )
+    if claims.is_service and (claims.issuer_node is None or claims.sub not in subs):
         raise problem(
             status.HTTP_401_UNAUTHORIZED,
             "Invalid token",
-            f"Bearer token rejected: {exc}",
-        ) from exc
+            f"A {claims.sub!r} service token from {claims.iss!r} does not open this route.",
+        )
+    return claims
 
 
 def require_authorized(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> security.TokenPayload:
-    """Operator OR any service-audience token.
+) -> tokens.Claims:
+    """A session, or an `agent` or `gateway` service token from a member node.
 
-    The level for reads. An agent polling for the current epoch and a
-    standby pulling the log both arrive with a service token, and
-    refusing them would make replication an operator-supervised
-    activity."""
-    return _validate(request, creds, accept_operator=True, accept_any_service=True)
-
-
-REPLICA_SERVICE_KINDS = frozenset({"control"})
-"""Which service audience may pull the replication surface.
-
-A standby presents `service:control` -- see `node_service_token` -- and
-nothing else has any business on `/v1/control/log` or
-`/v1/control/snapshot`."""
-
-
-def require_replica(
-    request: Request,
-    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> security.TokenPayload:
-    """Operator OR `service:control` -- the replication surface only.
-
-    `require_authorized` is the read level for things every component
-    legitimately needs: the current epoch, the node list. The log and the
-    snapshot are not that. They carry the install's **sealed signing key,
-    the Argon2id salt and the passphrase verifier**, and a `service:*`
-    holder that has no master key -- a gateway, a library, a driver, an
-    agent that has not unlocked -- gains an offline attack on the
-    verifier by reading them. The one caller that must have them is a
-    standby bootstrapping or following, and its audience already names
-    it.
-
-    Not `require_operator`, because replication has to work at 3am with
-    nobody logged in; a standby that needed an operator session would be
-    a standby that falls behind whenever the operator is asleep.
-    """
-    return _validate(
-        request,
-        creds,
-        accept_operator=True,
-        accept_any_service=False,
-        accept_service_kinds=REPLICA_SERVICE_KINDS,
-    )
+    The level for reads an agent or the gateway needs: the node list,
+    topology, the current epoch."""
+    return _session_or_services(request, creds, READ_SERVICE_SUBS)
 
 
 def require_operator(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> security.TokenPayload:
-    """Operator-audience tokens only.
+) -> tokens.Claims:
+    """An operator session only.
 
     The level for anything that mutates control state, mints a join
-    token, revokes a node, or rotates a key. A compromised peer holding
-    a service token must not be able to enroll a host or re-key the
-    install."""
-    return _validate(request, creds, accept_operator=True, accept_any_service=False)
+    token, revokes a node or rotates a key, and for the replication
+    surface, which carries the salt and the passphrase verifier."""
+    return verify_bearer(request, _bearer(request, creds), classes=(tokens.TYP_SESSION,))
+
+
+require_replica = require_operator
+"""The replication surface takes a session and nothing else (2026-09-25).
+
+A standby that follows unattended needs a credential of its own, and no
+production path has ever given it one; see the design's §5."""
 
 
 def require_key_policy(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> security.TokenPayload:
-    return _validate(
-        request,
-        creds,
-        accept_operator=True,
-        accept_any_service=False,
-        accept_service_kinds={"agent", "gateway"},
-    )
+) -> tokens.Claims:
+    return _session_or_services(request, creds, READ_SERVICE_SUBS)
+
+
+def require_node_actor(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> tokens.Claims:
+    """A member node speaking for itself: `sub: agent`, signed by its own key."""
+    claims = verify_bearer(request, _bearer(request, creds), classes=(tokens.TYP_SERVICE,))
+    if claims.sub != tokens.SUB_AGENT or claims.issuer_node is None:
+        raise problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Invalid token",
+            "Only an agent's own service token, signed by its node's key, is accepted here.",
+        )
+    return claims
+
+
+def optional_node_actor(request: Request, authorization: str | None) -> tokens.Claims | None:
+    """The asking node, when an `Authorization` header says so and verifies.
+
+    For the one route that works with or without it: a sign-in forwarded
+    by an agent is addressed to that machine, one made directly is not.
+    A header that does not verify is ignored rather than refused, so the
+    worst a caller can do is get a session addressed to this root alone.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    try:
+        claims = verify_bearer(request, authorization[7:].strip(), classes=(tokens.TYP_SERVICE,))
+    except HTTPException:
+        return None
+    if claims.sub != tokens.SUB_AGENT or claims.issuer_node is None:
+        return None
+    return claims

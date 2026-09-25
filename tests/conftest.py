@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from eugene_plexus_control import sealing, tokens
 from eugene_plexus_control.app import create_app
 from eugene_plexus_control.log_store import LogStore
 from eugene_plexus_control.settings import Settings
@@ -92,6 +94,79 @@ def login(client: TestClient, passphrase: str = PASSPHRASE) -> str:
     # duplicate schema. `/v1/nodes/join-token` still returns `token`; it
     # is a JoinToken and a different thing.
     return str(response.json()["sessionToken"])
+
+
+@dataclass(frozen=True)
+class NodeKeys:
+    """Everything an agent generates before it enrolls, private halves included.
+
+    A test that enrolls a node holds the node's own token key, so it can
+    mint exactly what that node could and nothing more (2026-09-25).
+    """
+
+    name: str
+    public: str
+    signing_private: str
+    signing_public: str
+    token: tokens.Signer
+
+    def body(self, join_token: str, **extra: object) -> dict[str, object]:
+        return {
+            "token": join_token,
+            "name": self.name,
+            "publicKey": self.public,
+            "signingPublicKey": self.signing_public,
+            "tokenPublicKey": tokens.public_b64(self.token.key),
+            **extra,
+        }
+
+    def service_token(
+        self, *, sub: str = "agent", aud: tuple[str, ...] = ("control",), ttl: int = 600
+    ) -> str:
+        token, _ = self.token.mint(typ=tokens.TYP_SERVICE, sub=sub, aud=aud, ttl_seconds=ttl)
+        return token
+
+
+def node_keys(name: str) -> NodeKeys:
+    identity = sealing.generate_control_identity()
+    return NodeKeys(
+        name=name,
+        public=sealing.generate_sealing_keypair().public,
+        signing_private=identity.private,
+        signing_public=identity.public,
+        token=tokens.Signer(key=tokens.generate_private_key(), issuer=f"node:{name}"),
+    )
+
+
+def mint_join_token(client: TestClient, **body: object) -> str:
+    response = client.post("/v1/nodes/join-token", json=body or None)
+    assert response.status_code == 201, response.text
+    return str(response.json()["token"])
+
+
+def enroll(client: TestClient, name: str, **extra: object) -> tuple[NodeKeys, Any]:
+    """Enroll a node with fresh keys; returns the keys and the response."""
+    keys = node_keys(name)
+    grants = extra.pop("grants", None)
+    join = mint_join_token(client, **({"grants": grants} if grants else {}))
+    return keys, client.post("/v1/nodes/enroll", json=keys.body(join, **extra))
+
+
+def session_after_history(app: Any, root_key: bytes) -> dict[str, str]:
+    """A session signed by the key a written history rotated to.
+
+    A history that rotates the root token key ends every session signed
+    before it, exactly as a real rotation does, because verification reads
+    the root's public key from applied state. The sealed key in that
+    history is a placeholder no passphrase opens, so the test adopts the
+    real key it wrote and signs with it directly.
+    """
+    app.state.auth_state.set_signing_key(root_key)
+    signer = app.state.auth_state.signer()
+    token, _ = signer.mint(
+        typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=3600
+    )
+    return {"Authorization": f"Bearer {token}"}
 
 
 def machine_at(directory: Path, *, role: str = ROLE_ACTIVE) -> StateMachine:

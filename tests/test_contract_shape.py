@@ -23,7 +23,7 @@ from eugene_plexus_control._generated.models import LogPage, Snapshot
 from eugene_plexus_control.app import create_app
 from eugene_plexus_control.state_machine import StateMachine
 
-from .conftest import PASSPHRASE, settings_for
+from .conftest import PASSPHRASE, session_after_history, settings_for
 from .test_replay_equivalence import _write_history, placeholder
 
 
@@ -32,9 +32,8 @@ def _active(tmp_path: Path) -> tuple[TestClient, dict[str, str]]:
     client = TestClient(app)
     client.__enter__()
     assert client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
-    token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["sessionToken"]
     machine: StateMachine = app.state.machine
-    _write_history(machine)
+    headers = session_after_history(app, _write_history(machine))
     # The shared history ends with a revocation, which correctly
     # cascades that node's component and runtime away — so it leaves
     # both collections empty. Re-populate them here, because this file
@@ -71,7 +70,7 @@ def _active(tmp_path: Path) -> tuple[TestClient, dict[str, str]]:
             },
         },
     )
-    return client, {"Authorization": f"Bearer {token}"}
+    return client, headers
 
 
 def test_the_snapshot_bytes_validate_against_the_contract(tmp_path: Path) -> None:

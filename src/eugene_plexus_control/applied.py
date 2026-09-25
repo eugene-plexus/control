@@ -90,6 +90,7 @@ OP_IMPORT_CLIENT_KEYS = "importClientKeys"
 OP_REVOKE_CLIENT_KEY = "revokeClientKey"
 OP_SET_CLIENT_KEY_LIMITS = "setClientKeyLimits"
 OP_PUT_CLIENT_ADMISSION = "putClientAdmission"
+OP_REVOKE_SESSION = "revokeSession"
 
 ALL_OPS: frozenset[str] = frozenset(
     {
@@ -108,6 +109,7 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_REVOKE_CLIENT_KEY,
         OP_SET_CLIENT_KEY_LIMITS,
         OP_PUT_CLIENT_ADMISSION,
+        OP_REVOKE_SESSION,
     }
 )
 
@@ -169,6 +171,14 @@ class NodeRecord:
     advertiseSequence: int = 0
     """Highest announcement sequence accepted. Applied state, so a
     promoted standby refuses the same replays this root would."""
+    tokenPublicKey: str | None = None
+    """Base64 of the node's raw Ed25519 **token** public key: what its
+    tokens are signed with, and what the trust bundle lists as
+    `node:<name>`. The private half was generated on the node and has
+    never been anywhere else (2026-09-25)."""
+    grants: tuple[str, ...] = ("node",)
+    """What the node's key may issue. `gateway` comes from the join token
+    that enrolled it, which the operator minted; never from the node."""
     agentVersion: str | None = None
     os: str | None = None
     arch: str | None = None
@@ -250,9 +260,13 @@ class InstallIdentity:
     promotion without holding the master key."""
 
     sealedSigningKey: str | None = None
-    """The current service-token signing key. Sealed, because a snapshot
-    is a file on a second host and this key mints every service token in
-    the install."""
+    """This root's token key: what signs sessions, exchanged tokens and
+    client keys. Sealed, because a snapshot is a file on a second host.
+    It never leaves a root in any other form."""
+
+    rootTokenPublicKey: str | None = None
+    """Base64 of the raw public half of the above, in the clear, so the
+    trust bundle can name it without unsealing anything."""
 
     sealedControlKey: str | None = None
     """The control root's identity private key. Replicated because nodes
@@ -305,6 +319,11 @@ class AppliedState:
     client_keys: dict[str, dict[str, Any]] = field(default_factory=dict)
     client_admission: dict[str, Any] = field(default_factory=lambda: {"clock": 0.0, "buckets": {}})
     client_key_imports: dict[str, str] = field(default_factory=dict)
+    revoked_sessions: dict[str, int] = field(default_factory=dict)
+    """Signed-out sessions, `jti -> exp`, as `revokeSession` wrote them.
+    Replicated because the trust bundle every machine checks sessions
+    against is built from applied state: a sign-out a standby had not
+    seen would be a session a promotion brought back."""
 
 
 # --------------------------------------------------------------------------- #
@@ -388,6 +407,8 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
         url=_optional_str(payload, "url"),
         publicKey=_optional_str(payload, "publicKey"),
         signingPublicKey=_optional_str(payload, "signingPublicKey"),
+        tokenPublicKey=_optional_str(payload, "tokenPublicKey"),
+        grants=_grants(payload.get("grants"), index),
         agentVersion=_optional_str(payload, "agentVersion"),
         os=_optional_str(payload, "os"),
         arch=_optional_str(payload, "arch"),
@@ -399,6 +420,21 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
     # and refusing that would make "reinstall the OS on the GPU box" an
     # operation with no path through the API.
     return replace(state, nodes={**state.nodes, name: record})
+
+
+_NODE_GRANTS = frozenset({"node", "gateway"})
+
+
+def _grants(raw: Any, index: int) -> tuple[str, ...]:
+    """A node's grants, always including `node`, sorted so replay is byte-stable."""
+    if raw is None:
+        return ("node",)
+    if not isinstance(raw, list) or not all(isinstance(g, str) for g in raw):
+        raise ApplyError(f"entry {index}: grants must be a list of strings")
+    unknown = set(raw) - _NODE_GRANTS
+    if unknown:
+        raise ApplyError(f"entry {index}: a node cannot hold {sorted(unknown)}")
+    return tuple(sorted(set(raw) | {"node"}))
 
 
 def _apply_update_node(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
@@ -527,12 +563,32 @@ def _apply_rotate_signing_key(
         state.identity,
         sealedSigningKey=_require_str(payload, "sealedSigningKey", index),
         signingKeyId=_require_str(payload, "signingKeyId", index),
+        rootTokenPublicKey=_optional_str(payload, "rootTokenPublicKey"),
     )
     state = replace(state, identity=identity)
     revoked = payload.get("revokedNode")
     if isinstance(revoked, str) and revoked in state.nodes:
         state = _without_node(state, revoked)
     return state
+
+
+def _apply_revoke_session(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    """Record a sign-out, and forget the ones that have expired.
+
+    `prunedBefore` is the writer's clock, stamped into the payload once,
+    like every timestamp here (rule 2). A sign-out whose session expired
+    before it has nothing left to refuse.
+    """
+    jti = _require_str(payload, "jti", index)
+    exp = payload.get("exp")
+    pruned = payload.get("prunedBefore", 0)
+    if not isinstance(exp, int) or isinstance(exp, bool):
+        raise ApplyError(f"entry {index}: 'exp' must be an integer")
+    if not isinstance(pruned, int) or isinstance(pruned, bool):
+        raise ApplyError(f"entry {index}: 'prunedBefore' must be an integer")
+    kept = {k: v for k, v in state.revoked_sessions.items() if v >= pruned}
+    kept[jti] = exp
+    return replace(state, revoked_sessions=kept)
 
 
 def _apply_promote(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
@@ -708,6 +764,7 @@ _HANDLERS: dict[str, _Handler] = {
     OP_REVOKE_CLIENT_KEY: _apply_revoke_client_key,
     OP_SET_CLIENT_KEY_LIMITS: _apply_set_client_key_limits,
     OP_PUT_CLIENT_ADMISSION: _apply_put_client_admission,
+    OP_REVOKE_SESSION: _apply_revoke_session,
 }
 
 
@@ -746,6 +803,8 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
                 "reachable": False,
                 "publicKey": n.publicKey,
                 "signingPublicKey": n.signingPublicKey,
+                "tokenPublicKey": n.tokenPublicKey,
+                "grants": list(n.grants),
                 "advertiseSequence": n.advertiseSequence,
                 "agentVersion": n.agentVersion,
                 "os": n.os,
@@ -770,6 +829,10 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
         "salt": identity.salt,
         "passphraseVerifier": identity.passphraseVerifier,
         "sealedSigningKey": identity.sealedSigningKey,
+        "rootTokenPublicKey": identity.rootTokenPublicKey,
+        "revokedSessions": [
+            {"jti": jti, "exp": exp} for jti, exp in sorted(state.revoked_sessions.items())
+        ],
         "sealedControlKey": identity.sealedControlKey,
         "controlPublicKey": identity.controlPublicKey,
         "sealedRecoveryKey": identity.sealedRecoveryKey,
@@ -822,6 +885,8 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
                 url=n.get("url"),
                 publicKey=n.get("publicKey"),
                 signingPublicKey=n.get("signingPublicKey"),
+                tokenPublicKey=n.get("tokenPublicKey"),
+                grants=tuple(n.get("grants") or ("node",)),
                 advertiseSequence=int(n.get("advertiseSequence") or 0),
                 agentVersion=n.get("agentVersion"),
                 os=n.get("os"),
@@ -845,10 +910,12 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         client_admission=validate_ledger(raw.get("clientAdmission")),
         client_keys=_key_records(raw.get("clientKeys", [])),
         client_key_imports=dict(raw.get("clientKeyImports") or {}),
+        revoked_sessions={str(r["jti"]): int(r["exp"]) for r in raw.get("revokedSessions") or []},
         identity=InstallIdentity(
             salt=raw.get("salt"),
             passphraseVerifier=raw.get("passphraseVerifier"),
             sealedSigningKey=raw.get("sealedSigningKey"),
+            rootTokenPublicKey=raw.get("rootTokenPublicKey"),
             sealedControlKey=raw.get("sealedControlKey"),
             controlPublicKey=raw.get("controlPublicKey"),
             sealedRecoveryKey=raw.get("sealedRecoveryKey"),

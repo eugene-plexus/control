@@ -37,6 +37,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from eugene_plexus_control import security, tokens
 from eugene_plexus_control.app import create_app
 from eugene_plexus_control.applied import (
     ALL_OPS,
@@ -52,6 +53,7 @@ from eugene_plexus_control.applied import (
     OP_PUT_RUNTIME,
     OP_REVOKE_CLIENT_KEY,
     OP_REVOKE_NODE,
+    OP_REVOKE_SESSION,
     OP_ROTATE_SIGNING_KEY,
     OP_SET_CLIENT_KEY_LIMITS,
     OP_UPDATE_NODE,
@@ -65,7 +67,13 @@ from eugene_plexus_control.applied import (
 )
 from eugene_plexus_control.state_machine import StateMachine
 
-from .conftest import PASSPHRASE, machine_at, settings_for, standby_at
+from .conftest import (
+    PASSPHRASE,
+    machine_at,
+    session_after_history,
+    settings_for,
+    standby_at,
+)
 
 # Every op that changes replicated state, exercised in one history. The
 # two that are not here are absent by design and asserted so below.
@@ -84,6 +92,7 @@ EXERCISED_OPS = {
     OP_IMPORT_CLIENT_KEYS,
     OP_REVOKE_CLIENT_KEY,
     OP_ROTATE_SIGNING_KEY,
+    OP_REVOKE_SESSION,
     OP_PROMOTE,
 }
 
@@ -115,8 +124,22 @@ def _seed_identity(machine: StateMachine) -> None:
     )
 
 
-def _write_history(machine: StateMachine) -> None:
+def _root_key() -> tuple[bytes, str]:
+    """A real root token key for a history rotation: PEM, and its public half.
+
+    Real rather than a placeholder because the trust bundle is built from
+    applied state, and a rotation's `rootTokenPublicKey` is the key every
+    machine will then accept sessions from.
+    """
+    pem = security.generate_signing_key()
+    return pem, tokens.public_b64(tokens.load_private(pem))
+
+
+def _write_history(machine: StateMachine) -> bytes:
     """One history that touches every op, with awkward values on purpose.
+
+    Returns the last rotation's root token key (PEM), so an HTTP test can
+    sign a session the rotated state accepts.
 
     The awkward values are the point of the exercise, not decoration:
 
@@ -159,6 +182,8 @@ def _write_history(machine: StateMachine) -> None:
             "role": "control",
             "url": "http://10.0.0.2:8079",
             "publicKey": "YW5vdGhlci1ub2RlLXB1YmxpYy1rZXktMzItbG9uZw==",
+            "tokenPublicKey": tokens.public_b64(tokens.generate_private_key()),
+            "grants": ["gateway", "node"],
             "os": "windows",
             "arch": "x64",
             "enrolledAt": "2026-09-09T11:20:00+00:00",
@@ -278,16 +303,24 @@ def _write_history(machine: StateMachine) -> None:
     )
     machine.append(OP_DELETE_RUNTIME, {"node": "attic", "name": "small"})
     machine.append(OP_DELETE_COMPONENT, {"node": "attic", "name": "gateway"})
+    _, second = _root_key()
     machine.append(
         OP_ROTATE_SIGNING_KEY,
-        {"signingKeyId": "2", "sealedSigningKey": placeholder("rotated"), "reason": "operator"},
+        {
+            "signingKeyId": "2",
+            "sealedSigningKey": placeholder("rotated"),
+            "rootTokenPublicKey": second,
+            "reason": "operator",
+        },
     )
+    machine.append(OP_REVOKE_SESSION, {"jti": "signed-out", "exp": 2000000000, "prunedBefore": 0})
     # A revocation as one entry: the rotation removes `shed` and its runtime.
     machine.append(
         OP_ROTATE_SIGNING_KEY,
         {
             "signingKeyId": "3",
             "sealedSigningKey": placeholder("revoked-shed"),
+            "rootTokenPublicKey": _root_key()[1],
             "reason": "revocation",
             "revokedNode": "shed",
         },
@@ -296,16 +329,19 @@ def _write_history(machine: StateMachine) -> None:
     # removed. Revoking takes the node's component and runtime with it.
     # Placed last so the cascade shows up in the compared state.
     machine.append(OP_REVOKE_NODE, {"name": "gpu-büro"})
+    last, last_public = _root_key()
     machine.append(
         OP_ROTATE_SIGNING_KEY,
         {
             "signingKeyId": "4",
             "sealedSigningKey": placeholder("revoked-gpu"),
+            "rootTokenPublicKey": last_public,
             "reason": "revocation",
             "revokedNode": "gpu-büro",
         },
     )
     machine.append(OP_PROMOTE, {"node": "attic"}, epoch_override=machine.state.epoch + 1)
+    return last
 
 
 def _ops_in(entries: list[dict[str, Any]]) -> set[str]:
@@ -331,13 +367,8 @@ def test_standby_matches_active_after_pulling_the_log_over_http(tmp_path: Path) 
         assert (
             active.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
         )
-        token = active.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
-            "sessionToken"
-        ]
-        headers = {"Authorization": f"Bearer {token}"}
-
         machine: StateMachine = active_app.state.machine
-        _write_history(machine)
+        headers = session_after_history(active_app, _write_history(machine))
 
         # The standby bootstraps from the snapshot, exactly as the
         # follower does, then tails whatever the snapshot did not cover.
@@ -368,13 +399,10 @@ def test_the_snapshot_document_is_the_bytes_that_are_compared(tmp_path: Path) ->
         assert (
             client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
         )
-        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
-            "sessionToken"
-        ]
         machine: StateMachine = app.state.machine
-        _write_history(machine)
+        headers = session_after_history(app, _write_history(machine))
 
-        response = client.get("/v1/control/snapshot", headers={"Authorization": f"Bearer {token}"})
+        response = client.get("/v1/control/snapshot", headers=headers)
         assert response.content == machine.canonical()
 
 

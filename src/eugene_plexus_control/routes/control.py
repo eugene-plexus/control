@@ -9,38 +9,27 @@ firewall between buildings.
 
 from __future__ import annotations
 
-import asyncio
-import base64
 import json
 import logging
-from datetime import UTC, datetime
 from typing import Any
 
-import httpx
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 
-from .. import sealing, security
+from .. import security, tokens, trust
 from .._generated.models import (
     ControlStatus,
-    KeyRotation,
     LogPage,
     NodeRole,
     PromoteRequest,
     Reason,
+    SignedTrustBundle,
     Snapshot,
     StandbyStatus,
-    State,
+    TrustChange,
 )
 from ..applied import OP_ROTATE_SIGNING_KEY
 from ..auth_state import AuthState
 from ..dependencies import problem, require_authorized, require_operator, require_replica
-from ..rotation import (
-    REASON_OPERATOR,
-    REASON_REVOCATION,
-    RotationInFlight,
-    RotationProgress,
-    RotationTracker,
-)
 from ..state_machine import AlreadyActive, StateMachine
 
 log = logging.getLogger(__name__)
@@ -60,9 +49,8 @@ async def control_status(request: Request) -> ControlStatus:
     promoted without losing whatever it has not applied, and this is
     where an operator sees that **before** deciding rather than after.
 
-    Readable by any service token as well as the operator: an agent
-    needs the current epoch, and a component needs to know whether
-    management is available at all.
+    Readable by a session and by a member node's `agent` or `gateway`
+    service token: an agent needs the current epoch.
     """
     machine: StateMachine = request.app.state.machine
     state = machine.state
@@ -109,9 +97,9 @@ async def read_log(
     are semantically identical and byte-different, and a replica must
     hold what the writer wrote.
 
-    **Operator or `service:control` only**, not any service token: the
-    entries include the ones that wrote the install's key material, so
-    this is the same door as the snapshot and takes the same level.
+    **An operator session only**: the entries include the ones that
+    wrote the install's key material, so this is the same door as the
+    snapshot and takes the same level.
     """
     machine: StateMachine = request.app.state.machine
     first_available = machine.first_available_index()
@@ -167,14 +155,10 @@ async def read_snapshot(request: Request) -> Response:
     against `Snapshot`, which is the assertion that actually matters —
     conformance without letting the serializer rewrite the payload.
 
-    **Operator or `service:control` only** (`require_replica`), which is
-    narrower than every other read here and deliberately so. What this
-    returns includes `sealedSigningKey`, `salt` and
-    `passphraseVerifier`; a `service:*` holder that has no master key —
-    a gateway, a library, a driver, an agent that has not unlocked —
-    gains an offline attack on the operator's passphrase by reading it,
-    and none of them has a reason to. A standby does, and presents
-    `service:control`.
+    **An operator session only** (`require_replica`), which is narrower
+    than every other read here and deliberately so. What this returns
+    includes `sealedSigningKey`, `salt` and `passphraseVerifier`, so any
+    other holder gains an offline attack on the operator's passphrase.
     """
     machine: StateMachine = request.app.state.machine
     return Response(content=machine.canonical(), media_type="application/json")
@@ -262,29 +246,14 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
             status.HTTP_409_CONFLICT, "Already active", "This control root is already active."
         ) from exc
 
-    # Announce the epoch. M5 §9 said agents learn it "on their next
-    # contact"; this is the contact — the same signed message a rotation
-    # sends, carrying the UNCHANGED signing key and the new epoch, so an
-    # agent records the generation and restarts nothing. Best-effort and
-    # not a log entry: it delivers an observation about the log's own
-    # epoch, and a node that is down learns it from the next rotation or
-    # announcement that reaches it. The identity key that signs it is the
-    # one promotion deliberately preserved (`sealedControlKey`).
-    if auth.control_private_key is not None and auth.signing_key is not None:
-        request.app.state.announce_task = asyncio.create_task(
-            _notify_nodes(
-                request,
-                key_b64=base64.b64encode(auth.signing_key).decode("ascii"),
-                key_id=machine.state.identity.signingKeyId or "1",
-                epoch=machine.state.epoch,
-                tracker=None,
-            ),
-            name="control-epoch-announce",
-        )
-    else:
+    # Announce the epoch: a trust bundle at the new epoch, signed with the
+    # identity key promotion deliberately preserved (`sealedControlKey`).
+    # Agents record it and refuse the old root's lower one. Best-effort;
+    # a node that is down takes it when it next pulls.
+    if request.app.state.trust.publish(request.app) is None:
         log.warning(
             "promoted without the control identity key in memory; nodes will learn epoch %d "
-            "from the next rotation instead of now",
+            "when this root is next unlocked",
             machine.state.epoch,
         )
 
@@ -306,223 +275,83 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
 
 @router.post(
     "/v1/control/rotate-key",
-    response_model=KeyRotation,
+    response_model=TrustChange,
     status_code=202,
     dependencies=[Depends(require_operator)],
 )
-async def rotate_signing_key(request: Request) -> KeyRotation:
-    """Mint a new signing key and redistribute it. Explicit, not a
-    side effect of restarting.
+async def rotate_signing_key(request: Request) -> TrustChange:
+    """Replace this root's token key. Every session and client key ends.
 
-    Through M4 tokens were "rotated on each agent restart", which was
-    harmless when one process spawned everything and is an outage once
-    there are N nodes — a restart that re-keyed the install would break
-    every component that had not yet been told.
+    The emergency lever for "this root's token key may have leaked". A
+    new key is generated, sealed into the log, and published in a trust
+    bundle that names only it, so everything the old key signed stops
+    verifying on every machine at once. **Nothing private is
+    distributed**: node keys are untouched and only the bundle moves.
+    Until 2026-09-25 this redistributed the one shared key to every node
+    and tracked which were stale; there is no shared key any more.
 
-    **This logs you out, including from this endpoint's own `GET`.** One
-    key signs both service tokens and operator sessions, so re-keying
-    invalidates every session that was issued under the old one — this
-    caller's included. That is correct rather than convenient: the
-    reason to rotate is usually that a host should no longer be trusted,
-    and a host that held a service token could have held an operator
-    session too. Log in again to watch the rotation finish; the progress
-    persists until the next rotation starts precisely so that it is
-    still there when you get back.
-    """
-    return await perform_rotation(request, reason=REASON_OPERATOR, revoked_node=None)
-
-
-@router.get(
-    "/v1/control/rotate-key",
-    response_model=KeyRotation,
-    dependencies=[Depends(require_authorized)],
-)
-async def get_key_rotation(request: Request) -> KeyRotation:
-    """Progress of the current or most recent rotation.
-
-    Persists until the next one starts, so a UI that reconnects after a
-    rotation still learns how it ended — including which hosts were left
-    holding a superseded key.
-    """
-    tracker: RotationTracker = request.app.state.rotation
-    current = tracker.current
-    if current is None:
-        raise problem(
-            status.HTTP_404_NOT_FOUND,
-            "No rotation",
-            "No key rotation has run on this control root.",
-        )
-    return _to_key_rotation(current)
-
-
-# --------------------------------------------------------------------------- #
-# rotation, shared with node revocation
-# --------------------------------------------------------------------------- #
-
-
-async def perform_rotation(
-    request: Request, *, reason: str, revoked_node: str | None
-) -> KeyRotation:
-    """Mint, log, then redistribute. In that order, and it matters.
-
-    The new key is durable in the log **before** any node is told about
-    it, so a crash midway leaves an install whose recorded key is the
-    new one and whose hosts are a mix — which is recoverable by re-running
-    the rotation. The other order would leave nodes holding a key no
-    surviving root knows about, which is not.
-
-    Redistribution is best-effort per node and the result names the ones
-    it could not reach. Those hold a superseded key and are refused until
-    they reconnect and are re-keyed: not a failure to hide, but the
-    reason this operation has to be idempotent and resumable.
+    **This logs you out.** Sign in again afterwards.
     """
     machine: StateMachine = request.app.state.machine
     auth: AuthState = request.app.state.auth_state
-    tracker: RotationTracker = request.app.state.rotation
-
     if not machine.is_active:
         raise problem(
             status.HTTP_409_CONFLICT,
             "Not the active root",
             f"This control root is a {machine.role}; rotation belongs to the active root.",
         )
-    if auth.master_key is None:
+    if auth.master_key is None or auth.control_private_key is None:
+        # Checked before minting: a key that could not be sealed, or a
+        # bundle that could not be signed, would be a rotation nobody hears of.
         raise problem(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Locked",
-            "The master key is not available in this process, so a new signing key "
-            "cannot be sealed. Log in first.",
+            "The master key or this root's identity key is not in memory, so a new token "
+            "key could not be sealed or published. Sign in first.",
         )
-    if auth.control_private_key is None:
-        # Checked BEFORE minting. A rotation whose re-keys cannot be signed
-        # would log a new key no node could be told about, which is the
-        # one order this operation must never end up in.
+    new_key = security.generate_signing_key()
+    previous = machine.state.identity.signingKeyId or "0"
+    key_id = str(int(previous) + 1) if previous.isdigit() else f"{previous}+1"
+    machine.append(
+        OP_ROTATE_SIGNING_KEY,
+        {
+            "signingKeyId": key_id,
+            # Sealed by the writer, once. A replica stores this string
+            # verbatim: sealing is not deterministic, so recomputing it
+            # would break replay equivalence.
+            "sealedSigningKey": security.seal_b64(new_key, auth.master_key),
+            "rootTokenPublicKey": tokens.public_b64(tokens.load_private(new_key)),
+            "reason": "operator",
+        },
+    )
+    auth.set_signing_key(new_key)
+    bundle = request.app.state.trust.publish(request.app)
+    version = bundle.version if bundle is not None else machine.state.index
+    log.warning("token key rotated to generation %s; bundle %d names only it", key_id, version)
+    return TrustChange(
+        version=version,
+        reason=Reason.rotation,
+        nodesBehind=trust.nodes_behind(request.app, version),
+    )
+
+
+@router.get("/v1/trust/bundle", response_model=SignedTrustBundle)
+async def get_trust_bundle(request: Request) -> SignedTrustBundle:
+    """The signed bundle every node pulls. **Public**: the signature is the credential.
+
+    A sealed root serves the last one it signed, which it keeps on disk,
+    so a node pulling during an outage keeps what it has rather than
+    learning nothing.
+    """
+    publisher: trust.TrustPublisher = request.app.state.trust
+    if publisher.current is None:
         raise problem(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Control identity unavailable",
-            "The control root's identity key did not open at login, so a re-key cannot be "
-            "signed and no node would accept it. Check the login log for "
-            "'control identity key did not open'.",
+            "No trust bundle yet",
+            "This root has never signed a trust bundle: it is not initialized, or it has not "
+            "been unlocked since it was.",
         )
-
-    # The revoked node is still enrolled here: the entry below removes it.
-    node_names = sorted(n for n in machine.state.nodes if n != revoked_node)
-    try:
-        tracker.begin(reason=reason, revoked_node=revoked_node, nodes=node_names)
-    except RotationInFlight as exc:
-        raise problem(status.HTTP_409_CONFLICT, "Rotation in flight", str(exc)) from exc
-
-    try:
-        new_key = security.generate_signing_key()
-        previous = machine.state.identity.signingKeyId or "0"
-        key_id = str(int(previous) + 1) if previous.isdigit() else f"{previous}+1"
-        machine.append(
-            OP_ROTATE_SIGNING_KEY,
-            {
-                "signingKeyId": key_id,
-                # Sealed by the writer, once. A replica stores this
-                # string verbatim and never re-seals it: sealing is not
-                # deterministic, so recomputing it would break replay
-                # equivalence.
-                "sealedSigningKey": security.seal_b64(new_key, auth.master_key),
-                "reason": reason,
-                "revokedNode": revoked_node,
-            },
-        )
-        auth.set_signing_key(new_key)
-        tracker.minted(key_id)
-    except Exception as exc:
-        tracker.fail(f"{type(exc).__name__}: {exc}")
-        raise
-
-    # Redistribution runs in the background: the caller gets a 202 and
-    # polls GET, because reaching N hosts in another building is not a
-    # request-latency operation. The reference is held on the app rather
-    # than dropped — an unreferenced task can be garbage collected
-    # mid-flight, which here would abandon a rotation halfway and leave
-    # the install in the mixed-key state this whole operation is
-    # careful about.
-    request.app.state.rotation_task = asyncio.create_task(
-        _notify_nodes(
-            request,
-            key_b64=base64.b64encode(new_key).decode("ascii"),
-            key_id=key_id,
-            epoch=machine.state.epoch,
-            tracker=tracker,
-        ),
-        name="control-key-rotation",
-    )
-    current = tracker.current
-    assert current is not None
-    return _to_key_rotation(current)
-
-
-async def _notify_nodes(
-    request: Request,
-    *,
-    key_b64: str,
-    key_id: str,
-    epoch: int,
-    tracker: RotationTracker | None,
-) -> None:
-    """Send every node a signed `POST /v1/node/rekey`.
-
-    Two callers, one message. A **rotation** passes the new key and its
-    tracker, and a node that refuses or times out is left pending and
-    named — there is deliberately no retry loop, because a rotation that
-    quietly retried for an hour would report `distributing` while an
-    operator waited for a verdict, and the verdict they need is "these
-    three hosts are stale". Re-running the rotation is the retry, and it
-    is idempotent. A **promotion** passes the unchanged key and the new
-    epoch with no tracker: the node records the epoch and restarts
-    nothing.
-
-    The body is signed with the control identity, not authenticated by
-    a bearer — `sealing.sign_rekey` says why — and the service token is
-    still sent because the agent ignores it on this one route and every
-    other call this client makes needs it.
-    """
-    machine: StateMachine = request.app.state.machine
-    auth: AuthState = request.app.state.auth_state
-    client = request.app.state.nodes_client
-
-    from .nodes import node_service_token
-
-    private = auth.control_private_key
-    if private is None:  # pragma: no cover - both callers check first
-        if tracker is not None:
-            tracker.fail("control identity key not in memory; the re-key cannot be signed")
-        return
-
-    message = sealing.rekey_message(signing_key=key_b64, signing_key_id=key_id, epoch=epoch)
-    body = {
-        "signingKey": key_b64,
-        "signingKeyId": key_id,
-        "epoch": epoch,
-        "signature": sealing.sign_rekey(private, message),
-    }
-    token = node_service_token(auth)
-
-    for record in list(machine.state.nodes.values()):
-        if not record.url:
-            continue
-        try:
-            await client.post_json(record.url, "/v1/node/rekey", token, body)
-        except (httpx.HTTPError, ValueError) as exc:
-            log.warning(
-                "node %s did not take %s (%s); it will be told again by the next rotation "
-                "or announcement that reaches it",
-                record.name,
-                f"signing key generation {key_id}" if tracker is not None else f"epoch {epoch}",
-                exc,
-            )
-            continue
-        if tracker is not None:
-            tracker.rekeyed(record.name)
-        else:
-            log.info("node %s acknowledged epoch %d", record.name, epoch)
-    if tracker is not None:
-        tracker.finish()
+    return SignedTrustBundle(jws=publisher.current.jws)
 
 
 # --------------------------------------------------------------------------- #
@@ -559,29 +388,3 @@ def _standby_statuses(request: Request) -> list[StandbyStatus]:
             )
         )
     return out
-
-
-def _to_key_rotation(progress: RotationProgress) -> KeyRotation:
-    return KeyRotation(
-        state=State(progress.state),
-        reason=Reason(progress.reason)
-        if progress.reason in (REASON_OPERATOR, REASON_REVOCATION)
-        else None,
-        revokedNode=progress.revoked_node,
-        nodesTotal=progress.nodes_total,
-        nodesRekeyed=progress.nodes_rekeyed,
-        nodesPending=list(progress.nodes_pending),
-        error=progress.error,
-        startedAt=_parse_iso(progress.started_at),
-        finishedAt=_parse_iso(progress.finished_at),
-    )
-
-
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)

@@ -11,11 +11,10 @@ import jwt
 import nacl.signing
 from fastapi.testclient import TestClient
 
-from eugene_plexus_control import security
+from eugene_plexus_control import tokens
 from eugene_plexus_control.applied import canonical_bytes, from_canonical, to_canonical
 from eugene_plexus_control.routes.client_keys import IMPORT_DOMAIN
-from tests.conftest import machine_at
-from tests.test_nodes import _enroll, _mint
+from tests.conftest import enroll, machine_at
 
 
 def test_mint_revoke_policy_and_restart(active_client: TestClient, tmp_path) -> None:
@@ -24,7 +23,9 @@ def test_mint_revoke_policy_and_restart(active_client: TestClient, tmp_path) -> 
     assert response.status_code == 201, response.text
     made = response.json()
     claims = jwt.decode(made["token"], options={"verify_signature": False})
-    assert claims["aud"] == "client" and claims["jti"] == made["key"]["id"]
+    assert jwt.get_unverified_header(made["token"])["typ"] == tokens.TYP_CLIENT
+    assert claims["aud"] == ["gateway"] and claims["iss"] == "control"
+    assert claims["jti"] == made["key"]["id"]
     assert claims["exp"] - claims["iat"] == 365 * 86400
     assert client.get("/v1/auth/client-keys").json()["scope"] == "install"
     assert made["token"] not in client.get("/v1/auth/client-keys").text
@@ -44,12 +45,9 @@ def test_mint_revoke_policy_and_restart(active_client: TestClient, tmp_path) -> 
 
 def test_policy_audiences_and_standby_refusal(active_client: TestClient) -> None:
     client = active_client
-    private = client.app.state.auth_state.signing_key
+    keys, _ = enroll(client, "nas", grants=["gateway"])
     for kind, expected in (("agent", 200), ("gateway", 200), ("library", 401), ("control", 401)):
-        header = {
-            "Authorization": "Bearer "
-            + security.issue_service_token(signing_key=private, kind=kind)
-        }
+        header = {"Authorization": "Bearer " + keys.service_token(sub=kind)}
         assert client.get("/v1/auth/client-keys/policy", headers=header).status_code == expected
         assert (
             client.post("/v1/auth/client-keys", headers=header, json={"name": "x"}).status_code
@@ -62,9 +60,9 @@ def test_policy_audiences_and_standby_refusal(active_client: TestClient) -> None
 
 def test_signed_import_is_idempotent_and_cannot_clear_revocation(active_client: TestClient) -> None:
     client = active_client
-    signing = nacl.signing.SigningKey.generate()
-    public = base64.b64encode(bytes(signing.verify_key)).decode()
-    assert _enroll(client, _mint(client), "legacy", signingPublicKey=public).status_code == 201
+    keys, enrolled = enroll(client, "legacy")
+    assert enrolled.status_code == 201
+    signing = nacl.signing.SigningKey(base64.b64decode(keys.signing_private))
     key = {
         "id": "legacy-key",
         "name": "Old app",

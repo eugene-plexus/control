@@ -24,6 +24,8 @@ import uvicorn
 from fastapi import FastAPI, Response
 from fastapi.testclient import TestClient
 
+from eugene_plexus_control import tokens
+
 
 def _fake_agent(
     *,
@@ -136,6 +138,8 @@ def _enroll(client: TestClient, name: str, url: str) -> None:
             "token": token,
             "name": name,
             "publicKey": base64.b64encode(name.encode().ljust(32, b"0")).decode(),
+            "signingPublicKey": base64.b64encode(name.encode().ljust(32, b"1")).decode(),
+            "tokenPublicKey": tokens.public_b64(tokens.generate_private_key()),
             "url": url,
         },
     )

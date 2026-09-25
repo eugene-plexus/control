@@ -1,7 +1,7 @@
-"""Token minter for the install: Ed25519 for new keys and rotations.
-Trusted agents/control retain private PEM; children receive public PEM.
-Existing 32-byte HS256 keys remain usable until an explicit rotation.
-The token-signing key is independent of the master encryption key.
+"""The trust root's secrets: the passphrase, the master key, sealing, join tokens.
+
+Tokens are minted and verified in `tokens` (per-node token keys,
+2026-09-25). The token key is independent of the master encryption key.
 """
 
 from __future__ import annotations
@@ -9,19 +9,16 @@ from __future__ import annotations
 import base64
 import logging
 import secrets
-import time
-from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
 import argon2
 import argon2.low_level
-import jwt
 import nacl.exceptions
 import nacl.secret
 import nacl.utils
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 log = logging.getLogger(__name__)
 
@@ -32,48 +29,6 @@ _ARGON2_MEMORY_COST = 65_536  # KiB
 _ARGON2_PARALLELISM = 4
 _ARGON2_HASH_LEN = 32  # bytes — drives the secretbox key length
 
-
-def validate_signing_key(key: bytes) -> None:
-    """Minters accept Ed25519 PKCS8 PEM or the existing legacy HMAC key."""
-    if len(key) == 32:
-        return
-    parsed = serialization.load_pem_private_key(key, password=None)
-    if not isinstance(parsed, Ed25519PrivateKey):
-        raise ValueError("token signing requires an Ed25519 private key")
-
-
-def signing_algorithm(key: bytes) -> str:
-    validate_signing_key(key)
-    return "HS256" if len(key) == 32 else "EdDSA"
-
-
-def verification_key(key: bytes) -> bytes:
-    """Validate public Ed25519 PEM, or an explicitly legacy 32-byte HMAC key."""
-    if len(key) == 32:
-        return key
-    if key.startswith(b"-----BEGIN PRIVATE KEY-----"):
-        parsed_private = serialization.load_pem_private_key(key, password=None)
-        if not isinstance(parsed_private, Ed25519PrivateKey):
-            raise ValueError("token signing requires an Ed25519 private key")
-        key = parsed_private.public_key().public_bytes(
-            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-    parsed = serialization.load_pem_public_key(key)
-    if not isinstance(parsed, Ed25519PublicKey):
-        raise ValueError("token verification requires an Ed25519 public key")
-    return key
-
-
-def verification_algorithm(key: bytes) -> str:
-    """Select from trusted key material, never an untrusted JWT header."""
-    return "HS256" if len(key) == 32 else "EdDSA"
-
-
-_DEFAULT_SESSION_TTL_SECONDS = 14 * 24 * 3600
-_DEFAULT_SERVICE_TTL_SECONDS = 365 * 24 * 3600
-
-AUDIENCE_OPERATOR = "operator"
-SERVICE_AUDIENCE_PREFIX = "service:"
 
 ENVELOPE_ALG = "secretbox-xsalsa20poly1305"
 
@@ -251,179 +206,20 @@ def open_b64(sealed: str, master_key: bytes) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
-# JWT session + service tokens
+# This root's token key
 # --------------------------------------------------------------------------- #
 
 
-@dataclass(frozen=True)
-class TokenPayload:
-    """Decoded JWT claims. `iat` / `exp` are unix seconds."""
-
-    sub: str
-    aud: str
-    iat: int
-    exp: int
-
-
 def generate_signing_key() -> bytes:
-    """New installs and explicit rotations use Ed25519, never a new HMAC key."""
+    """This root's token key: Ed25519, PKCS8 PEM, sealed into the log.
+
+    Signing lives in `tokens`; this only makes the key, in the one format
+    `seal_b64` carries.
+    """
     return Ed25519PrivateKey.generate().private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
-    )
-
-
-def issue_operator_token(
-    *,
-    signing_key: bytes,
-    ttl_seconds: int = _DEFAULT_SESSION_TTL_SECONDS,
-    now: int | None = None,
-) -> tuple[str, int]:
-    """Issue a UI session token. Returns `(token, exp_unix_seconds)`.
-
-    The `jti` is not decoration. Without it, two logins in the same
-    second produce byte-identical tokens — same claims, deterministic
-    signature — so logging out and logging straight back in hands the
-    operator the token they just revoked, and they are locked out until
-    the clock ticks over. A random session id makes revocation mean
-    "this session" rather than "every session issued this second".
-    """
-    issued_at = now if now is not None else int(time.time())
-    expires_at = issued_at + ttl_seconds
-    claims = {
-        "sub": "operator",
-        "aud": AUDIENCE_OPERATOR,
-        "iat": issued_at,
-        "exp": expires_at,
-        "jti": secrets.token_urlsafe(12),
-    }
-    return jwt.encode(claims, signing_key, algorithm=signing_algorithm(signing_key)), expires_at
-
-
-def issue_service_token(
-    *,
-    signing_key: bytes,
-    kind: str,
-    ttl_seconds: int = _DEFAULT_SERVICE_TTL_SECONDS,
-    now: int | None = None,
-) -> str:
-    """Issue a service token for one component kind.
-
-    Encoded as `aud: "service:<kind>"` so a component can additionally
-    check the audience matches on inbound calls — a leaked driver token
-    cannot be used against the gateway."""
-    issued_at = now if now is not None else int(time.time())
-    claims = {
-        "sub": kind,
-        "aud": f"{SERVICE_AUDIENCE_PREFIX}{kind}",
-        "iat": issued_at,
-        "exp": issued_at + ttl_seconds,
-    }
-    return jwt.encode(claims, signing_key, algorithm=signing_algorithm(signing_key))
-
-
-CLOCK_SKEW_LEEWAY_SECONDS = 300
-"""How far apart two hosts' clocks may drift before a token is refused.
-
-Five minutes: Kerberos's `MaxClockSkew`, and the window Entra and most
-OAuth validators apply to `iat`, `nbf` and `exp`. **It was zero until
-2026-09-15.** On the live two-machine install the control root's clock
-ran half a second ahead of a worker whose Windows Time service had
-stopped, and every token the root minted in the first half of each
-second was refused by that worker as "not yet valid (iat)" a few
-milliseconds later. Long-lived tokens (the gateway's, the operator's
-session) passed, every health check said ok, and the root listed the
-node `down` with no reason -- so it read as a key or enrollment fault
-and was neither. A skew large enough to matter for security is a
-broken clock; a broken clock is *reported* (`_note_clock_skew`), not
-enforced by refusing traffic between two healthy hosts.
-"""
-
-_SKEW_WARN_AFTER_SECONDS = 2.0
-_SKEW_WARN_INTERVAL_SECONDS = 60.0
-_last_skew_warning = 0.0
-
-
-def _note_clock_skew(iat: int, *, now: float | None = None) -> None:
-    """Warn, at most once a minute, when a token was issued in this host's future.
-
-    Accepted within `CLOCK_SKEW_LEEWAY_SECONDS`, so nothing breaks. Logged
-    so a wrong clock on either host is visible long before the skew grows
-    past the leeway and starts refusing traffic.
-    """
-    global _last_skew_warning
-    current = time.time() if now is None else now
-    ahead = iat - current
-    if ahead <= _SKEW_WARN_AFTER_SECONDS:
-        return
-    if current - _last_skew_warning < _SKEW_WARN_INTERVAL_SECONDS:
-        return
-    _last_skew_warning = current
-    log.warning(
-        "accepted a token issued %.1f s in this host's future: the issuer's clock or "
-        "this host's is wrong (tolerated up to %d s, then tokens are refused)",
-        ahead,
-        CLOCK_SKEW_LEEWAY_SECONDS,
-    )
-
-
-def decode_token(
-    *,
-    token: str,
-    signing_key: bytes,
-    accept_operator: bool = True,
-    accept_any_service: bool = True,
-    accept_service_kinds: Collection[str] | None = None,
-) -> TokenPayload:
-    """Verify signature and expiry, then check the audience class.
-
-    Raises `jwt.InvalidTokenError` or a subclass on any failure, so the
-    caller can collapse every rejection path into one branch.
-
-    `accept_service_kinds` names the exact `service:<kind>` audiences
-    that are acceptable, for the endpoints where "any component of this
-    install" is too wide a door. It exists because the replication
-    surface hands out the sealed signing key, the Argon2id salt and the
-    passphrase verifier, and every `service:*` holder could read it --
-    including the ones that hold no master key and so have something to
-    gain from an offline attack on the verifier. Set it *with*
-    `accept_any_service=False`; passing both means "any service, and
-    also these", which is the wider of the two and almost never what a
-    caller wants.
-    """
-    if not (accept_operator or accept_any_service or accept_service_kinds):
-        raise ValueError("must accept at least one audience class")
-
-    options: Any = {
-        "require": ["sub", "aud", "iat", "exp"],
-        # The caller decides which audiences are acceptable ("operator
-        # OR any service:*"), so PyJWT's own single-audience check is
-        # the wrong shape. `aud` is still required present, above.
-        "verify_aud": False,
-    }
-    claims = jwt.decode(
-        token,
-        key=verification_key(signing_key),
-        algorithms=[verification_algorithm(signing_key)],
-        options=options,
-        leeway=CLOCK_SKEW_LEEWAY_SECONDS,
-    )
-    _note_clock_skew(int(claims["iat"]))
-
-    aud = str(claims["aud"])
-    is_operator = accept_operator and aud == AUDIENCE_OPERATOR
-    is_service = accept_any_service and aud.startswith(SERVICE_AUDIENCE_PREFIX)
-    if not is_service and accept_service_kinds and aud.startswith(SERVICE_AUDIENCE_PREFIX):
-        is_service = aud.removeprefix(SERVICE_AUDIENCE_PREFIX) in set(accept_service_kinds)
-    if not (is_operator or is_service):
-        raise jwt.InvalidAudienceError(f"audience {aud!r} not accepted")
-
-    return TokenPayload(
-        sub=str(claims["sub"]),
-        aud=aud,
-        iat=int(claims["iat"]),
-        exp=int(claims["exp"]),
     )
 
 
@@ -449,13 +245,3 @@ def hash_join_token(token: str) -> str:
     import hashlib
 
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def issue_client_token(
-    *, signing_key: bytes, key_id: str, name: str, issued: int, expires: int
-) -> str:
-    return jwt.encode(
-        {"sub": name, "aud": "client", "iat": issued, "exp": expires, "jti": key_id},
-        signing_key,
-        algorithm=signing_algorithm(signing_key),
-    )

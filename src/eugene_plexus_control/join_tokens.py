@@ -63,6 +63,7 @@ class MintedToken:
     token: str
     expires_at: float
     node_name: str | None
+    grants: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ class TokenRecord:
     expires_at: float
     node_name: str | None
     used: bool
+    grants: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,9 @@ class _Record:
     expires_at: float
     node_name: str | None
     used: bool = False
+    grants: tuple[str, ...] = ()
+    """Extra trust-bundle grants for the node this token enrolls. The
+    operator chose them when minting; the node never asks."""
 
 
 class JoinTokenStore:
@@ -102,7 +107,9 @@ class JoinTokenStore:
         self._lock = threading.Lock()
         self._records: dict[str, _Record] = {}
 
-    def mint(self, *, ttl_seconds: int, node_name: str | None) -> MintedToken:
+    def mint(
+        self, *, ttl_seconds: int, node_name: str | None, grants: tuple[str, ...] = ()
+    ) -> MintedToken:
         token = security.generate_join_token()
         token_hash = security.hash_join_token(token)
         expires_at = time.time() + ttl_seconds
@@ -115,11 +122,17 @@ class JoinTokenStore:
         with self._lock:
             self._sweep_locked()
             self._records[token_hash] = _Record(
-                id=token_id, token_hash=token_hash, expires_at=expires_at, node_name=node_name
+                id=token_id,
+                token_hash=token_hash,
+                expires_at=expires_at,
+                node_name=node_name,
+                grants=grants,
             )
         # Returned once and never stored in recoverable form. A lost
         # token is re-minted, not looked up.
-        return MintedToken(id=token_id, token=token, expires_at=expires_at, node_name=node_name)
+        return MintedToken(
+            id=token_id, token=token, expires_at=expires_at, node_name=node_name, grants=grants
+        )
 
     def list(self) -> list[TokenRecord]:
         """Outstanding tokens, soonest to expire first.
@@ -134,7 +147,13 @@ class JoinTokenStore:
             records = list(self._records.values())
         records.sort(key=lambda r: (r.expires_at, r.id))
         return [
-            TokenRecord(id=r.id, expires_at=r.expires_at, node_name=r.node_name, used=r.used)
+            TokenRecord(
+                id=r.id,
+                expires_at=r.expires_at,
+                node_name=r.node_name,
+                used=r.used,
+                grants=r.grants,
+            )
             for r in records
         ]
 
@@ -155,8 +174,8 @@ class JoinTokenStore:
                     return True
         return False
 
-    def consume(self, token: str, *, node_name: str) -> None:
-        """Spend a token for one node name. Raises on any problem.
+    def consume(self, token: str, *, node_name: str) -> tuple[str, ...]:
+        """Spend a token for one node name, returning its grants. Raises on any problem.
 
         Marks the token used *before* the caller does anything with the
         enrollment, so a crash between the two spends the token rather
@@ -186,7 +205,9 @@ class JoinTokenStore:
                 expires_at=record.expires_at,
                 node_name=record.node_name,
                 used=True,
+                grants=record.grants,
             )
+            return record.grants
 
     def _sweep_locked(self) -> None:
         now = time.time()

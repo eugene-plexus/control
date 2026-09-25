@@ -18,7 +18,7 @@ import base64
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_control import node_address, sealing
+from eugene_plexus_control import node_address, sealing, tokens
 
 NODE_PUBLIC = base64.b64encode(b"x" * 32).decode("ascii")
 
@@ -49,6 +49,7 @@ def _enroll(client: TestClient, name: str, *, url: str, public: str) -> object:
             "publicKey": NODE_PUBLIC,
             "url": url,
             "signingPublicKey": public,
+            "tokenPublicKey": tokens.public_b64(tokens.generate_private_key()),
         },
     )
 
@@ -127,6 +128,7 @@ def test_a_refused_enrollment_does_not_burn_the_join_token(active_client: TestCl
             "publicKey": NODE_PUBLIC,
             "url": "http://169.254.169.254/",
             "signingPublicKey": public,
+            "tokenPublicKey": tokens.public_b64(tokens.generate_private_key()),
         },
     )
     assert bad.status_code == 400, bad.text
@@ -140,6 +142,7 @@ def test_a_refused_enrollment_does_not_burn_the_join_token(active_client: TestCl
             "publicKey": NODE_PUBLIC,
             "url": "http://10.0.0.7:8079",
             "signingPublicKey": public,
+            "tokenPublicKey": tokens.public_b64(tokens.generate_private_key()),
         },
     )
     assert good.status_code == 201, good.text

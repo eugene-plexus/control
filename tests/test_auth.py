@@ -17,10 +17,10 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from eugene_plexus_control import security
+from eugene_plexus_control import security, tokens
 from eugene_plexus_control.app import create_app
 
-from .conftest import PASSPHRASE, settings_for
+from .conftest import PASSPHRASE, enroll, node_keys, settings_for
 
 
 def test_a_fresh_install_reports_uninitialized_without_a_token(
@@ -134,29 +134,60 @@ def test_a_wrong_passphrase_is_rejected_and_rate_limited(tmp_path: Path) -> None
         assert client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).status_code == 429
 
 
-def test_a_service_token_can_read_but_not_mutate(active_client: TestClient) -> None:
-    """An agent needs the epoch; a compromised peer must not re-key the
+def test_a_node_service_token_can_read_but_not_mutate(active_client: TestClient) -> None:
+    """An agent needs the epoch; a compromised peer must not change the
     install. That asymmetry is the reason reads and mutations declare
-    different levels."""
+    different levels, and since 2026-09-25 the peer's token is signed by
+    its own node's key, so this is the whole of what one node can do here."""
+    keys, _ = enroll(active_client, "nas", grants=["gateway"])
+    for sub in ("agent", "gateway"):
+        headers = {"Authorization": f"Bearer {keys.service_token(sub=sub)}"}
+        assert active_client.get("/v1/control/status", headers=headers).status_code == 200
+        assert active_client.get("/v1/nodes", headers=headers).status_code == 200
+
+        # The replication surface is not a read like the two above: it
+        # carries the salt and the passphrase verifier.
+        assert active_client.get("/v1/control/snapshot", headers=headers).status_code == 401
+        assert active_client.get("/v1/control/log?after=0", headers=headers).status_code == 401
+
+        assert active_client.post("/v1/nodes/join-token", headers=headers).status_code == 401
+        assert active_client.post("/v1/control/rotate-key", headers=headers).status_code == 401
+        assert (
+            active_client.patch("/v1/config", json={"uiTheme": "dark"}, headers=headers).status_code
+            == 401
+        )
+
+
+def test_a_node_token_for_another_kind_opens_nothing_here(active_client: TestClient) -> None:
+    """A driver's or the library's token has no business at the root, and
+    a worker without the gateway grant cannot pass as the gateway."""
+    keys, _ = enroll(active_client, "gpu-box")
+    for sub in ("inference-driver", "library", "control", "gateway"):
+        headers = {"Authorization": f"Bearer {keys.service_token(sub=sub)}"}
+        assert active_client.get("/v1/nodes", headers=headers).status_code == 401, sub
+
+
+def test_a_token_this_root_sent_a_node_cannot_be_replayed_here(active_client: TestClient) -> None:
+    """The year-long `service:control` token every node received on every
+    poll opened this root's snapshot until 2026-09-25. What a node gets
+    now is addressed to it alone."""
+    from eugene_plexus_control.routes.nodes import service_token_for
+
+    enroll(active_client, "gpu-box")
     auth = active_client.app.state.auth_state  # type: ignore[attr-defined]
-    service = security.issue_service_token(signing_key=auth.signing_key, kind="gateway")
-    headers = {"Authorization": f"Bearer {service}"}
-
-    assert active_client.get("/v1/control/status", headers=headers).status_code == 200
-    assert active_client.get("/v1/nodes", headers=headers).status_code == 200
-
-    # And it stops at the replication surface, which is not a read like
-    # the two above: it carries the install's key material. This
-    # assertion is the one that was missing -- the test asserted the two
-    # 200s and stopped one endpoint short of the door that mattered.
-    assert active_client.get("/v1/control/snapshot", headers=headers).status_code == 401
-
-    assert active_client.post("/v1/nodes/join-token", headers=headers).status_code == 401
-    assert active_client.post("/v1/control/rotate-key", headers=headers).status_code == 401
-    assert (
-        active_client.patch("/v1/config", json={"uiTheme": "dark"}, headers=headers).status_code
-        == 401
+    sent = service_token_for(auth, "gpu-box")
+    assert sent is not None
+    view = active_client.app.state.trust.view_for(  # type: ignore[attr-defined]
+        active_client.app.state.machine.state  # type: ignore[attr-defined]
     )
+    claims = tokens.verify(
+        sent, bundle=view, recipient="node:gpu-box", classes=[tokens.TYP_SERVICE]
+    )
+    assert claims.aud == ("node:gpu-box",), "addressed to the one node, and to nothing else"
+    assert claims.exp - claims.iat <= tokens.CONTROL_SERVICE_TTL_SECONDS
+    headers = {"Authorization": f"Bearer {sent}"}
+    assert active_client.get("/v1/control/snapshot", headers=headers).status_code == 401
+    assert active_client.get("/v1/nodes", headers=headers).status_code == 401
 
 
 def test_logout_revokes_only_the_presented_token(active_client: TestClient) -> None:
@@ -201,52 +232,71 @@ def test_the_master_key_is_derived_not_stored(tmp_path: Path) -> None:
     assert security.derive_master_key(PASSPHRASE, base64.b64decode(identity.salt)) == master
 
 
-def test_a_service_token_that_is_not_the_standby_cannot_pull_key_material(
-    active_client: TestClient,
-) -> None:
-    """R2.4 / review §6.2 #12.
+def test_only_a_session_pulls_key_material(active_client: TestClient) -> None:
+    """R2.4 / review §6.2 #12, narrowed further on 2026-09-25.
 
-    `/v1/control/snapshot` carries the install's **sealed signing key,
-    the Argon2id salt and the passphrase verifier**, and `/v1/control/log`
-    carries the entries those values were written in. Read-level auth
-    accepted *any* `service:*` audience, so a gateway, library or driver
-    token holder that does not hold the master key -- the
-    configured-but-locked window, a restarted agent, a node whose agent
-    never unlocked -- could pull the verifier and the salt and run an
-    offline passphrase attack against them.
-
-    The one caller that legitimately pulls both is a **standby**, which
-    presents `service:control`. Nothing else has business here, and the
-    audience already says which is which.
-
-    The test that should have caught this asserted a `service:gateway`
-    token gets 200 on status and nodes and stopped one endpoint short of
-    the two carrying key material.
+    `/v1/control/snapshot` carries this root's **sealed token key, the
+    Argon2id salt and the passphrase verifier**, and `/v1/control/log`
+    carries the entries those values were written in. Nothing but an
+    operator session opens either now.
     """
-    auth = active_client.app.state.auth_state  # type: ignore[attr-defined]
-    gateway = {
-        "Authorization": "Bearer "
-        + security.issue_service_token(signing_key=auth.signing_key, kind="gateway")
-    }
-    standby = {
-        "Authorization": "Bearer "
-        + security.issue_service_token(signing_key=auth.signing_key, kind="control")
-    }
+    snapshot = active_client.get("/v1/control/snapshot")
+    assert snapshot.status_code == 200
+    body = snapshot.json()
+    assert body["passphraseVerifier"].startswith("$argon2")
+    assert body["salt"]
+    assert body["sealedSigningKey"]
+    assert active_client.get("/v1/control/log?after=0").status_code == 200
 
-    # The material is really there, so the refusal below is about
-    # something rather than about an empty document.
-    snapshot = active_client.get("/v1/control/snapshot").json()
-    assert snapshot["passphraseVerifier"].startswith("$argon2")
-    assert snapshot["salt"]
-    assert snapshot["sealedSigningKey"]
+    keys, _ = enroll(active_client, "nas", grants=["gateway"])
+    for sub in ("agent", "gateway"):
+        headers = {"Authorization": f"Bearer {keys.service_token(sub=sub)}"}
+        assert active_client.get("/v1/control/snapshot", headers=headers).status_code == 401
+        assert active_client.get("/v1/control/log?after=0", headers=headers).status_code == 401
 
-    assert active_client.get("/v1/control/snapshot", headers=gateway).status_code == 401
-    assert active_client.get("/v1/control/log?after=0", headers=gateway).status_code == 401
 
-    # And replication still works, or the fix would have cost failover.
-    assert active_client.get("/v1/control/snapshot", headers=standby).status_code == 200
-    assert active_client.get("/v1/control/log?after=0", headers=standby).status_code == 200
+def test_a_login_through_an_agent_is_addressed_to_that_machine(active_client: TestClient) -> None:
+    """D6: who asked decides the session's audience. A forged or foreign
+    header only narrows it."""
+    keys, _ = enroll(active_client, "gpu-box")
+    gateway, _ = enroll(active_client, "nas", grants=["gateway"])
+    view = active_client.app.state.trust.view_for(  # type: ignore[attr-defined]
+        active_client.app.state.machine.state  # type: ignore[attr-defined]
+    )
 
-    # What a non-standby service token keeps: the epoch, and the node list.
-    assert active_client.get("/v1/control/status", headers=gateway).status_code == 200
-    assert active_client.get("/v1/nodes", headers=gateway).status_code == 200
+    def session_aud(headers: dict[str, str]) -> tuple[str, ...]:
+        response = active_client.post(
+            "/v1/auth/login", json={"passphrase": PASSPHRASE}, headers=headers
+        )
+        assert response.status_code == 200, response.text
+        token = response.json()["sessionToken"]
+        return tokens.verify(
+            token, bundle=view, recipient="control", classes=[tokens.TYP_SESSION]
+        ).aud
+
+    through_agent = {"Authorization": f"Bearer {keys.service_token()}"}
+    assert session_aud(through_agent) == ("node:gpu-box", "control")
+    stranger = node_keys("gpu-box").service_token()
+    assert session_aud({"Authorization": f"Bearer {stranger}"}) == ("control",)
+    assert session_aud({"Authorization": "Bearer nonsense"}) == ("control",)
+    as_driver = {"Authorization": f"Bearer {keys.service_token(sub='inference-driver')}"}
+    assert session_aud(as_driver) == ("control",)
+    # A gateway token verifies here, and is still not an agent signing in.
+    as_gateway = {"Authorization": f"Bearer {gateway.service_token(sub='gateway')}"}
+    assert session_aud(as_gateway) == ("control",)
+
+
+def test_a_sign_out_is_replicated_and_reaches_the_bundle(active_client: TestClient) -> None:
+    """D6: sign-out is install-wide. The entry is in the log, so a standby
+    refuses the session too, and the bundle nodes check carries it."""
+    token = active_client.headers["Authorization"].removeprefix("Bearer ")
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    view = active_client.app.state.trust.view_for(machine.state)  # type: ignore[attr-defined]
+    jti = tokens.verify(token, bundle=view, recipient="control", classes=[tokens.TYP_SESSION]).jti
+
+    before = machine.state.index
+    assert active_client.delete("/v1/auth/sessions/current").status_code == 204
+    assert [e["op"] for e in machine.read_page(before, 10)] == ["revokeSession"]
+    assert jti in machine.state.revoked_sessions
+    published = active_client.app.state.trust.current  # type: ignore[attr-defined]
+    assert jti in published.revoked_sessions

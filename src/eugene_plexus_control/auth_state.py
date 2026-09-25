@@ -1,18 +1,18 @@
 """Process-wide auth posture for the trust root.
 
-Unlike every other component, this one is not handed a signing key at
-spawn. It **mints** the signing key and derives the master key from the
-operator's passphrase, and the agent that supervises it receives the key
-rather than supplying it.
+Unlike every other component, this one is not handed anything at
+spawn. It holds **its own token key**, sealed under the master key it
+derives from the operator's passphrase, and that key never leaves it:
+since 2026-09-25 no node receives it, and each node signs with a key of
+its own (`specs/docs/design/per-node-token-keys.md`).
 
 Three things live here, and the distinction between them is the whole
 security model:
 
-  * **The signing key** — in memory, and persisted sealed under the
-    master key so a restart is not a re-key. Through M4 tokens were
-    "rotated on each watchdog restart"; with N nodes that is an outage,
-    because a restart re-keying the install breaks every component that
-    has not yet been told.
+  * **The token key** — in memory, and persisted sealed under the
+    master key so a restart does not sign everyone out. It signs
+    sessions, exchanged tokens, client keys and this root's own service
+    tokens.
 
   * **The master key** — memory only, derived from passphrase + salt,
     never on disk in plaintext. Re-derivable, which is why it is not in
@@ -22,10 +22,11 @@ security model:
     resolves "does the master key cross a host boundary" in the good
     direction.
 
-  * **Login rate limiting and session revocation** — per process, not
-    replicated. A failed login on one host is not a fact about the
-    install, and a standby that inherited a lockout would be a denial of
-    service with extra steps.
+  * **Login rate limiting** — per process, not replicated. A failed
+    login on one host is not a fact about the install, and a standby
+    that inherited a lockout would be a denial of service with extra
+    steps. **Sign-outs are replicated** (`revokeSession`): the trust
+    bundle carries them to every machine.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import security
+from . import tokens
 
 log = logging.getLogger(__name__)
 
@@ -50,9 +51,9 @@ class AuthState:
     """
 
     signing_key: bytes | None = None
-    """Current service-token signing key. None before initialization, or
-    on a standby that has not been promoted — a standby holds it sealed
-    and cannot open it without the passphrase."""
+    """This root's token key, PKCS8 PEM. None before initialization, or
+    while sealed — a standby holds it sealed and cannot open it without
+    the passphrase."""
 
     master_key: bytes | None = None
     """Derived from the passphrase at login. Memory only, always."""
@@ -66,7 +67,6 @@ class AuthState:
     unsealed. Held only during an explicit recovery or re-seal; normal
     operation never needs it and never opens a component secret."""
 
-    _revoked: set[str] = field(default_factory=set)
     _failures: dict[str, list[float]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -87,8 +87,15 @@ class AuthState:
         return self.master_key is not None
 
     def set_signing_key(self, key: bytes) -> None:
-        security.validate_signing_key(key)
+        tokens.load_private(key)
         self.signing_key = key
+
+    def signer(self) -> tokens.Signer | None:
+        """The token key as a signer, or None while locked."""
+        if self.signing_key is None:
+            return None
+        key = tokens.load_private(self.signing_key)
+        return tokens.Signer(key=key, issuer=tokens.ISSUER_CONTROL)
 
     def set_master_key(self, key: bytes) -> None:
         if len(key) != 32:
@@ -102,16 +109,6 @@ class AuthState:
         self.master_key = None
         self.control_private_key = None
         self.recovery_private_key = None
-
-    # ----- sessions ---------------------------------------------------
-
-    def revoke(self, token: str) -> None:
-        with self._lock:
-            self._revoked.add(token)
-
-    def is_revoked(self, token: str) -> bool:
-        with self._lock:
-            return token in self._revoked
 
     # ----- login rate limiting ----------------------------------------
 

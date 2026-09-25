@@ -1,10 +1,12 @@
-"""Key rotation and per-node sealing.
+"""Trust-bundle distribution, root-key rotation, and per-node sealing.
 
-Rotation is the sharp edge: *"if rotation is incomplete — a node `down`
-during it, a partial redistribution — the install is left in a
-mixed-key state where some legitimate calls fail and a revoked node may
-still be trusted somewhere."* The design asked specifically for a test
-that revokes a node while another is offline, and that is the one below.
+Until 2026-09-25 this file was about rotating the one key every node
+held, and the mixed-key state a partial redistribution left behind. No
+node holds a key another could use now
+(`specs/docs/design/per-node-token-keys.md`), so a revocation or a
+rotation only publishes a new **trust bundle**. These tests are about
+that bundle reaching nodes, being refused by a node that pins a
+different root, and naming the nodes that do not hold it yet.
 
 Sealing is the other half of the blast-radius argument: one compromised
 GPU box in another building must not yield every secret in the install.
@@ -14,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import threading
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -22,44 +25,37 @@ import uvicorn
 from fastapi import FastAPI, Response
 from fastapi.testclient import TestClient
 
-from eugene_plexus_control import sealing
+from eugene_plexus_control import sealing, tokens
 from eugene_plexus_control.app import create_app
 from eugene_plexus_control.applied import NodeRecord
-from eugene_plexus_control.rotation import RotationTracker
 from eugene_plexus_control.sealing import SealError
 from eugene_plexus_control.state_machine import StateMachine
 
-from .conftest import PASSPHRASE, login, settings_for, standby_at
+from .conftest import PASSPHRASE, enroll, login, settings_for, standby_at
 
 # --------------------------------------------------------------------------- #
-# Rotation
+# Distribution
 # --------------------------------------------------------------------------- #
 
 
-def _rekeyable_agent() -> tuple[FastAPI, list[dict[str, Any]]]:
-    """A fake agent that does what a real one does with a re-key: verify
-    the signature against the control identity it recorded at
-    enrollment, and refuse anything else with 401. A fake that recorded
-    whatever arrived is how the unsigned re-key survived M5 — the real
-    agent would have refused every rotation the control root ever sent."""
-    received: list[dict[str, Any]] = []
+def _bundle_agent() -> tuple[FastAPI, list[tokens.TrustBundle]]:
+    """A fake agent that does what a real one does with a pushed bundle:
+    verify it against the control identity it pinned at enrollment, and
+    refuse anything else with 401. A fake that recorded whatever arrived
+    is how the unsigned re-key survived M5."""
+    received: list[tokens.TrustBundle] = []
     app = FastAPI()
     app.state.control_public_key = None
 
-    @app.post("/v1/node/rekey")
-    async def rekey(body: dict[str, Any], response: Response) -> dict[str, str]:
-        expected = app.state.control_public_key
-        message = sealing.rekey_message(
-            signing_key=body["signingKey"],
-            signing_key_id=body["signingKeyId"],
-            epoch=body["epoch"],
-        )
-        if expected is None or not sealing.verify_rekey(
-            expected, message, body.get("signature", "")
-        ):
+    @app.post("/v1/node/trust-bundle")
+    async def take(body: dict[str, Any], response: Response) -> dict[str, str]:
+        pinned = app.state.control_public_key
+        try:
+            bundle = tokens.parse_bundle(str(body["jws"]), authority=pinned or "")
+        except (tokens.BundleError, KeyError, ValueError):
             response.status_code = 401
             return {"detail": "signature rejected"}
-        received.append(body)
+        received.append(bundle)
         return {"ok": "true"}
 
     @app.get("/v1/runtimes")
@@ -93,137 +89,145 @@ class _Server:
 
 
 @pytest.fixture
-def rekeyable() -> Iterator[tuple[_Server, list[dict[str, Any]]]]:
-    app, received = _rekeyable_agent()
+def agent() -> Iterator[tuple[_Server, list[tokens.TrustBundle]]]:
+    app, received = _bundle_agent()
     with _Server(app) as server:
         yield server, received
 
 
-def _enroll(client: TestClient, name: str, url: str) -> None:
-    """Enroll through the API, URL included — the path a real agent takes
-    from M7. Until then this helper appended a second `enrollNode` entry
-    by hand to give the node an address the exchange never carried."""
-    token = client.post("/v1/nodes/join-token").json()["token"]
-    public = base64.b64encode(name.encode().ljust(32, b"0")).decode()
-    response = client.post(
-        "/v1/nodes/enroll",
-        json={"token": token, "name": name, "publicKey": public, "url": url},
-    )
-    assert response.status_code == 201, response.text
-
-
-def _trust(server: _Server, client: TestClient) -> None:
-    """Tell the fake agent which control identity to verify re-keys
-    against — what a real agent records at enrollment as
-    `controlPublicKey`."""
+def _pin(server: _Server, client: TestClient) -> None:
+    """What a real agent records at enrollment as `controlPublicKey`."""
     machine = client.app.state.machine  # type: ignore[attr-defined]
     server.app.state.control_public_key = machine.state.identity.controlPublicKey
 
 
-def test_rotation_mints_logs_and_redistributes_in_that_order(
-    active_client: TestClient, rekeyable: tuple[_Server, list[dict[str, Any]]]
-) -> None:
-    """The new key is durable **before** any node hears about it.
+def _await(received: list[tokens.TrustBundle], client: TestClient, version: int) -> None:
+    """Let the background push finish. Any request drives the app's loop."""
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if any(b.version >= version for b in received):
+            return
+        client.get("/healthz")
+        time.sleep(0.02)
 
-    A crash midway then leaves an install whose recorded key is the new
-    one and whose hosts are a mix, which re-running the rotation fixes.
-    The other order would leave nodes holding a key no surviving root
-    knows about, which nothing fixes.
-    """
-    server, received = rekeyable
-    _trust(server, active_client)
-    _enroll(active_client, "gpu-box", server.url)
+
+def _root_kids(bundle: tokens.TrustBundle) -> set[str]:
+    return {k.kid for k in bundle.keys.values() if k.issuer == "control"}
+
+
+def test_a_rotation_replaces_only_the_root_key_and_moves_nothing_private(
+    active_client: TestClient, agent: tuple[_Server, list[tokens.TrustBundle]]
+) -> None:
+    """D10. The new key is sealed into the log and named in a bundle; node
+    keys are untouched; the push carries public material only."""
+    server, received = agent
+    _pin(server, active_client)
+    keys, _ = enroll(active_client, "gpu-box", url=server.url)
     machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    auth = active_client.app.state.auth_state  # type: ignore[attr-defined]
+    before = active_client.app.state.trust.current  # type: ignore[attr-defined]
 
     response = active_client.post("/v1/control/rotate-key")
     assert response.status_code == 202, response.text
-    assert response.json()["reason"] == "operator"
+    body = response.json()
+    assert body["reason"] == "rotation"
 
-    # The log carries the sealed key, not the plaintext one.
     last = machine.read_page(machine.state.index - 1, 1)[0]
     assert last["op"] == "rotateSigningKey"
-    auth = active_client.app.state.auth_state  # type: ignore[attr-defined]
-    assert base64.b64encode(auth.signing_key).decode() not in str(last)
+    assert "PRIVATE KEY" not in str(last)
 
-    # And the caller is now logged out, because one key signs both
-    # service tokens and operator sessions. Correct rather than
-    # convenient: a host that held a service token could have held an
-    # operator session too, and the usual reason to rotate is that some
-    # host should no longer be trusted.
-    assert active_client.get("/v1/control/rotate-key").status_code == 401
-    _relogin(active_client)
+    # The caller signed in under the old key, so it is signed out: that is
+    # what the emergency lever is for.
+    assert active_client.get("/v1/nodes").status_code == 401
+    active_client.headers["Authorization"] = f"Bearer {login(active_client)}"
 
-    _await_rotation(active_client)
-    progress = active_client.get("/v1/control/rotate-key").json()
-    assert progress["state"] == "done", progress
-    assert received and base64.b64decode(received[0]["signingKey"]) == auth.signing_key
-
-    # The re-key the node took was signed by the control identity — the
-    # fake refused anything else with 401, so `done` is the proof — and
-    # carries the generation and the epoch the node fences on.
-    assert received[0]["signingKeyId"] == machine.state.identity.signingKeyId
-    assert received[0]["epoch"] == machine.state.epoch
-    message = sealing.rekey_message(
-        signing_key=received[0]["signingKey"],
-        signing_key_id=received[0]["signingKeyId"],
-        epoch=received[0]["epoch"],
-    )
-    assert sealing.verify_rekey(
-        machine.state.identity.controlPublicKey, message, received[0]["signature"]
-    )
-    impostor = sealing.generate_control_identity()
-    assert not sealing.verify_rekey(impostor.public, message, received[0]["signature"])
+    _await(received, active_client, body["version"])
+    pushed = received[-1]
+    assert pushed.version == body["version"]
+    assert _root_kids(pushed) != _root_kids(before)
+    assert _root_kids(pushed) == {auth.signer().kid}
+    node_kids = {k.kid for k in pushed.keys.values() if k.issuer == "node:gpu-box"}
+    assert node_kids == {keys.token.kid}, "a node's key survives a root rotation"
 
 
-def test_a_node_that_is_down_during_a_rotation_is_named_not_hidden(
-    active_client: TestClient, rekeyable: tuple[_Server, list[dict[str, Any]]]
+def test_a_revocation_pushes_a_bundle_without_the_node_and_names_who_is_behind(
+    active_client: TestClient, agent: tuple[_Server, list[tokens.TrustBundle]]
 ) -> None:
-    """The test §12 asked for: revoke a node while another is offline.
-
-    The rotation finishes as `failed` with the offline host **named**,
-    because "which host is stale" is the question an operator actually
-    has and a percentage cannot answer it. Calling it `done` would tell
-    them the install is consistent when it is not.
-    """
-    server, _ = rekeyable
-    _trust(server, active_client)
-    _enroll(active_client, "gpu-box", server.url)
-    _enroll(active_client, "attic", "http://127.0.0.1:1")
-    _enroll(active_client, "shed", server.url)
+    """The test §12 asked for, re-read: revoke a node while another is
+    offline. The offline one is named, and it catches up by pulling."""
+    server, received = agent
+    _pin(server, active_client)
+    enroll(active_client, "gpu-box", url=server.url)
+    enroll(active_client, "attic", url="http://127.0.0.1:1")
+    enroll(active_client, "shed", url=server.url)
 
     response = active_client.delete("/v1/nodes/shed")
-    assert response.status_code == 202
+    assert response.status_code == 202, response.text
+    version = response.json()["version"]
+    _await(received, active_client, version)
+    assert all("node:shed" not in {k.issuer for k in b.keys.values()} for b in received[-1:])
 
-    tracker: RotationTracker = active_client.app.state.rotation  # type: ignore[attr-defined]
-    _relogin(active_client)
-    _await_rotation(active_client)
-    final = tracker.current
-    assert final is not None
-    assert final.state == "failed"
-    assert final.nodes_pending == ("attic",)
-    assert final.error is not None and "attic" in final.error
-    assert "re-keyed on reconnect" in final.error
+    listed = active_client.get("/v1/nodes").json()["nodes"]
+    assert {n["name"] for n in listed} == {"gpu-box", "attic"}
+    deadline = time.time() + 10
+    behind: list[str] = []
+    while time.time() < deadline:
+        from eugene_plexus_control import trust
+
+        behind = trust.nodes_behind(active_client.app, version)
+        if behind == ["attic"]:
+            break
+        active_client.get("/healthz")
+        time.sleep(0.05)
+    assert behind == ["attic"]
 
 
-def test_a_node_that_does_not_trust_this_root_is_named_stale(
-    active_client: TestClient, rekeyable: tuple[_Server, list[dict[str, Any]]]
+def test_a_node_that_pins_another_root_refuses_the_bundle(
+    active_client: TestClient, agent: tuple[_Server, list[tokens.TrustBundle]]
 ) -> None:
     """The other half of the signature: a node enrolled with a *different*
-    root refuses this one's re-key, and the rotation says so rather than
-    calling the install consistent."""
-    server, received = rekeyable
+    root refuses this one's bundle, and is named behind rather than
+    counted as holding it."""
+    server, received = agent
     server.app.state.control_public_key = sealing.generate_control_identity().public
-    _enroll(active_client, "gpu-box", server.url)
-
-    assert active_client.post("/v1/control/rotate-key").status_code == 202
-    _relogin(active_client)
-    _await_rotation(active_client)
-    tracker: RotationTracker = active_client.app.state.rotation  # type: ignore[attr-defined]
-    final = tracker.current
-    assert final is not None
-    assert final.state == "failed"
-    assert final.nodes_pending == ("gpu-box",)
+    enroll(active_client, "gpu-box", url=server.url)
+    response = active_client.post("/v1/control/rotate-key")
+    assert response.status_code == 202
+    active_client.headers["Authorization"] = f"Bearer {login(active_client)}"
+    time.sleep(0.5)
+    active_client.get("/healthz")
     assert received == []
+    from eugene_plexus_control import trust
+
+    assert trust.nodes_behind(active_client.app, response.json()["version"]) == ["gpu-box"]
+
+
+def test_the_bundle_is_public_and_a_sealed_root_still_serves_it(tmp_path: Any) -> None:
+    """Every agent pulls it, including while this root is sealed after a
+    restart: the signature is the credential, and the last one is kept."""
+    directory = tmp_path / "install"
+    app = create_app(settings_for(directory))
+    with TestClient(app) as client:
+        assert (
+            client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
+        )
+        first = client.get("/v1/trust/bundle")
+        assert first.status_code == 200, first.text
+        authority = app.state.machine.state.identity.controlPublicKey
+        assert tokens.parse_bundle(first.json()["jws"], authority=authority)
+
+    restarted = create_app(settings_for(directory))
+    with TestClient(restarted) as client:
+        assert client.get("/v1/nodes").status_code == 503, "sealed"
+        kept = client.get("/v1/trust/bundle")
+        assert kept.status_code == 200
+        assert kept.json()["jws"] == first.json()["jws"]
+
+
+def test_a_fresh_root_has_no_bundle_to_give(tmp_path: Any) -> None:
+    app = create_app(settings_for(tmp_path / "fresh"))
+    with TestClient(app) as client:
+        assert client.get("/v1/trust/bundle").status_code == 503
 
 
 def _replicate(active: StateMachine, standby_dir: Any) -> StateMachine:
@@ -234,110 +238,47 @@ def _replicate(active: StateMachine, standby_dir: Any) -> StateMachine:
     return standby
 
 
-def test_promotion_announces_the_new_epoch_to_every_node(
-    tmp_path: Any, rekeyable: tuple[_Server, list[dict[str, Any]]]
+def test_promotion_announces_the_new_epoch_with_the_same_keys(
+    tmp_path: Any, agent: tuple[_Server, list[tokens.TrustBundle]]
 ) -> None:
-    """M5 §9 said agents learn the new epoch "on their next contact". This
-    is the contact: the promoted root sends every node the same signed
-    message a rotation would, with the signing key UNCHANGED and the new
-    epoch, so the node records the generation and restarts nothing. The
-    identity that signs it is the one promotion preserved — a promoted
-    standby with a fresh keypair would be refused by every node it tried
-    to command, which is the fencing mechanism firing at the wrong target."""
-    import time
-
-    server, received = rekeyable
+    """The promoted root pushes a bundle at the new epoch, signed by the
+    identity promotion preserved and naming the same root key, so nodes
+    fence the old root and nobody is signed out."""
+    server, received = agent
     active_app = create_app(settings_for(tmp_path / "active"))
     with TestClient(active_app) as active:
         assert (
             active.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
         )
         active.headers["Authorization"] = f"Bearer {login(active)}"
-        _trust(server, active)
-        _enroll(active, "gpu-box", server.url)
+        _pin(server, active)
+        enroll(active, "gpu-box", url=server.url)
         active_machine: StateMachine = active_app.state.machine
-        key_before = active_app.state.auth_state.signing_key
+        root_kid = active_app.state.auth_state.signer().kid
         epoch_before = active_machine.state.epoch
         _replicate(active_machine, tmp_path / "standby" / "state")
+    received.clear()
 
     standby_app = create_app(settings_for(tmp_path / "standby", role="standby"))
     with TestClient(standby_app) as standby:
         token = standby.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
             "sessionToken"
         ]
-        headers = {"Authorization": f"Bearer {token}"}
         promoted = standby.post(
-            "/v1/control/promote", json={"passphrase": PASSPHRASE}, headers=headers
+            "/v1/control/promote",
+            json={"passphrase": PASSPHRASE},
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert promoted.status_code == 200, promoted.text
         assert promoted.json()["epoch"] == epoch_before + 1
-
         deadline = time.time() + 20
-        while not received and time.time() < deadline:
+        while not any(b.epoch == epoch_before + 1 for b in received) and time.time() < deadline:
             standby.get("/healthz")
             time.sleep(0.05)
 
-    assert received, "the promoted root never announced its epoch"
-    announcement = received[-1]
-    assert announcement["epoch"] == epoch_before + 1
-    assert base64.b64decode(announcement["signingKey"]) == key_before, (
-        "a promotion changes the epoch, never the key"
-    )
-    assert announcement["signingKeyId"] == "1"
-
-
-def test_two_concurrent_rotations_are_refused(active_client: TestClient) -> None:
-    """Two new keys, each distributed to a different subset of hosts, is
-    a mixed-key state with no single correct answer."""
-    tracker: RotationTracker = active_client.app.state.rotation  # type: ignore[attr-defined]
-    tracker.begin(reason="operator", revoked_node=None, nodes=["a", "b"])
-    response = active_client.post("/v1/control/rotate-key")
-    assert response.status_code == 409
-    assert "mixed-key" in response.text
-
-
-def test_rotation_progress_persists_after_it_ends(active_client: TestClient) -> None:
-    """So a UI that reconnects afterwards still learns how it ended."""
-    assert active_client.get("/v1/control/rotate-key").status_code == 404
-    assert active_client.post("/v1/control/rotate-key").status_code == 202
-    _relogin(active_client)
-    _await_rotation(active_client)
-    later = active_client.get("/v1/control/rotate-key")
-    assert later.status_code == 200
-    assert later.json()["state"] in ("done", "distributing")
-
-
-def _relogin(client: TestClient) -> None:
-    """Get a session signed with the new key.
-
-    A rotation invalidates every token issued under the old one, this
-    caller's included. A UI would show a login prompt here; a test says
-    so out loud so that the behaviour is asserted rather than worked
-    around by accident.
-    """
-    from .conftest import PASSPHRASE
-
-    token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()["sessionToken"]
-    client.headers["Authorization"] = f"Bearer {token}"
-
-
-def _await_rotation(client: TestClient) -> None:
-    """Let the background redistribution finish.
-
-    A poll rather than a sleep: the task is scheduled on the app's loop
-    and the length of a timeout is not the thing under test.
-    """
-    import time
-
-    tracker: RotationTracker = client.app.state.rotation  # type: ignore[attr-defined]
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        current = tracker.current
-        if current is not None and not current.in_flight:
-            return
-        # Any request drives the loop the task is scheduled on.
-        client.get("/healthz")
-        time.sleep(0.02)
+    announced = [b for b in received if b.epoch == epoch_before + 1]
+    assert announced, "the promoted root never announced its epoch"
+    assert _root_kids(announced[-1]) == {root_kid}, "a promotion changes the epoch, never the key"
 
 
 # --------------------------------------------------------------------------- #

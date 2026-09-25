@@ -18,7 +18,7 @@ That was an accident of the architecture before this repo existed. Two tests mak
 
 ## One writer, one ordered log
 
-Every control-state change — enroll a node, revoke one, declare or delete a runtime, patch a component's config, rotate the signing key, promote — goes through **one** choke point that stamps a gapless monotonic `index`. Applied state is a deterministic function of the entries applied so far. Standbys **pull** from `GET /v1/control/log`; the active root never pushes.
+Every control-state change — enroll a node, revoke one, declare or delete a runtime, patch a component's config, rotate the token key, sign a session out, promote — goes through **one** choke point that stamps a gapless monotonic `index`. Applied state is a deterministic function of the entries applied so far. Standbys **pull** from `GET /v1/control/log`; the active root never pushes.
 
 Three rules hold the whole thing up, and each is asserted by a test rather than trusted:
 
@@ -52,16 +52,22 @@ Each node has an identity keypair generated at enrollment whose private half nev
 | A locked control-state copy without its unlock key | Encrypted recovery material; the passphrase is required to recover it   |
 | An unlocked control process or recovery key        | Recovery access to all sealed secrets                                   |
 
-These are encryption boundaries, not complete host-compromise guarantees. M7
-stores the shared install signing key in cleartext on each enrolled node so
-headless children can authenticate. A compromised node can therefore also forge
-install bearer tokens; per-node sealing does not isolate signing authority.
+**Token signing is per node since 2026-09-25**
+([design](https://github.com/eugene-plexus/specs/blob/main/docs/design/per-node-token-keys.md)).
+Each agent generates its own token key and enrollment sends only the public
+half; this root keeps its own key, sealed, and publishes a signed **trust
+bundle** (`GET /v1/trust/bundle`) naming every key and what it may issue. A
+compromised worker can mint tokens for its own machine and `agent` tokens for
+reads elsewhere, and nothing more: no session, no runtime declaration, no
+replication snapshot. Revoking it removes its key from the bundle and rotates
+nothing. Sessions are minted only here and addressed to the console machine;
+the console reaches other machines through `POST /v1/auth/token` (RFC 8693).
 
 `securityMode: os_keyring` is **host-bound**: the master key sits in *this* machine's Credential Manager or Keychain, so a standby cannot inherit auto-unlock and will require the passphrase at promotion. That is consistent with promotion being a human act anyway, but the wizard has to say so in words rather than let it be discovered during a failover.
 
 ## Status
 
-**M5 core and M7 integration built (2026-09-10).** Landed and tested: the single-writer ordered log, deterministic apply, snapshots and compaction, standby replication, epoch fencing, promotion, enrollment and revocation-as-rotation, two-recipient sealing, auth, config, and union topology views. M7 adds node-provided URLs, control-identity-signed rekeying and epoch announcements after promotion. All six consumers pin the M7 contracts.
+**M5 core and M7 integration built (2026-09-10).** Landed and tested: the single-writer ordered log, deterministic apply, snapshots and compaction, standby replication, epoch fencing, promotion, enrollment and revocation, two-recipient sealing, auth, config, and union topology views. M7 adds node-provided URLs and epoch announcements after promotion; row 3 (2026-09-25) replaces the shared signing key with per-node keys and the trust bundle. All six consumers pin the M7 contracts.
 
 M5 verified inference surviving a killed control root. M7 verified enrollment and
 rotation **on two real machines** — Windows and WSL2 Ubuntu across NAT and a host
@@ -75,7 +81,7 @@ Still unverified: a **partitioned** rather than shut-down old root, an offline
 node during rotation, and clock-skew behaviour. The first is reachable on the
 existing pair by dropping the firewall rule mid-run and is the next experiment.
 
-Not here yet: serving the UI (assets remain with the agent; ownership is undecided), control-root screens past M9's `/nodes` (mint a join token, render the `join` command), the log-shaped side of `securityMode: os_keyring` auto-unlock on a standby, recovery-from-a-dead-node as an operator flow, and wizard copy explaining keyring/HA. `POST /v1/runtimes` forwards to a node's agent; a node that is `down` during key rotation is re-keyed on reconnect.
+Not here yet: serving the UI (assets remain with the agent; ownership is undecided), control-root screens past M9's `/nodes` (mint a join token, render the `join` command), the log-shaped side of `securityMode: os_keyring` auto-unlock on a standby, recovery-from-a-dead-node as an operator flow, and wizard copy explaining keyring/HA. `POST /v1/runtimes` forwards to a node's agent; a node that is `down` when the trust bundle changes takes it when it next pulls.
 
 **Explicitly out of scope, by decision and not by neglect:** Raft, quorum, automatic promotion, multi-writer control state, and migrating an existing single-host install.
 
@@ -86,14 +92,16 @@ Defined in [`specs/openapi/control.yaml`](https://github.com/eugene-plexus/specs
 |                                                                          |                                                                   |
 | ------------------------------------------------------------------------ | ----------------------------------------------------------------- |
 | `GET /v1/nodes`                                                          | Every host, with its identity, role and last-seen epoch           |
-| `GET`/`DELETE /v1/nodes/{name}`                                          | Read one / revoke it, **which rotates the signing key**           |
+| `GET`/`DELETE /v1/nodes/{name}`                                          | Read one / revoke it: its key leaves the trust bundle             |
 | `POST /v1/nodes/join-token`                                              | Mint a single-use, short-lived, node-scoped token                 |
 | `POST /v1/nodes/enroll`                                                  | Called by an agent; join-token authenticated, no session          |
 | `GET /v1/control/status`                                                 | Role, epoch, applied index, and every standby's lag               |
 | `GET /v1/control/log`                                                    | Standbys pull entries after an index                              |
 | `GET /v1/control/snapshot`                                               | Bootstrap a standby; recover past compaction                      |
 | `POST /v1/control/promote`                                               | Operator action on the standby, passphrase required               |
-| `POST`/`GET /v1/control/rotate-key`                                      | Explicit rotation / its progress                                  |
+| `POST /v1/control/rotate-key`                                            | Replace this root's token key (every session and client key ends) |
+| `GET /v1/trust/bundle`                                                   | The signed trust bundle every node pulls; public                  |
+| `POST /v1/auth/token`                                                    | RFC 8693 exchange: a session for a token addressed to one node    |
 | `GET /v1/components`                                                     | Install-wide, each entry tagged with its node                     |
 | `GET`/`POST /v1/runtimes`                                                | The union across nodes / declare one, forwarded to an agent       |
 | `GET /v1/auth/status`, `POST /v1/auth/initialize`, `POST /v1/auth/login` | The trust root                                                    |

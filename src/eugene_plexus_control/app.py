@@ -37,7 +37,6 @@ from .join_tokens import JoinTokenStore
 from .log_store import LogStore
 from .nodes_client import NodesClient
 from .replication import Follower
-from .rotation import RotationTracker
 from .routes import admin as admin_routes
 from .routes import auth as auth_routes
 from .routes import client_keys as client_key_routes
@@ -46,8 +45,10 @@ from .routes import control as control_routes
 from .routes import health as health_routes
 from .routes import nodes as node_routes
 from .routes import topology as topology_routes
+from .routes.nodes import service_token_for
 from .settings import Settings, load_settings
 from .state_machine import ROLE_ACTIVE, ROLE_STANDBY, StateMachine
+from .trust import TrustPublisher
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +89,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not hasattr(app.state, "auth_state"):
         app.state.auth_state = AuthState()
 
+    # The last bundle this root signed, so a sealed root still serves one.
+    app.state.trust = TrustPublisher(Path(settings.state_dir))
+    app.state.trust.load(machine.state.identity.controlPublicKey)
+    app.state.trust_acks = {}
+
     # Auto-unlock, when the operator opted into one of the two ways.
     # Without it a trust root comes back from a restart holding its keys
     # sealed and locked - correct, and also an install that cannot
@@ -110,7 +116,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             _auto_unlock_from_file(app, machine, settings.passphrase_file)
 
     app.state.join_tokens = JoinTokenStore()
-    app.state.rotation = RotationTracker()
     app.state.node_probes = {}
     app.state.standby_reports = {}
     app.state.nodes_client = NodesClient(
@@ -133,7 +138,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             machine,
             active_url=normalize_url(settings.active_url),
             interval_seconds=settings.follow_interval_seconds,
-            token_provider=lambda: _service_token(app),
+            # No credential: replication takes an operator session, and
+            # a standby following unattended has none (design §5).
+            token_provider=None,
         )
         follower.start()
         app.state.follower = follower
@@ -145,6 +152,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             machine.state.epoch,
             machine.state.index,
         )
+
+    # An auto-unlocked root signs a fresh bundle for its state, and
+    # pushes it once the node client exists.
+    if app.state.auth_state.control_private_key is not None and role == ROLE_ACTIVE:
+        app.state.trust.publish(app)
 
     try:
         yield
@@ -293,8 +305,7 @@ async def _poll_nodes(app: FastAPI) -> None:
             #
             # The probes are useless while locked in any case: every
             # surface that would report them answers 503.
-            token = _service_token(app)
-            if token is None:
+            if app.state.auth_state.signing_key is None:
                 # Two reasons for no signing key, and they are not the
                 # same situation -- `dependencies.py` takes care to
                 # separate them because "run first-run setup" is advice
@@ -330,7 +341,9 @@ async def _poll_nodes(app: FastAPI) -> None:
                 announced_locked = False
 
             if targets:
-                app.state.node_probes = await client.probe_all(targets, token)
+                app.state.node_probes = await client.probe_all(
+                    targets, lambda node: service_token_for(app.state.auth_state, node)
+                )
             await asyncio.sleep(float(values["nodePollIntervalSeconds"]))
         except asyncio.CancelledError:
             raise
@@ -340,12 +353,6 @@ async def _poll_nodes(app: FastAPI) -> None:
             # than reporting nothing: a stale `true` reads as healthy.
             log.warning("node poll failed: %s", exc)
             await asyncio.sleep(5.0)
-
-
-def _service_token(app: FastAPI) -> str | None:
-    from .routes.nodes import node_service_token
-
-    return node_service_token(app.state.auth_state)
 
 
 def _local_node_name(machine: StateMachine) -> str | None:

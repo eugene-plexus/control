@@ -61,14 +61,17 @@ async def list_components(request: Request) -> ComponentPlacementList:
     auth: AuthState = request.app.state.auth_state
     client = request.app.state.nodes_client
 
-    from .nodes import node_service_token
+    from .nodes import service_token_for
 
     targets = _targets(machine)
     if not targets:
         return ComponentPlacementList(components=[], unreachableNodes=[])
 
     collected = await client.collect(
-        targets, node_service_token(auth), path="/v1/components", key="components"
+        targets,
+        lambda node: service_token_for(auth, node),
+        path="/v1/components",
+        key="components",
     )
 
     if collected.unreachable and len(collected.unreachable) == len(targets):
@@ -145,14 +148,17 @@ async def list_runtimes(request: Request) -> RuntimePlacementList:
     auth: AuthState = request.app.state.auth_state
     client = request.app.state.nodes_client
 
-    from .nodes import node_service_token
+    from .nodes import service_token_for
 
     targets = _targets(machine)
     if not targets:
         return RuntimePlacementList(runtimes=[], unreachableNodes=[])
 
     collected = await client.collect(
-        targets, node_service_token(auth), path="/v1/runtimes", key="runtimes"
+        targets,
+        lambda node: service_token_for(auth, node),
+        path="/v1/runtimes",
+        key="runtimes",
     )
 
     runtimes = [
@@ -198,7 +204,7 @@ async def create_runtime(request: Request, body: RuntimePlacementSpec) -> Runtim
     auth: AuthState = request.app.state.auth_state
     client = request.app.state.nodes_client
 
-    from .nodes import _not_active, node_service_token
+    from .nodes import _not_active, service_token_for
 
     if not machine.is_active:
         raise _not_active(machine)
@@ -236,7 +242,7 @@ async def create_runtime(request: Request, body: RuntimePlacementSpec) -> Runtim
         )
 
     status_code, payload = await client.create_runtime(
-        str(record.url), node_service_token(auth), spec
+        str(record.url), service_token_for(auth, node_name), spec
     )
     if status_code >= 400:
         raise problem(

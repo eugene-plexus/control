@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from .. import sealing, security
+from .. import sealing, tokens
 from .._generated.models import (
     ClientAdmissionRequest,
     ClientAdmissionResult,
@@ -100,9 +100,16 @@ async def create_key(request: Request, body: ClientKeyCreateRequest) -> ClientKe
     issued = int(time.time())
     expires = issued + (body.ttlDays or 365) * 86400
     key_id = secrets.token_hex(16)
-    signing_key = request.app.state.auth_state.signing_key
-    token = security.issue_client_token(
-        signing_key=signing_key, key_id=key_id, name=name, issued=issued, expires=expires
+    signer = request.app.state.auth_state.signer()
+    if signer is None:
+        raise problem(503, "Locked", "This root's token key is not in memory. Sign in first.")
+    token, _ = signer.mint(
+        typ=tokens.TYP_CLIENT,
+        sub=name,
+        aud=[tokens.RECIPIENT_GATEWAY],
+        ttl_seconds=expires - issued,
+        now=issued,
+        jti=key_id,
     )
     try:
         limits = validate_limits((body.limits or ClientKeyLimits()).model_dump(exclude_none=True))

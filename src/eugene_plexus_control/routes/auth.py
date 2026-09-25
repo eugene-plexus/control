@@ -10,12 +10,18 @@ single process in the install. Two states, as before:
     window.
   * **Initialized** — login is open, everything else needs a token.
 
-What initialization does that the agent's version did not: it mints the
-install's **service-token signing key**, the control root's **identity
-keypair** and the **recovery recipient**, seals all three under the
-passphrase-derived key, and snapshots them. That bundle is the
-replication set, and it is why a standby can be promoted from a
-passphrase rather than from a key somebody copied between hosts.
+What initialization does that the agent's version did not: it mints
+this root's **token key**, its **identity keypair** and the **recovery
+recipient**, seals all three under the passphrase-derived key, and
+snapshots them. That bundle is the replication set, and it is why a
+standby can be promoted from a passphrase rather than from a key
+somebody copied between hosts.
+
+**This is the only place an operator session is minted** in an enrolled
+install (2026-09-25). An agent's sign-in forwards here with its own
+service token, and the session comes back addressed to that machine and
+to this root. The console reaches every other machine by exchanging it
+(`POST /v1/auth/token`), never by sending it on.
 
 Login is rate-limited per source IP — five failures in sixty seconds
 locks that source out for sixty. Per process rather than replicated: a
@@ -28,20 +34,30 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Request, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import HTTPBearer
 
 from .. import config as config_module
-from .. import keyring_store, peer, sealing, security
+from .. import keyring_store, peer, sealing, security, tokens
 from .._generated.models import (
     AuthInitializeRequest,
     AuthLoginResponse,
     AuthStatus,
+    TokenExchangeRequest,
+    TokenExchangeResponse,
 )
+from ..applied import OP_REVOKE_SESSION
 from ..auth_state import AuthState
-from ..dependencies import problem, require_operator
+from ..dependencies import (
+    optional_node_actor,
+    problem,
+    require_node_actor,
+    require_operator,
+    verify_bearer,
+)
 from ..state_machine import AlreadyActive, NotActive, StateMachine
 from ..trusted_host import require_trusted_host
 
@@ -157,6 +173,7 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
     verifier = security.hash_passphrase(passphrase)
 
     signing_key = security.generate_signing_key()
+    root_public = tokens.public_b64(tokens.load_private(signing_key))
     control_identity = sealing.generate_control_identity()
     recovery = sealing.generate_sealing_keypair()
 
@@ -166,6 +183,7 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
                 "salt": base64.b64encode(salt).decode("ascii"),
                 "passphraseVerifier": verifier,
                 "sealedSigningKey": security.seal_b64(signing_key, master_key),
+                "rootTokenPublicKey": root_public,
                 "sealedControlKey": security.seal_b64(
                     base64.b64decode(control_identity.private), master_key
                 ),
@@ -195,8 +213,9 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
     auth.set_signing_key(signing_key)
     auth.control_private_key = control_identity.private
     auth.recovery_private_key = recovery.private
+    request.app.state.trust.publish(request.app)
     log.info(
-        "install initialized; epoch %d, signing key generation %s",
+        "install initialized; epoch %d, token key generation %s",
         machine.state.epoch,
         _INITIAL_KEY_ID,
     )
@@ -206,11 +225,16 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
 async def login(request: Request, body: AuthInitializeRequest) -> AuthLoginResponse:
     """Verify the passphrase, unseal the keys, issue a session token.
 
-    Unsealing on login is what makes a restart not a re-key: the signing
+    Unsealing on login is what makes a restart not a sign-out: the token
     key is in applied state sealed under the master key, so the process
-    recovers the install's existing key rather than minting a new one.
-    Through M4 a restart re-keyed everything, which was harmless with
-    one process and an outage with N nodes.
+    recovers the existing key rather than minting a new one.
+
+    **Who asked decides the session's `aud`.** An agent forwarding a
+    sign-in presents its own `agent` service token as `Authorization`,
+    and the session is addressed to that machine and to this root. A
+    login with no such token gets this root alone. The header is read
+    after unsealing, because a sealed root cannot verify anything, and a
+    header that does not verify only narrows the session.
     """
     machine: StateMachine = request.app.state.machine
     auth: AuthState = request.app.state.auth_state
@@ -263,9 +287,21 @@ async def login(request: Request, body: AuthInitializeRequest) -> AuthLoginRespo
         )
 
     auth.clear_login_failures(remote)
+    was_locked = auth.signing_key is None or auth.control_private_key is None
     unseal_into(auth, machine, passphrase)
+    if was_locked:
+        request.app.state.trust.publish(request.app)
 
-    token, expires = security.issue_operator_token(signing_key=_require_signing_key(auth))
+    actor = optional_node_actor(request, request.headers.get("authorization"))
+    audience = [tokens.RECIPIENT_CONTROL]
+    if actor is not None and actor.issuer_node is not None:
+        audience = [tokens.node_recipient(actor.issuer_node), tokens.RECIPIENT_CONTROL]
+    token, expires = _signer(auth).mint(
+        typ=tokens.TYP_SESSION,
+        sub=tokens.SUB_OPERATOR,
+        aud=audience,
+        ttl_seconds=tokens.SESSION_TTL_SECONDS,
+    )
 
     # Persist for auto-unlock if the operator asked for it. Here rather
     # than only on the config flip, because the flip can happen while
@@ -282,7 +318,11 @@ async def login(request: Request, body: AuthInitializeRequest) -> AuthLoginRespo
                 "this root will ask for the passphrase again after a restart"
             )
 
-    log.info("operator login from %s", remote)
+    log.info(
+        "operator login from %s%s",
+        remote,
+        f" through node {actor.issuer_node}" if actor is not None else "",
+    )
     return AuthLoginResponse(
         sessionToken=token,
         expiresAt=datetime.fromtimestamp(expires, tz=UTC),
@@ -292,23 +332,82 @@ async def login(request: Request, body: AuthInitializeRequest) -> AuthLoginRespo
 
 @router.delete("/v1/auth/sessions/current", status_code=204)
 async def logout(request: Request) -> None:
-    """Revoke the presented session token.
+    """Sign the presented session out, everywhere in the install.
 
-    Validated through the same dependency as any protected route, so a
-    caller can only revoke the token it is holding rather than an
-    arbitrary one.
+    Verified through the same dependency as any protected route, so a
+    caller can only sign out the session it holds. A replicated
+    `revokeSession` entry, then a new trust bundle pushed to every
+    machine: the session and everything exchanged from it (by `sid`)
+    stop verifying wherever they were. An exchanged token presented here
+    signs out the session it came from.
     """
-    creds: HTTPAuthorizationCredentials | None = await _bearer_scheme(request)
-    if creds is None or not creds.credentials:
+    claims = require_operator(request, await _bearer_scheme(request))
+    machine: StateMachine = request.app.state.machine
+    jti = claims.sid or claims.jti
+    try:
+        machine.append(
+            OP_REVOKE_SESSION,
+            {
+                "jti": jti,
+                "exp": claims.exp,
+                # Stamped by this writer, once, so replay prunes the same entries.
+                "prunedBefore": int(time.time()) - tokens.LEEWAY_SECONDS,
+            },
+        )
+    except NotActive as exc:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "Not the active root",
+            "Sign-out is a write, and this control root is a standby.",
+        ) from exc
+    request.app.state.trust.publish(request.app)
+    log.info("session signed out")
+
+
+@router.post("/v1/auth/token", response_model=TokenExchangeResponse)
+async def exchange_token(request: Request, body: TokenExchangeRequest) -> TokenExchangeResponse:
+    """RFC 8693: a session for a 5-minute token addressed to one other machine.
+
+    How the console acts on another machine without handing it the
+    session. The actor is the console's own agent, signing for itself;
+    the subject is the operator's session, which must be addressed to
+    that same machine: a session cannot be exchanged by a machine it was
+    not issued to, and an exchanged token cannot be exchanged again,
+    since it is not addressed to this root.
+    """
+    actor = require_node_actor(request, await _bearer_scheme(request))
+    machine: StateMachine = request.app.state.machine
+    auth: AuthState = request.app.state.auth_state
+    subject = verify_bearer(request, body.subjectToken, classes=(tokens.TYP_SESSION,))
+    console = tokens.node_recipient(actor.issuer_node or "")
+    if subject.act is not None or console not in subject.aud:
         raise problem(
             status.HTTP_401_UNAUTHORIZED,
-            "Missing token",
-            "Provide the session token to revoke via Authorization: Bearer.",
+            "Not this machine's session",
+            f"The session is addressed to {list(subject.aud)}; {console} cannot exchange it.",
         )
-    _ = require_operator(request, creds)
-    auth: AuthState = request.app.state.auth_state
-    auth.revoke(creds.credentials)
-    log.info("session revoked")
+    target = tokens.node_of(body.audience)
+    if target is None or target not in machine.state.nodes:
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "No such node",
+            f"{body.audience!r} names no enrolled node, so there is nothing to address.",
+        )
+    now = int(time.time())
+    ttl = min(tokens.EXCHANGED_TTL_SECONDS, subject.exp - now)
+    if ttl <= 0:
+        raise problem(status.HTTP_401_UNAUTHORIZED, "Session expired", "Sign in again.")
+    token, expires = _signer(auth).mint(
+        typ=tokens.TYP_SESSION,
+        sub=tokens.SUB_OPERATOR,
+        aud=[body.audience],
+        ttl_seconds=ttl,
+        now=now,
+        extra={"act": {"sub": console}, "sid": subject.jti},
+    )
+    return TokenExchangeResponse(
+        accessToken=token, expiresAt=datetime.fromtimestamp(expires, tz=UTC)
+    )
 
 
 def unseal_into(auth: AuthState, machine: StateMachine, passphrase: str) -> None:
@@ -357,9 +456,9 @@ def unseal_with_master_key(auth: AuthState, machine: StateMachine, master_key: b
         except ValueError as exc:
             raise problem(
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
-                "Sealed signing key unreadable",
-                f"The install's signing key did not open with this passphrase ({exc}). "
-                "Every service token in the install is signed with it, so this host "
+                "Sealed token key unreadable",
+                f"This root's token key did not open with this passphrase ({exc}). Every "
+                "session and client key in the install is signed with it, so this host "
                 "cannot serve until it is recovered.",
             ) from exc
 
@@ -383,11 +482,12 @@ def unseal_with_master_key(auth: AuthState, machine: StateMachine, master_key: b
             log.error("recovery key did not open: %s", exc)
 
 
-def _require_signing_key(auth: AuthState) -> bytes:
-    if auth.signing_key is None:
+def _signer(auth: AuthState) -> tokens.Signer:
+    signer = auth.signer()
+    if signer is None:
         raise problem(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
-            "No signing key",
-            "The install's signing key is not available in this process.",
+            "No token key",
+            "This root's token key is not available in this process.",
         )
-    return auth.signing_key
+    return signer

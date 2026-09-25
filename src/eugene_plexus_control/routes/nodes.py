@@ -24,22 +24,26 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request, status
 
-from .. import node_address, sealing, security
+from .. import node_address, sealing, tokens, trust
 from .._generated.models import (
     Enrollment,
     EnrollmentRequest,
+    Grant,
     JoinToken,
     JoinTokenList,
     JoinTokenRecord,
     JoinTokenRequest,
-    KeyRotation,
     Node,
     NodeAddressAck,
     NodeAddressAnnouncement,
     NodeList,
+    Reason,
+    SignedTrustBundle,
+    TrustChange,
 )
 from ..applied import (
     OP_ENROLL_NODE,
+    OP_REVOKE_NODE,
     OP_UPDATE_NODE,
     NodeRecord,
     normalize_url,
@@ -98,6 +102,7 @@ async def list_join_tokens(request: Request) -> JoinTokenList:
                 expiresAt=datetime.fromtimestamp(record.expires_at, tz=UTC),
                 nodeName=record.node_name,
                 used=record.used,
+                grants=[Grant(g) for g in record.grants] or None,
             )
             for record in store.list()
         ]
@@ -320,41 +325,56 @@ async def announce_node_address(
 
 @router.delete(
     "/v1/nodes/{name}",
-    response_model=KeyRotation,
+    response_model=TrustChange,
     status_code=202,
     dependencies=[Depends(require_operator)],
 )
-async def revoke_node(request: Request, name: str) -> KeyRotation:
-    """Revoke a node's enrollment, **which rotates the signing key.**
+async def revoke_node(request: Request, name: str) -> TrustChange:
+    """Revoke a node: its key leaves the trust bundle. **Nothing is rotated.**
 
-    This is a rotation and not a deletion, and the distinction is the
-    sharp edge of the whole design: a revoked node still *holds* the
-    signing key, so removing its registry entry would not stop it
-    authenticating to other components. So the key is re-minted and
-    redistributed to every remaining node.
+    Until 2026-09-25 this was a rotation of the one key every node held,
+    because a revoked node still holding it could still authenticate. No
+    node holds anything another can use now: the revoked node's tokens
+    were only ever signed by its own key, and that key is what leaves the
+    bundle. Every session whose `aud` names it as the console goes with
+    it (`tokens.verify`). Nobody else is signed out and no client key is
+    reissued.
 
-    Two consequences the caller must expect. Nodes that are `down`
-    during the rotation hold a superseded key and are refused until they
-    reconnect and are re-keyed — which is why this is resumable and
-    idempotent by necessity rather than by preference. And the runtimes
-    the revoked node was hosting become un-declared: the model files on
-    that host's disk are untouched, but nothing in this install will
-    route to them.
+    The bundle is signed **before** the entry is appended, so a root that
+    cannot sign (locked, or its identity key did not open) revokes
+    nothing rather than recording a revocation no node would hear of.
+    The runtimes the node hosted become un-declared; the model files on
+    that host's disk are untouched.
     """
     machine: StateMachine = request.app.state.machine
+    auth: AuthState = request.app.state.auth_state
     if name not in machine.state.nodes:
         raise problem(
             status.HTTP_404_NOT_FOUND, "No such node", f"No node named {name!r} is enrolled."
         )
+    if not machine.is_active:
+        raise _not_active(machine)
+    if auth.control_private_key is None:
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Control identity unavailable",
+            "This root's identity key is not in memory, so a trust bundle without the node "
+            "could not be signed. Nothing was revoked. Sign in, then try again.",
+        )
 
-    from .control import perform_rotation
-
-    # No `revokeNode` entry of its own: the rotation's entry removes the
-    # node, so a rotation that cannot run leaves it enrolled rather than
-    # deleted with its key still valid (`_apply_rotate_signing_key`).
-    rotation = await perform_rotation(request, reason="revocation", revoked_node=name)
-    log.warning("node %s revoked; the signing key was rotated", name)
-    return rotation
+    try:
+        machine.append(OP_REVOKE_NODE, {"name": name})
+    except NotActive as exc:
+        raise _not_active(machine) from exc
+    bundle = request.app.state.trust.publish(request.app)
+    version = bundle.version if bundle is not None else machine.state.index
+    log.warning("node %s revoked; trust bundle %d no longer lists its key", name, version)
+    return TrustChange(
+        version=version,
+        reason=Reason.revocation,
+        revokedNode=name,
+        nodesBehind=trust.nodes_behind(request.app, version),
+    )
 
 
 @router.post(
@@ -385,11 +405,14 @@ async def mint_join_token(request: Request, body: JoinTokenRequest | None = None
     default_ttl = int(config_values.get("joinTokenTtlSeconds") or 900)
     ttl = int(body.ttlSeconds) if body and body.ttlSeconds is not None else default_ttl
     node_name = body.nodeName if body else None
+    requested = body.grants or [] if body else []
+    grants = tuple(sorted({str(getattr(g, "value", g)) for g in requested}))
 
-    minted = store.mint(ttl_seconds=ttl, node_name=node_name)
+    minted = store.mint(ttl_seconds=ttl, node_name=node_name, grants=grants)
     log.info(
-        "minted a join token%s, valid for %ds",
+        "minted a join token%s%s, valid for %ds",
         f" bound to node {node_name!r}" if node_name else "",
+        f" granting {', '.join(grants)}" if grants else "",
         ttl,
     )
     return JoinToken(
@@ -397,6 +420,7 @@ async def mint_join_token(request: Request, body: JoinTokenRequest | None = None
         token=minted.token,
         expiresAt=datetime.fromtimestamp(minted.expires_at, tz=UTC),
         nodeName=minted.node_name,
+        grants=[Grant(g) for g in minted.grants] or None,
     )
 
 
@@ -410,11 +434,12 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
     token, which is why it is the one that consumes a single-use
     credential.
 
-    The agent sends only its public half; the private key never leaves
-    the node, which is what makes per-node sealing meaningful. In
-    exchange it receives the install's signing key — **the thing a
-    single-watchdog install could not give it**, because a driver
-    spawned on one host used to reject a gateway's token from another.
+    The agent sends only public halves: its sealing key, its
+    announcement key and its **token key**. No private key leaves the
+    node (2026-09-25; until then this response carried the install's
+    signing key in plaintext, which made every node the install). In
+    exchange it receives a trust bundle that already lists its key, so
+    the first token it mints verifies everywhere it is addressed.
 
     The `url` it sends is recorded as `Node.url`, where this root probes
     it, forwards declarations to it, and where a gateway sends a stop or
@@ -441,14 +466,31 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
     if not machine.is_active:
         raise _not_active(machine)
 
-    try:
-        base64.b64decode(body.publicKey, validate=True)
-    except Exception as exc:
+    for field_name, value in (
+        ("publicKey", body.publicKey),
+        ("signingPublicKey", body.signingPublicKey),
+        ("tokenPublicKey", body.tokenPublicKey),
+    ):
+        try:
+            if len(base64.b64decode(value, validate=True)) != 32:
+                raise ValueError("expected 32 bytes")
+        except Exception as exc:
+            raise problem(
+                status.HTTP_400_BAD_REQUEST,
+                "Malformed public key",
+                f"{field_name} must be base64 of a 32-byte key ({exc}).",
+            ) from exc
+    token_key = tokens.load_public(body.tokenPublicKey)
+    if any(
+        record.tokenPublicKey == body.tokenPublicKey and record.name != body.name
+        for record in machine.state.nodes.values()
+    ):
         raise problem(
             status.HTTP_400_BAD_REQUEST,
-            "Malformed public key",
-            f"publicKey must be base64 ({exc}).",
-        ) from exc
+            "Token key already enrolled",
+            "Another node already holds this token key. Each node generates its own; a "
+            "copied node.yaml is not a new node.",
+        )
 
     announced_url = normalize_url(str(body.url)) if body.url else None
     reason = node_address.rejection(announced_url) if announced_url else None
@@ -462,20 +504,22 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
             f"{body.url} cannot be this node's address: {reason}.",
         )
 
+    # Before the token is consumed: a locked root used to spend the
+    # single-use credential and then answer 503.
+    if auth.signing_key is None or auth.control_private_key is None:
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Locked",
+            "This control root has not been unlocked, so it cannot sign the trust bundle a "
+            "new node needs. Log in first; the join token was not used.",
+        )
+
     try:
-        store.consume(body.token, node_name=body.name)
+        grants = store.consume(body.token, node_name=body.name)
     except JoinTokenConsumed as exc:
         raise problem(status.HTTP_409_CONFLICT, "Token already used", str(exc)) from exc
     except JoinTokenError as exc:
         raise problem(status.HTTP_401_UNAUTHORIZED, "Join token rejected", str(exc)) from exc
-
-    if auth.signing_key is None:
-        raise problem(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Locked",
-            "This control root has not been unlocked, so it cannot hand out the install's "
-            "signing key. Log in first.",
-        )
 
     identity = machine.state.identity
     recovery_public = (
@@ -488,6 +532,8 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         "role": "agent",
         "publicKey": body.publicKey,
         "signingPublicKey": body.signingPublicKey,
+        "tokenPublicKey": body.tokenPublicKey,
+        "grants": sorted({"node", *grants}),
         "url": announced_url,
         "agentVersion": body.agentVersion,
         "os": body.os.value if body.os else None,
@@ -504,13 +550,23 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
     except NotActive as exc:
         raise _not_active(machine) from exc
 
-    log.info("enrolled node %s at epoch %d", body.name, machine.state.epoch)
+    bundle = request.app.state.trust.publish(request.app)
+    if bundle is None:  # pragma: no cover - the identity key was checked above
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Locked", "The trust bundle could not be signed."
+        )
+    log.info(
+        "enrolled node %s at epoch %d with token key %s%s",
+        body.name,
+        machine.state.epoch,
+        tokens.thumbprint(token_key),
+        f" and grants {', '.join(grants)}" if grants else "",
+    )
     return Enrollment(
         name=body.name,
         epoch=machine.state.epoch,
-        signingKey=base64.b64encode(auth.signing_key).decode("ascii"),
-        signingKeyId=identity.signingKeyId,
-        controlPublicKey=identity.controlPublicKey,
+        trustBundle=SignedTrustBundle(jws=bundle.jws),
+        controlPublicKey=identity.controlPublicKey or "",
         recoveryPublicKey=recovery_public,
     )
 
@@ -536,6 +592,9 @@ def _to_node(record: NodeRecord, probe: Any | None) -> Node:
             "reachable": bool(probe.reachable) if probe is not None else False,
             "publicKey": record.publicKey,
             "signingPublicKey": record.signingPublicKey,
+            "tokenPublicKey": record.tokenPublicKey,
+            "grants": list(record.grants),
+            "trustBundleVersion": getattr(probe, "trust_bundle_version", None),
             "advertiseSequence": record.advertiseSequence,
             "lastSeenEpoch": probe.epoch if probe is not None else None,
             "agentVersion": (probe.agent_version if probe is not None else None)
@@ -572,17 +631,24 @@ def _not_active(machine: StateMachine) -> Any:
     return problem(status.HTTP_409_CONFLICT, "Not the active root", detail)
 
 
-def node_service_token(auth: AuthState) -> str | None:
-    """A service token this root presents when calling a node's agent.
+def service_token_for(auth: AuthState, node: str) -> str | None:
+    """The token this root presents to one node's agent, and to nothing else.
 
-    `service:control` rather than an operator token: the control root
-    calling an agent is a component doing its job, and using an operator
-    credential for it would mean a leaked one could drive the UI
-    surface too.
+    Addressed to `node:<name>` and alive five minutes, minted per call.
+    Until 2026-09-25 this was one year-long `service:control` token for
+    every node, which each node received on every poll and could replay
+    anywhere, including at this root's replication snapshot.
     """
-    if auth.signing_key is None:
+    signer = auth.signer()
+    if signer is None:
         return None
-    return security.issue_service_token(signing_key=auth.signing_key, kind="control")
+    token, _ = signer.mint(
+        typ=tokens.TYP_SERVICE,
+        sub=tokens.SUB_CONTROL,
+        aud=[tokens.node_recipient(node)],
+        ttl_seconds=tokens.CONTROL_SERVICE_TTL_SECONDS,
+    )
+    return token
 
 
 def seal_for_node(plaintext: str, node: NodeRecord, recovery_public_key: str | None) -> str:
