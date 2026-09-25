@@ -1,19 +1,16 @@
-"""Install authority, durable replay, least privilege and signed legacy migration."""
+"""Install authority, durable replay and least privilege."""
 
 from __future__ import annotations
 
-import base64
-import json
 import time
 from datetime import UTC, datetime
 
 import jwt
-import nacl.signing
+import pytest
 from fastapi.testclient import TestClient
 
 from eugene_plexus_control import tokens
 from eugene_plexus_control.applied import canonical_bytes, from_canonical, to_canonical
-from eugene_plexus_control.routes.client_keys import IMPORT_DOMAIN
 from tests.conftest import enroll, machine_at
 
 
@@ -58,60 +55,24 @@ def test_policy_audiences_and_standby_refusal(active_client: TestClient) -> None
     assert client.get("/v1/auth/client-keys/policy").status_code == 503
 
 
-def test_signed_import_is_idempotent_and_cannot_clear_revocation(active_client: TestClient) -> None:
-    client = active_client
-    keys, enrolled = enroll(client, "legacy")
-    assert enrolled.status_code == 201
-    signing = nacl.signing.SigningKey(base64.b64decode(keys.signing_private))
+def test_a_record_that_claims_to_be_imported_is_refused(active_client: TestClient) -> None:
+    """Per-node token keys retired the shared install key and, with it,
+    the import of node-local key records (2026-09-25): a record that
+    says `migrated` or names an `originNode` is not one this root makes,
+    and the log refuses it rather than carrying it."""
+    from eugene_plexus_control.applied import OP_PUT_CLIENT_KEY, ApplyError
+
+    machine = active_client.app.state.machine
     key = {
-        "id": "legacy-key",
-        "name": "Old app",
+        "id": "k1",
+        "name": "App",
         "tail": "sample",
         "createdAt": datetime.now(UTC).isoformat(),
         "expiresAt": datetime.fromtimestamp(time.time() + 3600, UTC).isoformat(),
     }
-
-    def send(keys):
-        canonical = json.dumps(
-            {"node": "legacy", "keys": keys},
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode()
-        signature = base64.b64encode(signing.sign(IMPORT_DOMAIN + canonical).signature).decode()
-        return client.post(
-            "/v1/nodes/legacy/client-keys/import", json={"keys": keys, "signature": signature}
-        )
-
-    assert send([key]).status_code == 200
-    before = client.app.state.machine.state.index
-    assert send([key]).status_code == 200
-    assert client.app.state.machine.state.index == before
-    assert client.get("/v1/auth/client-keys").json()["keys"][0].get("limits") is None
-    assert (
-        client.put(
-            "/v1/auth/client-keys/legacy-key/limits",
-            json={
-                "limits": {
-                    "allowedModels": ["chosen"],
-                    "maxConcurrentRequests": 1,
-                    "requestsPerMinute": 3,
-                }
-            },
-        ).status_code
-        == 200
-    )
-    assert client.delete("/v1/auth/client-keys/legacy-key").status_code == 204
-    assert send([{**key, "name": "changed"}]).status_code == 200
-    listed = client.get("/v1/auth/client-keys").json()["keys"][0]
-    assert listed["revokedAt"] and listed["originNode"] == "legacy" and listed["migrated"]
-    assert listed["limits"]["allowedModels"] == ["chosen"]
-    assert listed["limits"]["requestsPerMinute"] == 3
-    assert send([{**key, "tail": "other"}]).status_code == 409
-    assert (
-        client.post(
-            "/v1/nodes/legacy/client-keys/import",
-            json={"keys": [key], "signature": "not-a-signature"},
-        ).status_code
-        == 401
-    )
+    # A clean record is taken, so the refusals below are about the fields.
+    machine.append(OP_PUT_CLIENT_KEY, {"key": key})
+    assert "k1" in machine.state.client_keys
+    for n, extra in enumerate(({"migrated": True}, {"originNode": "attic"})):
+        with pytest.raises(ApplyError, match="unexpected client-key property"):
+            machine.append(OP_PUT_CLIENT_KEY, {"key": {**key, "id": f"k{n + 2}", **extra}})

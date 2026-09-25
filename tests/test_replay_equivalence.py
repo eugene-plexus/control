@@ -44,7 +44,6 @@ from eugene_plexus_control.applied import (
     OP_DELETE_COMPONENT,
     OP_DELETE_RUNTIME,
     OP_ENROLL_NODE,
-    OP_IMPORT_CLIENT_KEYS,
     OP_PATCH_CONFIG,
     OP_PROMOTE,
     OP_PUT_CLIENT_ADMISSION,
@@ -89,7 +88,6 @@ EXERCISED_OPS = {
     OP_PUT_CLIENT_KEY,
     OP_SET_CLIENT_KEY_LIMITS,
     OP_PUT_CLIENT_ADMISSION,
-    OP_IMPORT_CLIENT_KEYS,
     OP_REVOKE_CLIENT_KEY,
     OP_ROTATE_SIGNING_KEY,
     OP_REVOKE_SESSION,
@@ -245,14 +243,6 @@ def _write_history(machine: StateMachine) -> bytes:
         },
     )
 
-    machine.append(
-        OP_IMPORT_CLIENT_KEYS,
-        {
-            "node": "attic",
-            "digest": "example-digest",
-            "keys": [{**key, "id": "legacy-key", "revokedAt": "2026-09-09T11:21:00+00:00"}],
-        },
-    )
     machine.append(
         OP_REVOKE_CLIENT_KEY, {"id": "app-key", "revokedAt": "2026-09-09T11:22:00+00:00"}
     )
@@ -662,7 +652,6 @@ def _genesis(machine: StateMachine) -> dict[str, Any]:
         "runtimes": [],
         "config": {},
         "clientKeys": [],
-        "clientKeyImports": {},
         "signingKeyId": "1",
         "sealedSigningKey": placeholder("signing"),
     }

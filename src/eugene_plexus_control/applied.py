@@ -86,7 +86,6 @@ OP_PATCH_CONFIG = "patchConfig"
 OP_ROTATE_SIGNING_KEY = "rotateSigningKey"
 OP_PROMOTE = "promote"
 OP_PUT_CLIENT_KEY = "putClientKey"
-OP_IMPORT_CLIENT_KEYS = "importClientKeys"
 OP_REVOKE_CLIENT_KEY = "revokeClientKey"
 OP_SET_CLIENT_KEY_LIMITS = "setClientKeyLimits"
 OP_PUT_CLIENT_ADMISSION = "putClientAdmission"
@@ -105,7 +104,6 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_ROTATE_SIGNING_KEY,
         OP_PROMOTE,
         OP_PUT_CLIENT_KEY,
-        OP_IMPORT_CLIENT_KEYS,
         OP_REVOKE_CLIENT_KEY,
         OP_SET_CLIENT_KEY_LIMITS,
         OP_PUT_CLIENT_ADMISSION,
@@ -318,7 +316,6 @@ class AppliedState:
     identity: InstallIdentity = field(default_factory=InstallIdentity)
     client_keys: dict[str, dict[str, Any]] = field(default_factory=dict)
     client_admission: dict[str, Any] = field(default_factory=lambda: {"clock": 0.0, "buckets": {}})
-    client_key_imports: dict[str, str] = field(default_factory=dict)
     revoked_sessions: dict[str, int] = field(default_factory=dict)
     """Signed-out sessions, `jti -> exp`, as `revokeSession` wrote them.
     Replicated because the trust bundle every machine checks sessions
@@ -638,8 +635,6 @@ def _key_record(raw: Any) -> dict[str, Any]:
         "createdAt",
         "expiresAt",
         "revokedAt",
-        "originNode",
-        "migrated",
         "lastUsedAt",
         "limits",
     }
@@ -671,37 +666,6 @@ def _apply_put_client_key(state: AppliedState, payload: dict[str, Any], index: i
     if record["id"] in state.client_keys:
         raise ApplyError("client-key identifier already exists")
     return replace(state, client_keys={**state.client_keys, record["id"]: record})
-
-
-def _apply_import_client_keys(
-    state: AppliedState, payload: dict[str, Any], index: int
-) -> AppliedState:
-    node = payload.get("node")
-    if node not in state.nodes or not isinstance(payload.get("digest"), str):
-        raise ApplyError("invalid client-key import origin")
-    imported = _key_records(payload.get("keys"))
-    keys = dict(state.client_keys)
-    for record in imported.values():
-        record = dict(record)
-        record.update(originNode=node, migrated=True)
-        previous = keys.get(record["id"])
-        if previous is not None:
-            if previous.get("originNode") != node or any(
-                previous.get(k) != record.get(k) for k in ("tail", "createdAt", "expiresAt")
-            ):
-                raise ApplyError("client-key import conflicts with an existing record")
-            if "limits" in previous:
-                record["limits"] = previous["limits"]
-            else:
-                record.pop("limits", None)
-            if previous.get("revokedAt") is not None:
-                record["revokedAt"] = previous["revokedAt"]
-        keys[record["id"]] = record
-    return replace(
-        state,
-        client_keys=keys,
-        client_key_imports={**state.client_key_imports, node: payload["digest"]},
-    )
 
 
 def _apply_set_client_key_limits(
@@ -760,7 +724,6 @@ _HANDLERS: dict[str, _Handler] = {
     OP_ROTATE_SIGNING_KEY: _apply_rotate_signing_key,
     OP_PROMOTE: _apply_promote,
     OP_PUT_CLIENT_KEY: _apply_put_client_key,
-    OP_IMPORT_CLIENT_KEYS: _apply_import_client_keys,
     OP_REVOKE_CLIENT_KEY: _apply_revoke_client_key,
     OP_SET_CLIENT_KEY_LIMITS: _apply_set_client_key_limits,
     OP_PUT_CLIENT_ADMISSION: _apply_put_client_admission,
@@ -825,7 +788,6 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
         "config": dict(state.config),
         "clientKeys": [state.client_keys[key] for key in sorted(state.client_keys)],
         "clientAdmission": state.client_admission,
-        "clientKeyImports": dict(state.client_key_imports),
         "salt": identity.salt,
         "passphraseVerifier": identity.passphraseVerifier,
         "sealedSigningKey": identity.sealedSigningKey,
@@ -909,7 +871,6 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         config=dict(raw.get("config") or {}),
         client_admission=validate_ledger(raw.get("clientAdmission")),
         client_keys=_key_records(raw.get("clientKeys", [])),
-        client_key_imports=dict(raw.get("clientKeyImports") or {}),
         revoked_sessions={str(r["jti"]): int(r["exp"]) for r in raw.get("revokedSessions") or []},
         identity=InstallIdentity(
             salt=raw.get("salt"),

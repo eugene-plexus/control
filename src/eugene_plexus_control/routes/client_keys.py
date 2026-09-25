@@ -2,29 +2,25 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import secrets
 import time
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from .. import sealing, tokens
+from .. import tokens
 from .._generated.models import (
     ClientAdmissionRequest,
     ClientAdmissionResult,
     ClientKey,
     ClientKeyCreated,
     ClientKeyCreateRequest,
-    ClientKeyImport,
     ClientKeyLimits,
     ClientKeyList,
     ClientKeyPolicy,
     ClientKeyUpdateRequest,
 )
 from ..applied import (
-    OP_IMPORT_CLIENT_KEYS,
     OP_PUT_CLIENT_ADMISSION,
     OP_PUT_CLIENT_KEY,
     OP_REVOKE_CLIENT_KEY,
@@ -36,7 +32,6 @@ from ..dependencies import problem, require_key_policy, require_operator
 from ..state_machine import StateMachine
 
 router = APIRouter(tags=["client keys"])
-IMPORT_DOMAIN = b"eugene-plexus/client-keys/import/v1\n"
 
 
 def active(request: Request) -> StateMachine:
@@ -70,7 +65,6 @@ def listing(machine: StateMachine) -> ClientKeyList:
             authority=authority(machine),
             revision=machine.state.index,
             scope="install",
-            migration="complete",
         )
     )
 
@@ -161,54 +155,6 @@ async def revoke_key(request: Request, id: str) -> None:
         raise problem(404, "No such key", "This key is not in the install's registry.")
     if not record.get("revokedAt"):
         machine.append(OP_REVOKE_CLIENT_KEY, {"id": id, "revokedAt": datetime.now(UTC).isoformat()})
-
-
-@router.post(
-    "/v1/nodes/{name}/client-keys/import",
-    response_model=ClientKeyList,
-    response_model_exclude_none=True,
-)
-async def import_keys(request: Request, name: str, body: ClientKeyImport) -> ClientKeyList:
-    machine = active(request)
-    node = machine.state.nodes.get(name)
-    raw = await request.json()
-    canonical = json.dumps(
-        {"node": name, "keys": raw["keys"]},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode()
-    if (
-        node is None
-        or not node.signingPublicKey
-        or not sealing.verify_address(
-            node.signingPublicKey, IMPORT_DOMAIN + canonical, body.signature
-        )
-    ):
-        raise problem(401, "Invalid migration signature", "An enrolled node must sign its records.")
-    digest = hashlib.sha256(canonical).hexdigest()
-    if machine.state.client_key_imports.get(name) != digest:
-        try:
-            machine.append(
-                OP_IMPORT_CLIENT_KEYS,
-                {
-                    "node": name,
-                    "digest": digest,
-                    "keys": [key.model_dump(mode="json", exclude_none=True) for key in body.keys],
-                },
-            )
-        except ApplyError as exc:
-            raise problem(409, "Client-key migration conflict", str(exc)) from exc
-    # No management listing is disclosed to a node authenticated only by this signature.
-    return ClientKeyList.model_validate(
-        dict(
-            keys=[],
-            authority=authority(machine),
-            revision=machine.state.index,
-            scope="install",
-            migration="complete",
-        )
-    )
 
 
 @router.put(
