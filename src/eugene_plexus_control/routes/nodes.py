@@ -40,7 +40,6 @@ from .._generated.models import (
 )
 from ..applied import (
     OP_ENROLL_NODE,
-    OP_REVOKE_NODE,
     OP_UPDATE_NODE,
     NodeRecord,
     normalize_url,
@@ -350,13 +349,12 @@ async def revoke_node(request: Request, name: str) -> KeyRotation:
 
     from .control import perform_rotation
 
-    try:
-        machine.append(OP_REVOKE_NODE, {"name": name})
-    except NotActive as exc:
-        raise _not_active(machine) from exc
-
-    log.warning("node %s revoked; rotating the signing key", name)
-    return await perform_rotation(request, reason="revocation", revoked_node=name)
+    # No `revokeNode` entry of its own: the rotation's entry removes the
+    # node, so a rotation that cannot run leaves it enrolled rather than
+    # deleted with its key still valid (`_apply_rotate_signing_key`).
+    rotation = await perform_rotation(request, reason="revocation", revoked_node=name)
+    log.warning("node %s revoked; the signing key was rotated", name)
+    return rotation
 
 
 @router.post(

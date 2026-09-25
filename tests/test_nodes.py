@@ -185,6 +185,68 @@ def test_revoking_a_node_undeclares_what_it_hosted(active_client: TestClient) ->
     assert machine.state.runtimes == {}
 
 
+def test_a_revocation_that_cannot_rotate_leaves_the_node_enrolled(
+    active_client: TestClient,
+) -> None:
+    """The node was deleted before the rotation's checks ran (found 2026-09-24).
+
+    A rotation already in flight answered 409 *after* the registry entry
+    was gone, so the revoked host kept a key every component still
+    trusts, the install reported no node, and the retry was a 404. The
+    refusal has to leave everything as it was, and the retry has to work.
+    """
+    _enroll(active_client, _mint(active_client), "gpu-box")
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    auth = active_client.app.state.auth_state  # type: ignore[attr-defined]
+    tracker = active_client.app.state.rotation  # type: ignore[attr-defined]
+    key_before = auth.signing_key
+    id_before = machine.state.identity.signingKeyId
+    index_before = machine.state.index
+
+    tracker.begin(reason="operator", revoked_node=None, nodes=[])
+    response = active_client.delete("/v1/nodes/gpu-box")
+    assert response.status_code == 409, response.text
+
+    assert "gpu-box" in machine.state.nodes
+    assert machine.state.index == index_before, "a refused revocation must append nothing"
+    assert auth.signing_key == key_before
+    assert machine.state.identity.signingKeyId == id_before
+
+    tracker.finish()
+    retried = active_client.delete("/v1/nodes/gpu-box")
+    assert retried.status_code == 202, retried.text
+    assert "gpu-box" not in machine.state.nodes
+    assert auth.signing_key != key_before
+
+
+def test_a_revocation_the_root_cannot_sign_leaves_the_node_enrolled(
+    active_client: TestClient,
+) -> None:
+    """The 503 half: no control identity in memory, so no re-key could be signed."""
+    _enroll(active_client, _mint(active_client), "gpu-box")
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    auth = active_client.app.state.auth_state  # type: ignore[attr-defined]
+    index_before = machine.state.index
+
+    auth.control_private_key = None
+    response = active_client.delete("/v1/nodes/gpu-box")
+    assert response.status_code == 503, response.text
+    assert "gpu-box" in machine.state.nodes
+    assert machine.state.index == index_before
+
+
+def test_a_revocation_is_one_log_entry(active_client: TestClient) -> None:
+    """One entry cannot half-happen; two entries can, across a crash."""
+    _enroll(active_client, _mint(active_client), "gpu-box")
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    index_before = machine.state.index
+
+    assert active_client.delete("/v1/nodes/gpu-box").status_code == 202
+    entries = machine.read_page(index_before, 100)
+    assert [e["op"] for e in entries] == ["rotateSigningKey"]
+    assert entries[0]["payload"]["revokedNode"] == "gpu-box"
+
+
 def test_revoking_an_unknown_node_is_a_404(active_client: TestClient) -> None:
     assert active_client.delete("/v1/nodes/nowhere").status_code == 404
 

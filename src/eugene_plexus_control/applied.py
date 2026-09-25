@@ -435,6 +435,10 @@ def _apply_revoke_node(state: AppliedState, payload: dict[str, Any], index: int)
     name = _require_str(payload, "name", index)
     if name not in state.nodes:
         raise ApplyError(f"entry {index}: cannot revoke unknown node {name!r}")
+    return _without_node(state, name)
+
+
+def _without_node(state: AppliedState, name: str) -> AppliedState:
     # The revoked node's declarations go with it. The model files on that
     # host's disk are untouched — but nothing in this install will route
     # to them, which is the honest consequence of removing a host.
@@ -506,12 +510,29 @@ def _apply_patch_config(state: AppliedState, payload: dict[str, Any], index: int
 def _apply_rotate_signing_key(
     state: AppliedState, payload: dict[str, Any], index: int
 ) -> AppliedState:
+    """Replace the signing key and, for a revocation, remove the node.
+
+    **The two are one entry since 2026-09-25.** A revocation used to be
+    a `revokeNode` entry followed by this one, and the route wrote the
+    first before it knew whether the second could be written: a rotation
+    already in flight (409), a locked root or a missing control identity
+    (503) left the node deleted, the key it holds still valid everywhere,
+    and a retry answering 404. One entry cannot half-happen.
+
+    A `revokedNode` that is not enrolled is not an error, because every
+    log written before the change carries the `revokeNode` entry first
+    and names the same node here again.
+    """
     identity = replace(
         state.identity,
         sealedSigningKey=_require_str(payload, "sealedSigningKey", index),
         signingKeyId=_require_str(payload, "signingKeyId", index),
     )
-    return replace(state, identity=identity)
+    state = replace(state, identity=identity)
+    revoked = payload.get("revokedNode")
+    if isinstance(revoked, str) and revoked in state.nodes:
+        state = _without_node(state, revoked)
+    return state
 
 
 def _apply_promote(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:

@@ -128,9 +128,9 @@ def test_the_snapshot_can_hold_every_ops_effect(tmp_path: Path) -> None:
         assert document["runtimes"][0]["spec"].get("modelPath")
         # patchConfig
         assert document["config"]["uiTheme"] == "light"
-        # rotateSigningKey
-        assert document["signingKeyId"] == "2"
-        assert document["sealedSigningKey"] == placeholder("rotated")
+        # rotateSigningKey -- the history's last rotation is the revocation of `gpu-büro`
+        assert document["signingKeyId"] == "4"
+        assert document["sealedSigningKey"] == placeholder("revoked-gpu")
         # promote
         assert document["epoch"] == 2
     finally:

@@ -129,7 +129,10 @@ def _write_history(machine: StateMachine) -> None:
     * a **config value set and then overwritten**, so "last write wins"
       is exercised rather than assumed;
     * a **node revoked after it owned a runtime**, so the cascade is in
-      the compared state rather than only in a unit test.
+      the compared state rather than only in a unit test -- in both
+      shapes a log can hold: the rotation entry that removes the node
+      itself (since 2026-09-25), and the older `revokeNode` followed by
+      a rotation naming a node that is already gone.
     """
     machine.append(
         OP_ENROLL_NODE,
@@ -159,6 +162,25 @@ def _write_history(machine: StateMachine) -> None:
             "os": "windows",
             "arch": "x64",
             "enrolledAt": "2026-09-09T11:20:00+00:00",
+        },
+    )
+    machine.append(
+        OP_ENROLL_NODE,
+        {
+            "name": "shed",
+            "role": "agent",
+            "url": "http://10.0.0.8:8079",
+            "publicKey": "c2hlZC1ub2RlLXB1YmxpYy1rZXktYnl0ZXMtMzItbG9uZw==",
+            "os": "linux",
+            "arch": "arm64",
+            "enrolledAt": "2026-09-09T11:21:00+00:00",
+        },
+    )
+    machine.append(
+        OP_PUT_RUNTIME,
+        {
+            "node": "shed",
+            "spec": {"name": "tiny", "engine": "llama_cpp", "modelPath": "/m/tiny.gguf"},
         },
     )
     key = {
@@ -260,9 +282,29 @@ def _write_history(machine: StateMachine) -> None:
         OP_ROTATE_SIGNING_KEY,
         {"signingKeyId": "2", "sealedSigningKey": placeholder("rotated"), "reason": "operator"},
     )
-    # Revoking takes the node's component and runtime with it. Placed
-    # last so the cascade shows up in the compared state.
+    # A revocation as one entry: the rotation removes `shed` and its runtime.
+    machine.append(
+        OP_ROTATE_SIGNING_KEY,
+        {
+            "signingKeyId": "3",
+            "sealedSigningKey": placeholder("revoked-shed"),
+            "reason": "revocation",
+            "revokedNode": "shed",
+        },
+    )
+    # The older shape: `revokeNode`, then a rotation naming the node it
+    # removed. Revoking takes the node's component and runtime with it.
+    # Placed last so the cascade shows up in the compared state.
     machine.append(OP_REVOKE_NODE, {"name": "gpu-büro"})
+    machine.append(
+        OP_ROTATE_SIGNING_KEY,
+        {
+            "signingKeyId": "4",
+            "sealedSigningKey": placeholder("revoked-gpu"),
+            "reason": "revocation",
+            "revokedNode": "gpu-büro",
+        },
+    )
     machine.append(OP_PROMOTE, {"node": "attic"}, epoch_override=machine.state.epoch + 1)
 
 

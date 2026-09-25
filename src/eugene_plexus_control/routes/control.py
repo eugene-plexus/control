@@ -405,7 +405,8 @@ async def perform_rotation(
             "'control identity key did not open'.",
         )
 
-    node_names = sorted(machine.state.nodes)
+    # The revoked node is still enrolled here: the entry below removes it.
+    node_names = sorted(n for n in machine.state.nodes if n != revoked_node)
     try:
         tracker.begin(reason=reason, revoked_node=revoked_node, nodes=node_names)
     except RotationInFlight as exc:
