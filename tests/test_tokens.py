@@ -21,7 +21,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from eugene_plexus_control import tokens
 
-NOW = int(time.time())
+
+def _now() -> int:
+    """Read at the moment of use: a module-level constant goes stale by
+    however long the suite has run, and a leeway test then measures that."""
+    return int(time.time())
 
 
 def _signer(issuer: str) -> tokens.Signer:
@@ -117,7 +121,7 @@ def test_a_bundle_naming_a_kid_that_is_not_its_keys_thumbprint_is_refused() -> N
     payload = {
         "version": 1,
         "epoch": 1,
-        "iat": NOW,
+        "iat": _now(),
         "authority": tokens.public_b64(authority),
         "keys": [
             {
@@ -156,8 +160,8 @@ def test_expired_sign_outs_are_pruned_and_live_ones_kept() -> None:
         version=1,
         epoch=1,
         keys=[],
-        revoked_sessions=[("gone", NOW - 10 * 3600), ("live", NOW + 3600)],
-        now=NOW,
+        revoked_sessions=[("gone", _now() - 10 * 3600), ("live", _now() + 3600)],
+        now=_now(),
     )
     assert bundle.revoked_sessions == frozenset({"live"})
 
@@ -298,8 +302,8 @@ def test_hs256_signed_with_the_public_key_is_refused(install: dict[str, object])
         "iss": "control",
         "sub": "operator",
         "aud": ["control"],
-        "iat": NOW,
-        "exp": NOW + 60,
+        "iat": _now(),
+        "exp": _now() + 60,
         "jti": "x",
     }
 
@@ -348,7 +352,7 @@ def test_a_signed_out_session_and_everything_exchanged_from_it_are_refused() -> 
         version=1,
         epoch=1,
         keys=[root.trust_key(["authority"]), nas.trust_key(["node"])],
-        revoked_sessions=[("session-1", NOW + 3600)],
+        revoked_sessions=[("session-1", _now() + 3600)],
     )
     session, _ = root.mint(
         typ=tokens.TYP_SESSION, sub="operator", aud=["node:nas"], ttl_seconds=600, jti="session-1"
@@ -415,10 +419,10 @@ def test_an_expired_token_is_refused_past_the_leeway(install: dict[str, object])
     root = install["root"]
     assert isinstance(root, tokens.Signer)
     within, _ = root.mint(
-        typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=60, now=NOW - 120
+        typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=60, now=_now() - 120
     )
     beyond, _ = root.mint(
-        typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=60, now=NOW - 1000
+        typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=60, now=_now() - 1000
     )
     assert _verify(install, within, "control")
     with pytest.raises(tokens.TokenError):
@@ -435,7 +439,7 @@ def test_a_token_from_a_clock_half_a_second_ahead_is_accepted(
     root = install["root"]
     assert isinstance(root, tokens.Signer)
     token, _ = root.mint(
-        typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=60, now=NOW + 1
+        typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=60, now=_now() + 1
     )
     assert _verify(install, token, "control")
 
@@ -446,10 +450,10 @@ def test_skew_inside_the_leeway_is_accepted_and_past_it_refused(
     root = install["root"]
     assert isinstance(root, tokens.Signer)
     inside, _ = root.mint(
-        typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=60, now=NOW + 250
+        typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=60, now=_now() + 250
     )
     past, _ = root.mint(
-        typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=60, now=NOW + 400
+        typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=60, now=_now() + 400
     )
     assert _verify(install, inside, "control")
     with pytest.raises(tokens.TokenError):
