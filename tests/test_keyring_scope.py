@@ -154,6 +154,27 @@ def test_the_probe_says_no_in_a_container(dict_keyring: DictKeyring) -> None:
     assert keyring_store.probe_sync() is False
 
 
+def test_a_refused_probe_does_not_read_as_a_failed_unlock(
+    dict_keyring: DictKeyring, caplog: pytest.LogCaptureFixture
+) -> None:
+    """In a container the probe always refuses, and it once logged the
+    master-key write's *"master key NOT persisted"* on every start -- read
+    as a failed unlock when only the check ran. One line now, naming the
+    check, the backend's reason and the unattended path, and no warning."""
+    keyring_store.reset_probe_cache()
+    dict_keyring.raise_on.add("set")
+    with caplog.at_level("DEBUG", logger=keyring_store.__name__):
+        assert keyring_store.probe_sync() is False
+    text = caplog.text
+    assert "master key" not in text
+    assert "keyring check" in text
+    assert "nothing was unlocked" in text
+    assert "simulated" in text  # the backend's own reason
+    assert "passphrase_file" in text
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+    assert len(caplog.records) == 1
+
+
 def test_status_says_unlocked_and_whether_a_keyring_exists(
     tmp_path: Path, dict_keyring: DictKeyring
 ) -> None:

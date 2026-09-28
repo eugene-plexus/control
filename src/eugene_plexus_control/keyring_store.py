@@ -203,27 +203,53 @@ def probe_sync() -> bool:
     back and delete a throwaway entry. Measured once per process, not
     assumed from the platform — a container reports False here and
     `passphrase_file` is its answer. Synchronous; the status route runs
-    it in a thread with a deadline."""
+    it in a thread with a deadline.
+
+    **It logs one line of its own and none of the master key's.** It
+    used to go through `_write`, whose refusal reads *"keyring write
+    failed; master key NOT persisted"* -- which an operator read as a
+    failed unlock when nothing but this check had run. The agent's
+    probe had the same defect and the same fix."""
     global _probe_result, _probe_done
     with _PROBE_LOCK:
         if _probe_done:
             return bool(_probe_result)
-        username = f"probe:{secrets.token_hex(6)}"
-        payload = secrets.token_bytes(32)
-        ok = False
-        try:
-            if _write(username, payload):
-                ok = _read(username) == payload
-        finally:
-            _delete(username)
+        ok, reason = _probe_round_trip()
         _probe_result = ok
         _probe_done = True
         if not ok:
             log.info(
-                "this host's OS keyring did not accept a probe entry; securityMode "
-                "os_keyring would not auto-unlock here (passphrase_file is the unattended path)"
+                "keyring check: this host's OS keyring refused a throwaway test entry "
+                "(%s), so securityMode os_keyring cannot auto-unlock here "
+                "(passphrase_file is the unattended path). This is only the check "
+                "behind the keyring option; nothing was unlocked, locked or lost",
+                reason,
             )
         return ok
+
+
+def _probe_round_trip() -> tuple[bool, str]:
+    """Write, read back and delete a throwaway entry; (worked, why not).
+
+    Calls `keyring` directly so a refusal is reported once, by the
+    probe, in the probe's words. The delete runs whatever happened and
+    its own failure is ignored: an entry that was never written cannot
+    be deleted either, and that is not news.
+    """
+    username = f"probe:{secrets.token_hex(6)}"
+    encoded = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+    try:
+        keyring.set_password(SERVICE, username, encoded)
+        if keyring.get_password(SERVICE, username) != encoded:
+            return False, "the entry did not read back"
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            keyring.delete_password(SERVICE, username)
+        except Exception:
+            pass
 
 
 def reset_probe_cache() -> None:
