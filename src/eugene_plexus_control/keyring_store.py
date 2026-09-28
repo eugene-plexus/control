@@ -48,6 +48,7 @@ the behaviour with the field unset.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import logging
 import secrets
@@ -246,10 +247,8 @@ def _probe_round_trip() -> tuple[bool, str]:
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
     finally:
-        try:
+        with contextlib.suppress(Exception):
             keyring.delete_password(SERVICE, username)
-        except Exception:
-            pass
 
 
 def reset_probe_cache() -> None:
