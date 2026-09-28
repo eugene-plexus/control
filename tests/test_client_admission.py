@@ -204,3 +204,31 @@ def test_model_scope_concurrency_and_rate_are_one_allowance(active_client):
     assert call("release", "gateway-two").status_code == 200
     assert call("acquire", "third").status_code == 429
     assert client.get("/v1/auth/client-keys").status_code == 200
+
+
+def test_an_account_pattern_admits_its_models_and_nothing_else():
+    """P1: the control root applies the same `*` rule as the agent and the
+    gateway, so a key scoped to one account cannot reach another."""
+    key = {"name": "App", "expiresAt": 4_102_444_800, "limits": {"allowedModels": ["openrouter/*"]}}
+    ledger = {"clock": 0.0, "buckets": {}}
+    result, _ = admission.decide(
+        ledger,
+        key,
+        key_id="k",
+        action="acquire",
+        request_id="r1",
+        model="openrouter/anthropic/claude-opus-5.5",
+        now=1.0,
+    )
+    assert result["leaseSeconds"] > 0
+    with pytest.raises(admission.AdmissionRefusal) as caught:
+        admission.decide(
+            ledger,
+            key,
+            key_id="k",
+            action="acquire",
+            request_id="r2",
+            model="work/anthropic/claude-opus-5.5",
+            now=1.0,
+        )
+    assert caught.value.status == 403
