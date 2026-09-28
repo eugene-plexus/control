@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -93,6 +94,21 @@ class Settings(BaseSettings):
 
     The config field's own description names this variable, so an
     operator who flips the mode in the UI is told what else to set."""
+
+    @field_validator("passphrase_file", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        """A blank variable is an unset one, and says so.
+
+        Unraid passes every template variable, blank ones included, and
+        `Path("")` is `.`: a root with the variable left empty logged
+        *"passphrase file . could not be read (Is a directory)"* instead of
+        naming the variable that was not set (found on a live NAS,
+        2026-09-28).
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     allowed_hosts: str | None = None
     """Extra names first-run setup and sign-in answer to, comma-separated;
