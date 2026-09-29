@@ -22,6 +22,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, status
+from pydantic import ValidationError
 
 from .._generated.models import (
     ComponentPlacement,
@@ -90,21 +91,21 @@ async def list_components(request: Request) -> ComponentPlacementList:
     for item in collected.items:
         key = (str(item.get("node")), str(item.get("name")))
         seen.add(key)
-        components.append(
-            ComponentPlacement.model_validate(
-                {
-                    "node": key[0],
-                    "name": key[1],
-                    "kind": item.get("kind"),
-                    "url": item.get("url"),
-                    # A string here rather than a copy of the agent's
-                    # enum: the agent owns component status, and
-                    # duplicating its enum in this document would create
-                    # two definitions of one fact.
-                    "status": str(item.get("status")) if item.get("status") else None,
-                }
-            )
+        placement = _placement(
+            {
+                "node": key[0],
+                "name": key[1],
+                "kind": item.get("kind"),
+                "url": item.get("url"),
+                # A string here rather than a copy of the agent's
+                # enum: the agent owns component status, and
+                # duplicating its enum in this document would create
+                # two definitions of one fact.
+                "status": str(item.get("status")) if item.get("status") else None,
+            }
         )
+        if placement is not None:
+            components.append(placement)
 
     # Declared-but-not-reported components are still part of the
     # install. A component on a node that answered but did not list it
@@ -112,17 +113,17 @@ async def list_components(request: Request) -> ComponentPlacementList:
     for key, record in declared.items():
         if key in seen or record.node in collected.unreachable:
             continue
-        components.append(
-            ComponentPlacement.model_validate(
-                {
-                    "node": record.node,
-                    "name": record.name,
-                    "kind": record.kind,
-                    "url": record.url,
-                    "status": "undeclared_on_node",
-                }
-            )
+        placement = _placement(
+            {
+                "node": record.node,
+                "name": record.name,
+                "kind": record.kind,
+                "url": record.url,
+                "status": "undeclared_on_node",
+            }
         )
+        if placement is not None:
+            components.append(placement)
 
     return ComponentPlacementList(
         components=sorted(components, key=lambda c: (c.node, c.name)),
@@ -272,6 +273,29 @@ def _targets(machine: StateMachine) -> list[tuple[str, str | None]]:
         (record.name, normalize_url(record.url))
         for record in sorted(machine.state.nodes.values(), key=lambda r: r.name)
     ]
+
+
+def _placement(values: dict[str, Any]) -> ComponentPlacement | None:
+    """One row of the union view, or None for a kind this build does not know.
+
+    **Left out, never a failure of the whole view** -- `_engine`'s rule,
+    one field over. During a rolling upgrade a newer agent declares a kind
+    this control root has never heard of (the tool-driver arrived at P8),
+    and validating it strictly made `GET /v1/components` a 500 for the
+    whole install, after which the console's tree lost every machine's
+    placement at once.
+    """
+    try:
+        return ComponentPlacement.model_validate(values)
+    except ValidationError:
+        log.info(
+            "node %r reported component %r of a kind this build does not know (%r); "
+            "leaving it out of the union view",
+            values.get("node"),
+            values.get("name"),
+            values.get("kind"),
+        )
+        return None
 
 
 def _engine(value: Any) -> EngineKind | None:

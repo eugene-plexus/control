@@ -149,6 +149,8 @@ def test_admission_and_edit_audiences(active_client):
     [
         {"allowedModels": [" "]},
         {"allowedModels": ["a", "a"]},
+        {"allowedTools": [" "]},
+        {"allowedTools": ["web_search", "web_search"]},
         {"maxConcurrentRequests": 0},
         {"requestsPerMinute": 10001},
     ],

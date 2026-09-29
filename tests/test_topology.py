@@ -273,3 +273,25 @@ def test_a_runtime_spec_without_a_name_is_refused(
         "/v1/runtimes", json={"node": "gpu-box", "spec": {"modelPath": "/m.gguf"}}
     )
     assert response.status_code == 400
+
+
+def test_a_search_account_is_a_component_and_an_unknown_kind_leaves_the_view_whole(
+    active_client: TestClient,
+) -> None:
+    """A tool-driver (P8) is listed like any component; a kind this build
+    has never heard of -- a newer agent, mid-upgrade -- is left out rather
+    than turning the whole install's view into a 500."""
+    app = _fake_agent(
+        runtimes=[],
+        components=[
+            {"name": "left", "kind": "inference-driver", "url": "http://10.0.0.7:8081"},
+            {"name": "searx", "kind": "tool-driver", "url": "http://10.0.0.7:8190"},
+            {"name": "future", "kind": "some-later-kind", "url": "http://10.0.0.7:8300"},
+        ],
+    )
+    with _Server(app) as server:
+        _enroll(active_client, "gpu-box", server.url)
+        response = active_client.get("/v1/components")
+    assert response.status_code == 200, response.text
+    kinds = {c["name"]: c["kind"] for c in response.json()["components"]}
+    assert kinds == {"left": "inference-driver", "searx": "tool-driver"}
