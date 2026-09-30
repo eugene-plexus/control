@@ -26,6 +26,7 @@ config values an operator types.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 from pathlib import Path
@@ -98,7 +99,10 @@ FIELDS: list[ConfigField] = [
             "can unlock the install without knowing the passphrase. "
             "They buy an install that comes back from a power cut with "
             "nobody present, which is why they exist and why neither is "
-            "the default."
+            "the default.\n\n"
+            "Nothing restarts when you change it: the keyring entry is "
+            "stored or removed when you save, and the next start unlocks "
+            "accordingly."
         ),
         category="security",
         valueType=ConfigValueType.enum,
@@ -109,7 +113,11 @@ FIELDS: list[ConfigField] = [
             "OS keyring auto-unlock",
             "Passphrase file auto-unlock",
         ],
-        requiresRestart=True,
+        # Not `requiresRestart` (2026-09-30, Troy): the running root does
+        # not change -- the keyring entry is written or deleted at PATCH
+        # time and the mode is read at the next start. The flag made the
+        # UI restart this root after every change, and a root that comes
+        # back in prompt mode comes back locked.
     ),
     ConfigField(
         key="standbyUrls",
@@ -257,8 +265,32 @@ def validate_patch(request: ConfigUpdateRequest) -> tuple[dict[str, Any], list[C
     return accepted, rejected
 
 
-def requires_restart(keys: list[str]) -> list[str]:
-    return sorted(k for k in keys if (_FIELDS_BY_KEY.get(k) and _FIELDS_BY_KEY[k].requiresRestart))
+def requires_restart(keys: list[str], values: dict[str, Any] | None = None) -> list[str]:
+    """This PATCH's restart keys whose value now differs from what the
+    process runs on (`running`), when `values` (the applied config) is
+    given -- a key set back to its running value needs nothing."""
+    out = sorted(k for k in keys if (_FIELDS_BY_KEY.get(k) and _FIELDS_BY_KEY[k].requiresRestart))
+    if values is None:
+        return out
+    now = effective(values)
+    return [k for k in out if now.get(k) != running().get(k)]
+
+
+def running() -> dict[str, Any]:
+    """What this process runs on, for the fields read only at start.
+
+    `logLevel` is the one: it is whatever the root logger was set to at
+    boot, which is the level in effect, not the level saved."""
+    return {"logLevel": logging.getLevelName(logging.getLogger().getEffectiveLevel())}
+
+
+#: What an unset or empty value does (settings never lie, 2026-09-30).
+UNSET_MEANS: dict[str, str] = {
+    "standbyUrls": (
+        "No standbys. A standby replicates this root's log and can be promoted if this "
+        "host is not coming back; none is required."
+    ),
+}
 
 
 def as_document(values: dict[str, Any]) -> ConfigDocument:
@@ -282,6 +314,15 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
         return None  # null clears to default
 
     vt = field.valueType
+
+    if (
+        isinstance(value, float)
+        and not math.isfinite(value)
+        and vt in (ConfigValueType.number, ConfigValueType.duration)
+    ):
+        # JSON's `NaN` parses, and every comparison with it is false, so it
+        # passed the range check and was stored.
+        return "must be a finite number"
 
     if vt in (ConfigValueType.string, ConfigValueType.url, ConfigValueType.file_path):
         if not isinstance(value, str):

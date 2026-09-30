@@ -14,14 +14,18 @@ wrong way round.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials
 
 from .. import config as config_module
 from .. import keyring_store
 from .._generated.models import (
     ConfigDocument,
+    ConfigFieldStatus,
+    ConfigFieldStatusLevel,
     ConfigSchema,
     ConfigUpdateRequest,
     ConfigUpdateResult,
@@ -51,10 +55,89 @@ async def get_config(request: Request) -> ConfigDocument:
 
 
 @router.get("/v1/config/schema", response_model=ConfigSchema)
-async def get_config_schema() -> ConfigSchema:
+async def get_config_schema(request: Request) -> ConfigSchema:
     """Unauthenticated, like every other component's: it describes the
-    shape of the form, not its contents."""
-    return config_module.as_schema()
+    shape of the form, not its contents.
+
+    **What the values are doing is contents**, so it is added only for a
+    caller who may read them (settings never lie, 2026-09-30): a restart
+    that is still pending and what runs meanwhile, and a security mode this
+    host cannot carry out. An anonymous caller gets the shape alone.
+    """
+    schema = config_module.as_schema()
+    fields = [
+        f.model_copy(update={"unsetMeans": config_module.UNSET_MEANS[f.key]})
+        if f.key in config_module.UNSET_MEANS
+        else f
+        for f in schema.fields
+    ]
+    if _may_read(request):
+        machine: StateMachine = request.app.state.machine
+        values = machine.state.config
+        pending = config_module.requires_restart(list(values), values)
+        running = config_module.running()
+        mode = config_module.effective(values)["securityMode"]
+        keyring: bool | None = None
+        if mode == "os_keyring":
+            # Memoised per process; a locked Secret Service can block on a
+            # prompt nobody answers, so the status route's deadline.
+            try:
+                keyring = await asyncio.wait_for(
+                    asyncio.to_thread(keyring_store.probe_sync), timeout=3.0
+                )
+            except TimeoutError:
+                keyring = None
+        status = _security_mode_status(request, mode, keyring)
+        decorated = []
+        for f in fields:
+            update: dict[str, object] = {}
+            if f.key in pending:
+                update["pendingRestart"] = True
+                update["inEffect"] = running.get(f.key)
+            if f.key == "securityMode" and status is not None:
+                update["status"] = status
+            decorated.append(f.model_copy(update=update) if update else f)
+        fields = decorated
+    schema.fields = fields
+    return schema
+
+
+def _may_read(request: Request) -> bool:
+    """Whether the caller could read `GET /v1/config` -- the same check."""
+    scheme, _, token = (request.headers.get("authorization") or "").partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return False
+    try:
+        require_authorized(
+            request, HTTPAuthorizationCredentials(scheme="Bearer", credentials=token.strip())
+        )
+    except HTTPException:
+        return False
+    return True
+
+
+def _security_mode_status(
+    request: Request, mode: object, keyring: bool | None
+) -> ConfigFieldStatus | None:
+    settings = getattr(request.app.state, "settings", None)
+    if mode == "passphrase_file" and getattr(settings, "passphrase_file", None) is None:
+        return ConfigFieldStatus(
+            level=ConfigFieldStatusLevel.warning,
+            text=(
+                "This root has no passphrase file configured "
+                "(EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE), so it comes back locked after "
+                "every restart, as Prompt on startup does."
+            ),
+        )
+    if mode == "os_keyring" and keyring is False:
+        return ConfigFieldStatus(
+            level=ConfigFieldStatusLevel.warning,
+            text=(
+                "This host's keyring refused a test entry, so it cannot keep the key: the "
+                "root comes back locked after every restart, as Prompt on startup does."
+            ),
+        )
+    return None
 
 
 @router.patch(
@@ -119,7 +202,7 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
                 "the next login will store it"
             )
 
-    pending = config_module.requires_restart(list(accepted))
+    pending = config_module.requires_restart(list(accepted), machine.state.config)
     return ConfigUpdateResult(
         applied=sorted(accepted),
         rejected=rejected,

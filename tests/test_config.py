@@ -215,3 +215,52 @@ def test_effective_config_layers_applied_over_defaults() -> None:
     values = config_module.effective({"uiTheme": "dark"})
     assert values["uiTheme"] == "dark"
     assert values["nodePollIntervalSeconds"] == 15
+
+
+# --- settings never lie (2026-09-30) ----------------------------------------
+
+
+def test_security_mode_needs_no_restart(active_client: TestClient) -> None:
+    """The keyring entry is written or deleted at PATCH time and the mode is
+    read at the next start. The flag made the UI restart this root after
+    every change, and a root that comes back in prompt mode is locked."""
+    response = active_client.patch("/v1/config", json={"securityMode": "os_keyring"})
+    body = response.json()
+    assert body["applied"] == ["securityMode"] and body["requiresRestart"] is False
+
+
+def test_a_level_set_back_to_the_running_one_needs_no_restart(active_client: TestClient) -> None:
+    import logging
+
+    running = logging.getLevelName(logging.getLogger().getEffectiveLevel())
+    other = "DEBUG" if running != "DEBUG" else "ERROR"
+    assert active_client.patch("/v1/config", json={"logLevel": other}).json()["requiresRestart"]
+    field = next(
+        f for f in active_client.get("/v1/config/schema").json()["fields"] if f["key"] == "logLevel"
+    )
+    assert field["pendingRestart"] is True and field["inEffect"] == running
+    back = active_client.patch("/v1/config", json={"logLevel": running}).json()
+    assert back["requiresRestart"] is False and back["pendingRestart"] == []
+
+
+def test_what_values_are_doing_is_not_told_to_an_anonymous_caller(
+    active_client: TestClient,
+) -> None:
+    active_client.patch("/v1/config", json={"securityMode": "passphrase_file"})
+    active_client.app.state.settings.passphrase_file = None  # type: ignore[attr-defined]
+    fields = {f["key"]: f for f in active_client.get("/v1/config/schema").json()["fields"]}
+    assert fields["securityMode"]["status"]["level"] == "warning"
+    assert "comes back locked" in fields["securityMode"]["status"]["text"]
+    assert "No standbys" in fields["standbyUrls"]["unsetMeans"]
+    anonymous = TestClient(active_client.app)
+    bare = {f["key"]: f for f in anonymous.get("/v1/config/schema").json()["fields"]}
+    assert bare["securityMode"].get("status") is None
+
+
+def test_nan_is_refused(active_client: TestClient) -> None:
+    body = active_client.patch(
+        "/v1/config",
+        content='{"nodeRequestTimeoutSeconds": NaN}',
+        headers={"content-type": "application/json"},
+    ).json()
+    assert body["applied"] == [] and "finite" in body["rejected"][0]["message"]
