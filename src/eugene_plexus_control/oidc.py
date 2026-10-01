@@ -402,9 +402,11 @@ def still_valid(state: Any, claims: dict[str, Any], client_id: str) -> Subject |
 
 _STYLE = """
 :root { color-scheme: light dark; --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330;
-  --muted: #5b6475; --border: #d6dae2; --accent: #2f6fd6; --error: #b42318; }
+  --muted: #5b6475; --border: #d6dae2; --accent: #2f6fd6; --on-accent: #ffffff;
+  --error: #b42318; }
 @media (prefers-color-scheme: dark) { :root { --bg: #0f141c; --panel: #161d28;
-  --text: #e7ebf2; --muted: #9aa4b5; --border: #2a3444; --accent: #8ec5ff; --error: #ff8a80; } }
+  --text: #e7ebf2; --muted: #9aa4b5; --border: #2a3444; --accent: #8ec5ff;
+  --on-accent: #0f141c; --error: #ff8a80; } }
 * { box-sizing: border-box; }
 body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px;
   background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, sans-serif; }
@@ -416,7 +418,8 @@ label { display: block; margin: 12px 0 4px; font-weight: 600; }
 input { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 4px;
   background: transparent; color: inherit; font: inherit; }
 button { margin-top: 20px; width: 100%; padding: 10px; border: 0; border-radius: 4px;
-  background: var(--accent); color: #0f141c; font: inherit; font-weight: 600; cursor: pointer; }
+  background: var(--accent); color: var(--on-accent); font: inherit; font-weight: 600;
+  cursor: pointer; }
 .error { color: var(--error); margin: 0 0 8px; }
 .hint { color: var(--muted); font-size: 0.875rem; margin: 16px 0 0; }
 details { margin-top: 16px; } summary { cursor: pointer; color: var(--accent); }

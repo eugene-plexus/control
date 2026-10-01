@@ -616,3 +616,33 @@ def test_a_short_password_is_refused_on_both_routes(active_client: TestClient) -
     person = active_client.post("/v1/people", json={"name": "Ada", "password": FIRST}).json()
     reset = active_client.put(f"/v1/people/{person['id']}/password", json={"password": "short"})
     assert reset.status_code == 422 and "password" in reset.text
+
+
+def _contrast(a: str, b: str) -> float:
+    def lum(hex_: str) -> float:
+        channels = [int(hex_[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+        lin = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+        return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+def test_the_page_text_meets_the_contrast_minimum(scheme: str) -> None:
+    light, dark = oidc._STYLE.split("@media (prefers-color-scheme: dark)", 1)
+    block = light if scheme == "light" else dark
+
+    def token(name: str) -> str:
+        found = re.search(rf"--{name}: (#[0-9a-f]{{6}})", block)
+        assert found, name
+        return found.group(1)
+
+    for fg, bg in (
+        ("on-accent", "accent"),
+        ("text", "panel"),
+        ("muted", "panel"),
+        ("accent", "panel"),
+        ("error", "panel"),
+    ):
+        assert _contrast(token(fg), token(bg)) >= 4.5, (scheme, fg, bg)
