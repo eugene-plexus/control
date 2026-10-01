@@ -138,7 +138,9 @@ def test_a_forwarded_host_is_believed_only_beside_an_agents_token(
     ignored = active_client.get("/oidc/.well-known/openid-configuration", headers=forwarded)
     assert ignored.json()["issuer"] == "http://testserver/oidc"
 
-    keys, enrolled = enroll(active_client, "node-a")
+    # The gateway grant lets this node's gateway token reach the root, so
+    # the provider's own check is the only thing that refuses it below.
+    keys, enrolled = enroll(active_client, "node-a", grants=["gateway"])
     assert enrolled.status_code == 201, enrolled.text
     token, _ = keys.token.mint(
         typ=tokens.TYP_SERVICE,
@@ -155,6 +157,14 @@ def test_a_forwarded_host_is_believed_only_beside_an_agents_token(
     forged, _ = keys.token.mint(
         typ=tokens.TYP_SERVICE, sub="gateway", aud=[tokens.RECIPIENT_CONTROL], ttl_seconds=300
     )
+    app = active_client.app
+    claims = tokens.verify(
+        forged,
+        bundle=app.state.trust.view_for(app.state.machine.state),
+        recipient=tokens.RECIPIENT_CONTROL,
+        classes=(tokens.TYP_SERVICE,),
+    )
+    assert claims.sub == "gateway"  # a real service token, and not an agent's
     not_an_agent = active_client.get(
         "/oidc/.well-known/openid-configuration",
         headers={**forwarded, oidc.NODE_TOKEN_HEADER: forged},
@@ -421,5 +431,188 @@ def test_the_owners_passphrase_is_not_changed_on_the_sign_in_page(
         new_password=MINE,
         new_password_again=MINE,
     )
-    assert refused.status_code == 400 and "console" in refused.text
+    assert refused.status_code == 400 and "cannot be changed here" in refused.text
     assert _sign_in(active_client, client_id, PASSPHRASE, "operator").status_code == 302
+
+
+# --------------------------------------------------------------------- #
+# the code, its client and its proof
+# --------------------------------------------------------------------- #
+
+
+def _code(
+    c: TestClient, client_id: str, password: str = PASSPHRASE, name: str | None = None
+) -> str:
+    answer = _sign_in(c, client_id, password, name)
+    assert answer.status_code == 302, answer.text
+    return parse_qs(urlsplit(answer.headers["location"]).query)["code"][0]
+
+
+def _trade(c: TestClient, made: dict[str, Any], code: str, **change: str) -> Any:
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "code_verifier": "v" * 50,
+        "redirect_uri": CALLBACK,
+        **change,
+    }
+    auth = (made["client"]["clientId"], made["clientSecret"])
+    return c.post("/oidc/token", auth=auth, data=data)
+
+
+def test_the_wrong_client_secret_is_refused(active_client: TestClient) -> None:
+    made = _client(active_client)
+    code = _code(active_client, made["client"]["clientId"])
+    wrong = active_client.post(
+        "/oidc/token",
+        auth=(made["client"]["clientId"], "not-the-secret"),
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": "v" * 50,
+            "redirect_uri": CALLBACK,
+        },
+    )
+    assert wrong.status_code == 401 and wrong.json()["error"] == "invalid_client"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"code_verifier": "w" * 50}, {"redirect_uri": "http://127.0.0.1:9/elsewhere"}],
+)
+def test_a_code_needs_its_own_proof_and_return_address(
+    active_client: TestClient, change: dict[str, str]
+) -> None:
+    made = _client(active_client)
+    code = _code(active_client, made["client"]["clientId"])
+    assert _trade(active_client, made, code, **change).json()["error"] == "invalid_grant"
+
+
+def test_a_code_works_once(active_client: TestClient) -> None:
+    made = _client(active_client)
+    code = _code(active_client, made["client"]["clientId"])
+    assert _trade(active_client, made, code).status_code == 200
+    assert _trade(active_client, made, code).json()["error"] == "invalid_grant"
+
+
+def test_a_code_is_only_for_the_app_it_was_issued_to(active_client: TestClient) -> None:
+    mine, theirs = _client(active_client, "Mine"), _client(active_client, "Theirs")
+    code = _code(active_client, mine["client"]["clientId"])
+    stolen = active_client.post(
+        "/oidc/token",
+        auth=(theirs["client"]["clientId"], theirs["clientSecret"]),
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": "v" * 50,
+            "redirect_uri": CALLBACK,
+        },
+    )
+    assert stolen.json()["error"] == "invalid_grant"
+
+
+# --------------------------------------------------------------------- #
+# who may sign in, and for how long
+# --------------------------------------------------------------------- #
+
+
+def test_a_turned_off_person_is_told_so_and_gets_no_code(active_client: TestClient) -> None:
+    made = _client(active_client)
+    client_id = made["client"]["clientId"]
+    person = active_client.post("/v1/people", json={"name": "Ada", "password": FIRST}).json()
+    active_client.patch(f"/v1/people/{person['id']}", json={"disabled": True})
+    refused = _sign_in(active_client, client_id, FIRST, "Ada")
+    assert refused.status_code == 403 and "turned off" in refused.text
+    assert "location" not in refused.headers
+
+
+def test_a_person_is_refused_an_app_they_are_not_given(active_client: TestClient) -> None:
+    given, other = _client(active_client, "Given"), _client(active_client, "Other")
+    active_client.post(
+        "/v1/people",
+        json={"name": "Ada", "password": FIRST, "apps": [given["client"]["clientId"]]},
+    )
+    refused = _sign_in(active_client, other["client"]["clientId"], FIRST, "Ada")
+    assert refused.status_code == 403 and "Other" in refused.text
+    assert "location" not in refused.headers
+    assert _sign_in(active_client, given["client"]["clientId"], FIRST, "Ada").status_code == 302
+
+
+def test_an_unknown_name_costs_a_password_check(
+    active_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eugene_plexus_control import security
+
+    made = _client(active_client)
+    active_client.post("/v1/people", json={"name": "Ada", "password": FIRST})
+    checked: list[str] = []
+    real = security.verify_passphrase
+
+    def counting(password: str, verifier: str) -> bool:
+        checked.append(verifier)
+        return real(password, verifier)
+
+    monkeypatch.setattr(security, "verify_passphrase", counting)
+    answer = _sign_in(active_client, made["client"]["clientId"], FIRST, "Nobody")
+    assert answer.status_code == 200 and len(checked) == 1
+
+
+def _refresh(c: TestClient, made: dict[str, Any], token: str) -> Any:
+    return c.post(
+        "/oidc/token",
+        auth=(made["client"]["clientId"], made["clientSecret"]),
+        data={"grant_type": "refresh_token", "refresh_token": token},
+    )
+
+
+def test_a_turned_off_persons_sign_in_ends_at_its_next_refresh(active_client: TestClient) -> None:
+    made = _client(active_client)
+    person = active_client.post("/v1/people", json={"name": "Ada", "password": FIRST}).json()
+    issued = _tokens(active_client, made, name="Ada", password=FIRST)
+    assert _refresh(active_client, made, issued["refresh_token"]).status_code == 200
+    active_client.patch(f"/v1/people/{person['id']}", json={"disabled": True})
+    assert _refresh(active_client, made, issued["refresh_token"]).json()["error"] == "invalid_grant"
+    userinfo = active_client.get(
+        "/oidc/userinfo", headers={"Authorization": f"Bearer {issued['access_token']}"}
+    )
+    assert userinfo.status_code == 401
+
+
+def test_a_revoked_sign_in_does_not_refresh(active_client: TestClient) -> None:
+    made = _client(active_client)
+    issued = _tokens(active_client, made)
+    revoked = active_client.post(
+        "/oidc/revoke",
+        auth=(made["client"]["clientId"], made["clientSecret"]),
+        data={"token": issued["refresh_token"]},
+    )
+    assert revoked.status_code == 200
+    assert _refresh(active_client, made, issued["refresh_token"]).json()["error"] == "invalid_grant"
+
+
+def test_the_log_refuses_a_sign_in_key_with_its_private_part(active_client: TestClient) -> None:
+    from eugene_plexus_control.applied import OP_PUT_OIDC_KEY, ApplyError
+
+    _, jwk = oidc.new_signing_key()
+    machine = active_client.app.state.machine
+    with pytest.raises(ApplyError):
+        machine.append(
+            OP_PUT_OIDC_KEY,
+            {
+                "key": {
+                    "kid": jwk["kid"],
+                    "sealedKey": "c2VhbGVk",
+                    "publicJwk": {**jwk, "d": "c2VjcmV0"},
+                    "createdAt": oidc.utcnow_iso(),
+                }
+            },
+        )
+    assert machine.state.oidc_keys == ()
+
+
+def test_a_short_password_is_refused_on_both_routes(active_client: TestClient) -> None:
+    made = active_client.post("/v1/people", json={"name": "Ada", "password": "short"})
+    assert made.status_code == 422 and "password" in made.text
+    person = active_client.post("/v1/people", json={"name": "Ada", "password": FIRST}).json()
+    reset = active_client.put(f"/v1/people/{person['id']}/password", json={"password": "short"})
+    assert reset.status_code == 422 and "password" in reset.text

@@ -361,7 +361,9 @@ async def sign_in(request: Request) -> Response:
     if new_password or form.get("new_password_again"):
         if person is None:
             return again(
-                400, "Eugene's passphrase is changed on the console, under Settings, not here."
+                400,
+                "Eugene's passphrase cannot be changed here. Only people the owner "
+                "added change their password on this page.",
             )
         if new_password != str(form.get("new_password_again") or ""):
             return again(200, "The two new passwords are not the same.")

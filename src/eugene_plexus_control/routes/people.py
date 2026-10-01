@@ -7,6 +7,9 @@ the replicated log, so a standby keeps them.
 
 Nothing here answers with a password, a verifier or a client secret, except
 a new client's secret, once, in the answer that made it.
+
+A password's length is the contract's rule (`minLength: 12` on both
+requests), so a short one is a 422 before any handler here runs.
 """
 
 from __future__ import annotations
@@ -43,8 +46,6 @@ from ..dependencies import problem, require_operator
 from ..state_machine import StateMachine
 
 router = APIRouter(tags=["people"], dependencies=[Depends(require_operator)])
-
-MIN_PASSWORD = oidc.MIN_PASSWORD
 
 
 def _active(request: Request) -> StateMachine:
@@ -94,12 +95,6 @@ def _check_apps(machine: StateMachine, apps: list[str] | None) -> list[str] | No
     return list(dict.fromkeys(apps))
 
 
-def _check_password(password: str) -> str:
-    if len(password) < MIN_PASSWORD:
-        raise problem(422, "Password too short", f"At least {MIN_PASSWORD} characters.")
-    return password
-
-
 @router.get("/v1/people", response_model=PersonList, response_model_exclude_none=True)
 async def list_people(request: Request) -> PersonList:
     machine = _active(request)
@@ -115,7 +110,7 @@ async def create_person(request: Request, body: PersonCreateRequest) -> Person:
     record: dict[str, Any] = {
         "id": uuid.uuid4().hex,
         "name": name,
-        "passwordVerifier": security.hash_passphrase(_check_password(body.password)),
+        "passwordVerifier": security.hash_passphrase(body.password),
         "apps": _check_apps(machine, body.apps),
         "disabled": False,
         "createdAt": when,
@@ -162,7 +157,7 @@ async def set_password(request: Request, person_id: str, body: PersonPasswordReq
         OP_SET_PERSON_PASSWORD,
         {
             "id": person_id,
-            "passwordVerifier": security.hash_passphrase(_check_password(body.password)),
+            "passwordVerifier": security.hash_passphrase(body.password),
             "passwordChangedAt": oidc.utcnow_iso(),
         },
     )

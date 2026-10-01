@@ -460,7 +460,7 @@ def page(
         )
         if asks_name:
             # D10: a person given a password by the owner makes it their own
-            # here. The owner's passphrase is changed on the console.
+            # here. The owner's passphrase is not: nothing changes it yet.
             parts.append("<details><summary>Change my password</summary>")
             parts.append("<label for='new_password'>New password</label>")
             parts.append(
