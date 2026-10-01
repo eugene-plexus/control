@@ -14,6 +14,10 @@ levels, per `specs/docs/design/per-node-token-keys.md` D5:
 * `require_node_actor` — a service token with `sub: agent` from a member
   node, and nothing else: the credential an agent presents when it asks
   on its own behalf (token exchange, a forwarded sign-in).
+* `require_operator_or_acting_node` — an operator session, or a member
+  node acting for an operator who is acting on it. Only the routes an app
+  install spends (its key and its sign-in registration), and each such
+  route then confines the node to things named for itself.
 
 **There is no auth-disabled dev path.** A missing token key means the
 install has not been initialized, or is sealed, and the answer is 503.
@@ -29,7 +33,10 @@ here except by a node speaking for itself.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection
+from dataclasses import dataclass
+from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -211,3 +218,90 @@ def optional_node_actor(request: Request, authorization: str | None) -> tokens.C
     if claims.sub != tokens.SUB_AGENT or claims.issuer_node is None:
         return None
     return claims
+
+
+SUBJECT_TOKEN_HEADER = "X-Eugene-Plexus-Subject-Token"
+"""Where a node acting for an operator puts the operator's token (RFC 8693's
+"subject"); its own service token, in `Authorization`, is the actor."""
+
+
+@dataclass(frozen=True)
+class Operator:
+    """Who an operator-level request speaks for, and through which machine.
+
+    `node` is None for an operator session presented here directly. It names
+    a member node when that node presented the operator's token for them, and
+    then the route confines it to what `named_for_node` allows.
+    """
+
+    claims: tokens.Claims
+    node: str | None = None
+
+    def may_name(self, name: str | None) -> bool:
+        return self.node is None or named_for_node(name, self.node)
+
+
+def named_for_node(name: str | None, node: str) -> bool:
+    """An app's key or sign-in owner on that node: `app:<id>@<node>`."""
+    return bool(name) and re.fullmatch(rf"app:[^@\s]+@{re.escape(node)}", str(name)) is not None
+
+
+def require_operator_or_acting_node(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> Operator:
+    """An operator session; or a member node acting for an operator acting on it.
+
+    **Why the second form exists (2026-10-01).** The console reaches another
+    machine with a five-minute token addressed to that machine alone (D7), so
+    an install the operator starts there cannot send that token on here --
+    it is not addressed here, and forwarding a bearer past its audience is
+    what D7 forbids. Installing an app needs two things only this root can
+    do: its key, and its sign-in registration. So the machine presents its
+    own `sub: agent` token as the actor, and the operator's token addressed
+    to that same machine as the subject.
+
+    The pair proves that this node is asking and that an operator is acting
+    on it right now: the subject lives five minutes, and a sign-out revokes
+    it by `sid`. A node's key alone opens nothing here, and the routes that
+    take this let the node touch only keys and sign-in registrations named
+    for itself.
+    """
+    subject = request.headers.get(SUBJECT_TOKEN_HEADER)
+    if not subject:
+        return Operator(require_operator(request, creds))
+    actor = require_node_actor(request, creds)
+    node = actor.issuer_node
+    assert node is not None  # require_node_actor said so
+    auth: AuthState = request.app.state.auth_state
+    if auth.signing_key is None:
+        raise _locked_or_uninitialized(request)
+    bundle = request.app.state.trust.view_for(request.app.state.machine.state)
+    try:
+        claims = tokens.verify(
+            subject.strip(),
+            bundle=bundle,
+            recipient=tokens.node_recipient(node),
+            classes=(tokens.TYP_SESSION,),
+        )
+    except tokens.TokenError as exc:
+        raise problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Not an operator acting on this machine",
+            f"{node} sent an operator token this root will not take for it: {exc}",
+        ) from exc
+    return Operator(claims, node=node)
+
+
+ActingOperator = Annotated[Operator, Depends(require_operator_or_acting_node)]
+"""A route parameter that takes `require_operator_or_acting_node`."""
+
+
+def refuse_for_node(op: Operator, what: str) -> HTTPException:
+    """The 403 for a node that reached past its own apps."""
+    return problem(
+        status.HTTP_403_FORBIDDEN,
+        "Not this machine's to change",
+        f"{op.node} is acting for you, so it may {what} only for its own apps, "
+        f"named app:<id>@{op.node}. Do this from a console signed in to the control root.",
+    )

@@ -42,10 +42,19 @@ from ..applied import (
     OP_SET_PERSON_PASSWORD,
     OPERATOR_NAME,
 )
-from ..dependencies import problem, require_operator
+from ..dependencies import (
+    ActingOperator,
+    problem,
+    refuse_for_node,
+    require_operator,
+)
 from ..state_machine import StateMachine
 
 router = APIRouter(tags=["people"], dependencies=[Depends(require_operator)])
+# Registering and removing an app's sign-in is also what installing an app on
+# another machine does, so these two take a node acting for the operator as
+# well, confined to that node's own apps (`require_operator_or_acting_node`).
+app_clients = APIRouter(tags=["people"])
 
 
 def _active(request: Request) -> StateMachine:
@@ -200,17 +209,23 @@ async def list_clients(request: Request) -> OidcClientList:
     )
 
 
-@router.post(
+@app_clients.post(
     "/v1/oidc/clients",
     response_model=OidcClientCreated,
     status_code=201,
     response_model_exclude_none=True,
 )
-async def create_client(request: Request, body: OidcClientCreateRequest) -> OidcClientCreated:
+async def create_client(
+    request: Request,
+    body: OidcClientCreateRequest,
+    op: ActingOperator,
+) -> OidcClientCreated:
     machine = _active(request)
     name = body.name.strip()
     if not name:
         raise problem(422, "Name required", "Give the app a name people will recognise.")
+    if not op.may_name(body.owner):
+        raise refuse_for_node(op, "register sign-in")
     secret = secrets.token_urlsafe(32)
     record: dict[str, Any] = {
         "clientId": "c-" + secrets.token_hex(12),
@@ -225,10 +240,13 @@ async def create_client(request: Request, body: OidcClientCreateRequest) -> Oidc
     return OidcClientCreated(client=_client_view(record), clientSecret=secret)
 
 
-@router.delete("/v1/oidc/clients/{client_id}", status_code=204)
-async def delete_client(request: Request, client_id: str) -> Response:
+@app_clients.delete("/v1/oidc/clients/{client_id}", status_code=204)
+async def delete_client(request: Request, client_id: str, op: ActingOperator) -> Response:
     machine = _active(request)
-    if client_id not in machine.state.oidc_clients:
+    record = machine.state.oidc_clients.get(client_id)
+    if record is None:
         raise problem(404, "No such app", "No app that signs in with Eugene has that id.")
+    if not op.may_name(record.get("owner")):
+        raise refuse_for_node(op, "remove sign-in")
     machine.append(OP_DELETE_OIDC_CLIENT, {"clientId": client_id})
     return Response(status_code=204)

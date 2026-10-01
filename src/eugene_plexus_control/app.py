@@ -403,5 +403,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Signing in with Eugene (C2): the provider's endpoints, and people.
     app.include_router(oidc_routes.router)
     app.include_router(people_routes.router)
+    app.include_router(people_routes.app_clients)
 
     return app

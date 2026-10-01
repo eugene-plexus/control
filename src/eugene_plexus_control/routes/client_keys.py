@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 from datetime import UTC, datetime
@@ -28,10 +29,17 @@ from ..applied import (
     ApplyError,
 )
 from ..client_admission import AdmissionClock, AdmissionRefusal, decide, validate_limits
-from ..dependencies import problem, require_key_policy, require_operator
+from ..dependencies import (
+    ActingOperator,
+    problem,
+    refuse_for_node,
+    require_key_policy,
+    require_operator,
+)
 from ..state_machine import StateMachine
 
 router = APIRouter(tags=["client keys"])
+log = logging.getLogger(__name__)
 
 
 def active(request: Request) -> StateMachine:
@@ -84,13 +92,18 @@ async def list_keys(request: Request) -> ClientKeyList:
     response_model=ClientKeyCreated,
     status_code=201,
     response_model_exclude_none=True,
-    dependencies=[Depends(require_operator)],
 )
-async def create_key(request: Request, body: ClientKeyCreateRequest) -> ClientKeyCreated:
+async def create_key(
+    request: Request,
+    body: ClientKeyCreateRequest,
+    op: ActingOperator,
+) -> ClientKeyCreated:
     machine = active(request)
     name = body.name.strip()
     if not name:
         raise problem(422, "Name required", "Give the key a name.")
+    if not op.may_name(name):
+        raise refuse_for_node(op, "make keys")
     issued = int(time.time())
     expires = issued + (body.ttlDays or 365) * 86400
     key_id = secrets.token_hex(16)
@@ -118,6 +131,8 @@ async def create_key(request: Request, body: ClientKeyCreateRequest) -> ClientKe
         limits=ClientKeyLimits.model_validate(limits),
     )
     machine.append(OP_PUT_CLIENT_KEY, {"key": key.model_dump(mode="json", exclude_none=True)})
+    if op.node is not None:
+        log.info("%s made key %r (id %s) for the operator acting on it", op.node, name, key_id)
     return ClientKeyCreated(key=key, token=token)
 
 
@@ -145,16 +160,18 @@ async def policy(request: Request, response: Response) -> ClientKeyPolicy:
     )
 
 
-@router.delete(
-    "/v1/auth/client-keys/{id}", status_code=204, dependencies=[Depends(require_operator)]
-)
-async def revoke_key(request: Request, id: str) -> None:
+@router.delete("/v1/auth/client-keys/{id}", status_code=204)
+async def revoke_key(request: Request, id: str, op: ActingOperator) -> None:
     machine = active(request)
     record = machine.state.client_keys.get(id)
     if record is None:
         raise problem(404, "No such key", "This key is not in the install's registry.")
+    if not op.may_name(record.get("name")):
+        raise refuse_for_node(op, "revoke keys")
     if not record.get("revokedAt"):
         machine.append(OP_REVOKE_CLIENT_KEY, {"id": id, "revokedAt": datetime.now(UTC).isoformat()})
+        if op.node is not None:
+            log.info("%s revoked key %r for the operator acting on it", op.node, record.get("name"))
 
 
 @router.put(
