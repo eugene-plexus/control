@@ -42,6 +42,8 @@ from eugene_plexus_control.app import create_app
 from eugene_plexus_control.applied import (
     ALL_OPS,
     OP_DELETE_COMPONENT,
+    OP_DELETE_OIDC_CLIENT,
+    OP_DELETE_PERSON,
     OP_DELETE_RUNTIME,
     OP_ENROLL_NODE,
     OP_PATCH_CONFIG,
@@ -49,12 +51,17 @@ from eugene_plexus_control.applied import (
     OP_PUT_CLIENT_ADMISSION,
     OP_PUT_CLIENT_KEY,
     OP_PUT_COMPONENT,
+    OP_PUT_OIDC_CLIENT,
+    OP_PUT_OIDC_KEY,
+    OP_PUT_PERSON,
     OP_PUT_RUNTIME,
     OP_REVOKE_CLIENT_KEY,
     OP_REVOKE_NODE,
     OP_REVOKE_SESSION,
+    OP_REVOKE_SIGN_IN,
     OP_ROTATE_SIGNING_KEY,
     OP_SET_CLIENT_KEY_LIMITS,
+    OP_SET_PERSON_PASSWORD,
     OP_UPDATE_NODE,
     AppliedState,
     ApplyError,
@@ -92,6 +99,13 @@ EXERCISED_OPS = {
     OP_ROTATE_SIGNING_KEY,
     OP_REVOKE_SESSION,
     OP_PROMOTE,
+    OP_PUT_PERSON,
+    OP_SET_PERSON_PASSWORD,
+    OP_DELETE_PERSON,
+    OP_PUT_OIDC_CLIENT,
+    OP_DELETE_OIDC_CLIENT,
+    OP_PUT_OIDC_KEY,
+    OP_REVOKE_SIGN_IN,
 }
 
 
@@ -304,7 +318,83 @@ def _write_history(machine: StateMachine) -> bytes:
         },
     )
     machine.append(OP_REVOKE_SESSION, {"jti": "signed-out", "exp": 2000000000, "prunedBefore": 0})
-    # A revocation as one entry: the rotation removes `shed` and its runtime.
+    # Signing in with Eugene (C2): people, an app, the sealed key, a revoked sign-in.
+    when = "2026-10-01T12:00:00+00:00"
+    verifier = security.hash_passphrase("a person's password")
+    for person_id, name in (("p-ada", "Ada"), ("p-bob", "Bob")):
+        machine.append(
+            OP_PUT_PERSON,
+            {
+                "person": {
+                    "id": person_id,
+                    "name": name,
+                    "passwordVerifier": verifier,
+                    "apps": None,
+                    "disabled": False,
+                    "createdAt": when,
+                    "passwordChangedAt": when,
+                }
+            },
+        )
+    machine.append(
+        OP_PUT_OIDC_CLIENT,
+        {
+            "client": {
+                "clientId": "app-one",
+                "name": "App one",
+                "secretVerifier": "0" * 64,
+                "redirectUris": ["http://127.0.0.1:9/callback"],
+                "createdAt": when,
+            }
+        },
+    )
+    machine.append(
+        OP_PUT_OIDC_CLIENT,
+        {
+            "client": {
+                "clientId": "app-two",
+                "name": "App two",
+                "secretVerifier": "1" * 64,
+                "redirectUris": ["http://127.0.0.1:9/two"],
+                "createdAt": when,
+            }
+        },
+    )
+    machine.append(
+        OP_PUT_PERSON,
+        {
+            "person": {
+                "id": "p-ada",
+                "name": "Ada",
+                "displayName": "Ada Lovelace",
+                "passwordVerifier": verifier,
+                "apps": ["app-one", "app-two"],
+                "disabled": True,
+                "createdAt": when,
+                "passwordChangedAt": when,
+            }
+        },
+    )
+    machine.append(
+        OP_SET_PERSON_PASSWORD,
+        {"id": "p-ada", "passwordVerifier": verifier, "passwordChangedAt": when},
+    )
+    machine.append(OP_DELETE_OIDC_CLIENT, {"clientId": "app-two"})
+    machine.append(OP_DELETE_PERSON, {"id": "p-bob"})
+    machine.append(
+        OP_PUT_OIDC_KEY,
+        {
+            "key": {
+                "kid": "k-1",
+                "sealedKey": placeholder("oidc-key"),
+                "publicJwk": {"kty": "RSA", "n": "AQAB", "e": "AQAB", "kid": "k-1"},
+                "createdAt": when,
+            }
+        },
+    )
+    machine.append(
+        OP_REVOKE_SIGN_IN, {"sid": "signed-in", "exp": 2000000000, "prunedBefore": 0}
+    )  # A revocation as one entry: the rotation removes `shed` and its runtime.
     machine.append(
         OP_ROTATE_SIGNING_KEY,
         {
@@ -652,6 +742,10 @@ def _genesis(machine: StateMachine) -> dict[str, Any]:
         "runtimes": [],
         "config": {},
         "clientKeys": [],
+        "people": [],
+        "oidcClients": [],
+        "oidcKeys": [],
+        "revokedSignIns": [],
         "signingKeyId": "1",
         "sealedSigningKey": placeholder("signing"),
     }

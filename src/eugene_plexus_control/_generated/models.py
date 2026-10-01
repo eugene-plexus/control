@@ -1531,6 +1531,11 @@ class StandbyStatus(BaseModel):
 
 class LogOp(StrEnum):
     """
+    **The seven sign-in operations (C2, 2026-10-01)** replicate people,
+    the apps that sign in, the provider's sealed RSA key and revoked
+    sign-ins, so a promoted standby signs people in as the old root
+    did and keeps refusing what it refused.
+
     The complete set of control-state mutations. Closed on purpose:
     **every change goes through one writer and one ordered path**, and
     an operation that is not in this list is an operation that would
@@ -1575,6 +1580,175 @@ class LogOp(StrEnum):
     rotateSigningKey = 'rotateSigningKey'
     revokeSession = 'revokeSession'
     promote = 'promote'
+    putPerson = 'putPerson'
+    setPersonPassword = 'setPersonPassword'
+    deletePerson = 'deletePerson'
+    putOidcClient = 'putOidcClient'
+    deleteOidcClient = 'deleteOidcClient'
+    putOidcKey = 'putOidcKey'
+    revokeSignIn = 'revokeSignIn'
+
+
+class SnapshotPerson(BaseModel):
+    id: str
+    name: str
+    displayName: str | None = None
+    passwordVerifier: str = Field(
+        ..., description="Argon2id, the passphrase's parameters."
+    )
+    apps: list[str] | None = None
+    disabled: bool
+    createdAt: AwareDatetime
+    passwordChangedAt: AwareDatetime
+
+
+class SnapshotOidcClient(BaseModel):
+    clientId: str
+    name: str
+    secretVerifier: str = Field(
+        ..., description='SHA-256 of the 32 random bytes of the secret, hex.'
+    )
+    redirectUris: list[str]
+    owner: str | None = None
+    createdAt: AwareDatetime
+
+
+class SnapshotOidcKey(BaseModel):
+    kid: str
+    sealedKey: str
+    publicJwk: dict[str, Any]
+    createdAt: AwareDatetime
+
+
+class Person(BaseModel):
+    """
+    Someone the operator lets sign in to apps (C2). Not an operator:
+    a person's sign-in opens their apps and nothing in the hub.
+
+    """
+
+    id: str = Field(..., description='Stable; the `sub` in their ID tokens.')
+    name: str = Field(
+        ..., description='What they sign in with. Unique, compared case-folded.'
+    )
+    displayName: str | None = None
+    apps: list[str] | None = Field(
+        None,
+        description='The `clientId`s they may sign in to. Null is every app on the install.',
+    )
+    disabled: bool
+    createdAt: AwareDatetime
+    passwordChangedAt: AwareDatetime
+
+
+class PersonList(BaseModel):
+    people: list[Person]
+    operatorName: str | None = Field(
+        None,
+        description='The name the owner signs in with, once the install has people.',
+    )
+
+
+class PersonCreateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(
+        ..., max_length=64, min_length=1, pattern='^[^\\s@][^@]*[^\\s@]$|^[^\\s@]$'
+    )
+    displayName: str | None = Field(None, max_length=120)
+    password: str = Field(..., max_length=1024, min_length=12)
+    apps: list[str] | None = None
+
+
+class PersonUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    displayName: str | None = Field(None, max_length=120)
+    apps: list[str] | None = None
+    disabled: bool | None = None
+
+
+class PersonPasswordRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    password: str = Field(..., max_length=1024, min_length=12)
+
+
+class OidcClient(BaseModel):
+    clientId: str
+    name: str
+    redirectUris: list[str]
+    owner: str | None = Field(
+        None,
+        description='`app:<id>@<node>` for an app the registry installed; absent for one the operator added.',
+    )
+    createdAt: AwareDatetime
+
+
+class OidcClientList(BaseModel):
+    clients: list[OidcClient]
+    issuer: str | None = Field(
+        None,
+        description='`oidcIssuer` when the operator set one; otherwise absent, and an app uses the address it reaches Eugene at, with `/oidc`.',
+    )
+
+
+class RedirectUri(RootModel[str]):
+    root: str = Field(..., max_length=2048, min_length=1)
+
+
+class OidcClientCreateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=80, min_length=1)
+    redirectUris: list[RedirectUri] = Field(..., max_length=20, min_length=1)
+    owner: str | None = Field(None, max_length=120)
+
+
+class OidcClientCreated(BaseModel):
+    client: OidcClient
+    clientSecret: str = Field(..., description='In this answer only.')
+
+
+class OidcDiscovery(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    issuer: str
+    authorization_endpoint: str
+    token_endpoint: str
+    userinfo_endpoint: str | None = None
+    revocation_endpoint: str | None = None
+    jwks_uri: str
+    response_types_supported: list[str] | None = None
+    id_token_signing_alg_values_supported: list[str] | None = None
+    code_challenge_methods_supported: list[str] | None = None
+
+
+class JsonWebKeySet(BaseModel):
+    keys: list[dict[str, Any]]
+
+
+class TokenType(StrEnum):
+    Bearer = 'Bearer'
+
+
+class OidcTokenResponse(BaseModel):
+    access_token: str
+    token_type: TokenType
+    expires_in: int
+    id_token: str
+    refresh_token: str | None = None
+    scope: str | None = None
+
+
+class OAuthError(BaseModel):
+    error: str
+    error_description: str | None = None
 
 
 class PromoteRequest(BaseModel):
@@ -2288,6 +2462,19 @@ class Snapshot(BaseModel):
     controlPublicKey: str | None = Field(
         None,
         description='The public half of the above, carried in the clear so a\nstandby can report the identity it would assume without\nholding the passphrase.\n',
+    )
+    people: list[SnapshotPerson] | None = Field(
+        None,
+        description='The people who may sign in to apps, as `putPerson`,\n`setPersonPassword` and `deletePerson` left them, with their\nArgon2id verifiers: as `passphraseVerifier` is here, and for the\nsame reason (a promoted standby signs people in).\n',
+    )
+    oidcClients: list[SnapshotOidcClient] | None = None
+    oidcKeys: list[SnapshotOidcKey] | None = Field(
+        None,
+        description="The provider's RSA keys, newest first, each sealed under the\npassphrase-derived key as `sealedSigningKey` is.\n",
+    )
+    revokedSignIns: list[RevokedSession] | None = Field(
+        None,
+        description='Sign-ins revoked at `/oidc/revoke` and not yet expired, by their `jti`.',
     )
 
 

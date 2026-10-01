@@ -218,6 +218,23 @@ FIELDS: list[ConfigField] = [
         enumValues=["DEBUG", "INFO", "WARNING", "ERROR"],
         requiresRestart=True,
     ),
+    ConfigField(
+        key="oidcIssuer",
+        label="Sign-in address for apps",
+        description=(
+            "The one address apps that sign in with Eugene are configured "
+            "with, ending in /oidc -- for example "
+            "http://192.168.1.5:8079/oidc. Set it when apps reach Eugene at "
+            "more than one address and their tokens must all name one."
+        ),
+        category="security",
+        valueType=ConfigValueType.url,
+        default=None,
+        unsetMeans=(
+            "The address the app reaches Eugene at, with /oidc: an app set up "
+            "with http://192.168.1.5:8079/oidc gets that one."
+        ),
+    ),
 ]
 
 # NOTE on what is NOT in this schema:

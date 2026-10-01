@@ -90,6 +90,20 @@ OP_REVOKE_CLIENT_KEY = "revokeClientKey"
 OP_SET_CLIENT_KEY_LIMITS = "setClientKeyLimits"
 OP_PUT_CLIENT_ADMISSION = "putClientAdmission"
 OP_REVOKE_SESSION = "revokeSession"
+# Signing in with Eugene (C2, docs/design/sign-in-with-eugene.md).
+OP_PUT_PERSON = "putPerson"
+OP_SET_PERSON_PASSWORD = "setPersonPassword"
+OP_DELETE_PERSON = "deletePerson"
+OP_PUT_OIDC_CLIENT = "putOidcClient"
+OP_DELETE_OIDC_CLIENT = "deleteOidcClient"
+OP_PUT_OIDC_KEY = "putOidcKey"
+OP_REVOKE_SIGN_IN = "revokeSignIn"
+
+#: The owner's name on the sign-in page, which no person may take.
+OPERATOR_NAME = "operator"
+#: Provider keys kept: the current one and the one before it, so tokens
+#: signed just before a rotation still verify until they expire.
+OIDC_KEYS_KEPT = 2
 
 ALL_OPS: frozenset[str] = frozenset(
     {
@@ -108,6 +122,13 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_SET_CLIENT_KEY_LIMITS,
         OP_PUT_CLIENT_ADMISSION,
         OP_REVOKE_SESSION,
+        OP_PUT_PERSON,
+        OP_SET_PERSON_PASSWORD,
+        OP_DELETE_PERSON,
+        OP_PUT_OIDC_CLIENT,
+        OP_DELETE_OIDC_CLIENT,
+        OP_PUT_OIDC_KEY,
+        OP_REVOKE_SIGN_IN,
     }
 )
 
@@ -321,6 +342,18 @@ class AppliedState:
     Replicated because the trust bundle every machine checks sessions
     against is built from applied state: a sign-out a standby had not
     seen would be a session a promotion brought back."""
+    people: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """People who may sign in to apps (C2), by id, as `SnapshotPerson`:
+    their Argon2id verifiers included, for the reason `passphraseVerifier`
+    is replicated -- a promoted standby signs them in."""
+    oidc_clients: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """Apps that sign in with Eugene, by `clientId`, as `SnapshotOidcClient`."""
+    oidc_keys: tuple[dict[str, Any], ...] = ()
+    """The provider's RSA keys, newest first, each sealed under the master
+    key as `sealedSigningKey` is. At most `OIDC_KEYS_KEPT`."""
+    revoked_sign_ins: dict[str, int] = field(default_factory=dict)
+    """Sign-ins revoked at `/oidc/revoke`, `sid -> exp`, as `revokeSession`
+    keeps sessions."""
 
 
 # --------------------------------------------------------------------------- #
@@ -710,6 +743,176 @@ def _apply_revoke_client_key(
     return replace(state, client_keys={**state.client_keys, key_id: record})
 
 
+# --------------------------------------------------------------------------- #
+# signing in with Eugene (C2)
+# --------------------------------------------------------------------------- #
+
+
+def _timestamp(raw: dict[str, Any], key: str, what: str, *, optional: bool = False) -> None:
+    from datetime import datetime
+
+    value = raw.get(key)
+    if value is None and optional:
+        return
+    if not isinstance(value, str):
+        raise ApplyError(f"invalid {what} {key}")
+    try:
+        if datetime.fromisoformat(value).utcoffset() is None:
+            raise ValueError("timezone missing")
+    except ValueError as exc:
+        raise ApplyError(f"invalid {what} {key}") from exc
+
+
+def _person_record(raw: Any) -> dict[str, Any]:
+    """One `SnapshotPerson`, checked as a client-key record is: exactly the
+    fields the schema has, so nothing else can ride into the log."""
+    if not isinstance(raw, dict):
+        raise ApplyError("person record must be an object")
+    allowed = {
+        "id",
+        "name",
+        "displayName",
+        "passwordVerifier",
+        "apps",
+        "disabled",
+        "createdAt",
+        "passwordChangedAt",
+    }
+    if raw.keys() - allowed:
+        raise ApplyError("unexpected person property")
+    for key in ("id", "name", "passwordVerifier"):
+        if not isinstance(raw.get(key), str) or not raw[key]:
+            raise ApplyError(f"invalid person {key}")
+    if not raw["passwordVerifier"].startswith("$argon2id$"):
+        raise ApplyError("a person's verifier must be Argon2id")
+    if raw["name"].casefold() == OPERATOR_NAME:
+        raise ApplyError(f"{OPERATOR_NAME!r} is the owner's name")
+    if raw.get("displayName") is not None and not isinstance(raw["displayName"], str):
+        raise ApplyError("invalid person displayName")
+    apps = raw.get("apps")
+    if apps is not None and (
+        not isinstance(apps, list) or any(not isinstance(a, str) or not a for a in apps)
+    ):
+        raise ApplyError("invalid person apps")
+    if not isinstance(raw.get("disabled"), bool):
+        raise ApplyError("invalid person disabled")
+    _timestamp(raw, "createdAt", "person")
+    _timestamp(raw, "passwordChangedAt", "person")
+    return dict(raw)
+
+
+def _apply_put_person(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    """Add a person or replace one, by id. A name is unique, case-folded."""
+    record = _person_record(payload.get("person"))
+    folded = record["name"].casefold()
+    for other in state.people.values():
+        if other["id"] != record["id"] and other["name"].casefold() == folded:
+            raise ApplyError(f"entry {index}: the name {record['name']!r} is taken")
+    return replace(state, people={**state.people, record["id"]: record})
+
+
+def _apply_set_person_password(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    person_id = payload.get("id")
+    if person_id not in state.people:
+        raise ApplyError(f"entry {index}: unknown person")
+    record = _person_record(
+        {
+            **state.people[person_id],
+            "passwordVerifier": payload.get("passwordVerifier"),
+            "passwordChangedAt": payload.get("passwordChangedAt"),
+        }
+    )
+    return replace(state, people={**state.people, person_id: record})
+
+
+def _apply_delete_person(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    person_id = payload.get("id")
+    if person_id not in state.people:
+        raise ApplyError(f"entry {index}: unknown person")
+    return replace(state, people={k: v for k, v in state.people.items() if k != person_id})
+
+
+def _oidc_client_record(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ApplyError("sign-in client record must be an object")
+    if raw.keys() - {"clientId", "name", "secretVerifier", "redirectUris", "owner", "createdAt"}:
+        raise ApplyError("unexpected sign-in client property")
+    for key in ("clientId", "name", "secretVerifier"):
+        if not isinstance(raw.get(key), str) or not raw[key]:
+            raise ApplyError(f"invalid sign-in client {key}")
+    uris = raw.get("redirectUris")
+    if not isinstance(uris, list) or not uris or any(not isinstance(u, str) or not u for u in uris):
+        raise ApplyError("invalid sign-in client redirectUris")
+    if raw.get("owner") is not None and not isinstance(raw["owner"], str):
+        raise ApplyError("invalid sign-in client owner")
+    _timestamp(raw, "createdAt", "sign-in client")
+    return dict(raw)
+
+
+def _apply_put_oidc_client(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    record = _oidc_client_record(payload.get("client"))
+    if record["clientId"] in state.oidc_clients:
+        raise ApplyError(f"entry {index}: that client id already exists")
+    return replace(state, oidc_clients={**state.oidc_clients, record["clientId"]: record})
+
+
+def _apply_delete_oidc_client(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    client_id = payload.get("clientId")
+    if client_id not in state.oidc_clients:
+        raise ApplyError(f"entry {index}: unknown sign-in client")
+    # A person's list of apps keeps no id of an app that is gone.
+    people = {
+        key: (
+            {**person, "apps": [a for a in person["apps"] if a != client_id]}
+            if isinstance(person.get("apps"), list)
+            else person
+        )
+        for key, person in state.people.items()
+    }
+    clients = {k: v for k, v in state.oidc_clients.items() if k != client_id}
+    return replace(state, oidc_clients=clients, people=people)
+
+
+def _oidc_key_record(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict) or raw.keys() - {"kid", "sealedKey", "publicJwk", "createdAt"}:
+        raise ApplyError("invalid sign-in key record")
+    for key in ("kid", "sealedKey"):
+        if not isinstance(raw.get(key), str) or not raw[key]:
+            raise ApplyError(f"invalid sign-in key {key}")
+    jwk = raw.get("publicJwk")
+    if not isinstance(jwk, dict) or jwk.get("kty") != "RSA" or "d" in jwk:
+        raise ApplyError("a sign-in key's public JWK must be RSA, and public")
+    _timestamp(raw, "createdAt", "sign-in key")
+    return dict(raw)
+
+
+def _apply_put_oidc_key(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    record = _oidc_key_record(payload.get("key"))
+    if any(k["kid"] == record["kid"] for k in state.oidc_keys):
+        raise ApplyError(f"entry {index}: that sign-in key is already here")
+    return replace(state, oidc_keys=(record, *state.oidc_keys)[:OIDC_KEYS_KEPT])
+
+
+def _apply_revoke_sign_in(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    """As `revokeSession`, for a sign-in at `/oidc/revoke`."""
+    sid = _require_str(payload, "sid", index)
+    exp = payload.get("exp")
+    pruned = payload.get("prunedBefore", 0)
+    if not isinstance(exp, int) or isinstance(exp, bool):
+        raise ApplyError(f"entry {index}: 'exp' must be an integer")
+    if not isinstance(pruned, int) or isinstance(pruned, bool):
+        raise ApplyError(f"entry {index}: 'prunedBefore' must be an integer")
+    kept = {k: v for k, v in state.revoked_sign_ins.items() if v >= pruned}
+    kept[sid] = exp
+    return replace(state, revoked_sign_ins=kept)
+
+
 _Handler = Callable[["AppliedState", dict[str, Any], int], "AppliedState"]
 
 _HANDLERS: dict[str, _Handler] = {
@@ -728,6 +931,13 @@ _HANDLERS: dict[str, _Handler] = {
     OP_SET_CLIENT_KEY_LIMITS: _apply_set_client_key_limits,
     OP_PUT_CLIENT_ADMISSION: _apply_put_client_admission,
     OP_REVOKE_SESSION: _apply_revoke_session,
+    OP_PUT_PERSON: _apply_put_person,
+    OP_SET_PERSON_PASSWORD: _apply_set_person_password,
+    OP_DELETE_PERSON: _apply_delete_person,
+    OP_PUT_OIDC_CLIENT: _apply_put_oidc_client,
+    OP_DELETE_OIDC_CLIENT: _apply_delete_oidc_client,
+    OP_PUT_OIDC_KEY: _apply_put_oidc_key,
+    OP_REVOKE_SIGN_IN: _apply_revoke_sign_in,
 }
 
 
@@ -799,6 +1009,12 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
         "controlPublicKey": identity.controlPublicKey,
         "sealedRecoveryKey": identity.sealedRecoveryKey,
         "signingKeyId": identity.signingKeyId,
+        "people": [state.people[key] for key in sorted(state.people)],
+        "oidcClients": [state.oidc_clients[key] for key in sorted(state.oidc_clients)],
+        "oidcKeys": [dict(k) for k in state.oidc_keys],
+        "revokedSignIns": [
+            {"jti": sid, "exp": exp} for sid, exp in sorted(state.revoked_sign_ins.items())
+        ],
     }
 
 
@@ -872,6 +1088,12 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         client_admission=validate_ledger(raw.get("clientAdmission")),
         client_keys=_key_records(raw.get("clientKeys", [])),
         revoked_sessions={str(r["jti"]): int(r["exp"]) for r in raw.get("revokedSessions") or []},
+        people={(p := _person_record(item))["id"]: p for item in raw.get("people") or []},
+        oidc_clients={
+            (c := _oidc_client_record(item))["clientId"]: c for item in raw.get("oidcClients") or []
+        },
+        oidc_keys=tuple(_oidc_key_record(item) for item in raw.get("oidcKeys") or []),
+        revoked_sign_ins={str(r["jti"]): int(r["exp"]) for r in raw.get("revokedSignIns") or []},
         identity=InstallIdentity(
             salt=raw.get("salt"),
             passphraseVerifier=raw.get("passphraseVerifier"),

@@ -44,6 +44,8 @@ from .routes import config as config_routes
 from .routes import control as control_routes
 from .routes import health as health_routes
 from .routes import nodes as node_routes
+from .routes import oidc as oidc_routes
+from .routes import people as people_routes
 from .routes import topology as topology_routes
 from .routes.nodes import service_token_for
 from .settings import Settings, load_settings
@@ -201,6 +203,9 @@ def _auto_unlock(app: FastAPI, machine: StateMachine) -> None:
         # raises for an unreadable signing key. At startup that is not
         # an HTTP concern, it is a locked root.
         app.state.auth_state.forget_master_key()
+        # ...and the sign-in key unsealed from it (C2).
+        if getattr(app.state, "oidc", None) is not None:
+            app.state.oidc.forget()
         keyring_store.delete_master_key(install_id)
         log.error(
             "the key stored in the OS keyring did not open this install's sealed values "
@@ -256,6 +261,9 @@ def _auto_unlock_from_file(app: FastAPI, machine: StateMachine, path: Path | Non
         auth_routes.unseal_into(app.state.auth_state, machine, passphrase)
     except Exception as exc:
         app.state.auth_state.forget_master_key()
+        # ...and the sign-in key unsealed from it (C2).
+        if getattr(app.state, "oidc", None) is not None:
+            app.state.oidc.forget()
         log.error(
             "the passphrase in %s verified but did not open this install's sealed values "
             "(%s); the root stays locked and the file is left alone.",
@@ -392,5 +400,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(topology_routes.router)
     app.include_router(config_routes.router)
     app.include_router(admin_routes.router)
+    # Signing in with Eugene (C2): the provider's endpoints, and people.
+    app.include_router(oidc_routes.router)
+    app.include_router(people_routes.router)
 
     return app

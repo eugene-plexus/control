@@ -49,6 +49,9 @@ dependencies = [
     "pyjwt[crypto]>=2.10,<3",             # session/service token sign + verify
     "pynacl>=1.5,<2",             # secretbox at rest, sealed boxes per node
     "keyring>=25.5,<26",          # OS Credential Manager / Keychain / Secret Service
+    # C2: the sign-in page and the token endpoint read form posts, as
+    # OpenID Connect sends them.
+    "python-multipart>=0.0.20,<0.1",
 ]
 
 [project.optional-dependencies]
