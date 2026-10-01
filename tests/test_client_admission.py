@@ -234,3 +234,20 @@ def test_an_account_pattern_admits_its_models_and_nothing_else():
             now=1.0,
         )
     assert caught.value.status == 403
+
+
+def test_a_key_that_may_send_logs_says_so_to_the_ingress(active_client):
+    """C1: an app's key is minted at the root with `writeLogs`, and the
+    agent's log ingress asks the root about it with `check`."""
+    key = mint(active_client, writeLogs=True)["key"]
+    assert key["limits"]["writeLogs"] is True
+    answer = call(active_client, key["id"], "check", model=None)
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["limits"]["writeLogs"] is True
+    plain = mint(active_client)["key"]
+    # The response fills in the default, as it does for localOnly.
+    assert plain["limits"].get("writeLogs") in (None, False)
+    answer = call(active_client, plain["id"], "check", model=None)
+    assert answer.json()["limits"].get("writeLogs") is not True
+    with pytest.raises(ValueError):
+        admission.validate_limits({"writeLogs": 1})
