@@ -59,9 +59,15 @@ def _request_id(page: str) -> str:
 
 
 def _sign_in(
-    c: TestClient, client_id: str, password: str, name: str | None = None, **extra: str
+    c: TestClient,
+    client_id: str,
+    password: str,
+    name: str | None = None,
+    *,
+    scope: str = "openid profile",
+    **extra: str,
 ) -> Any:
-    page = _authorize(c, client_id)
+    page = _authorize(c, client_id, scope=scope)
     data = {"request": _request_id(page.text), "password": password, **extra}
     if name is not None:
         data["name"] = name
@@ -69,9 +75,14 @@ def _sign_in(
 
 
 def _tokens(
-    c: TestClient, made: dict[str, Any], *, name: str | None = None, password: str = PASSPHRASE
+    c: TestClient,
+    made: dict[str, Any],
+    *,
+    name: str | None = None,
+    password: str = PASSPHRASE,
+    scope: str = "openid profile",
 ) -> dict[str, Any]:
-    answer = _sign_in(c, made["client"]["clientId"], password, name)
+    answer = _sign_in(c, made["client"]["clientId"], password, name, scope=scope)
     assert answer.status_code == 302, answer.text
     code = parse_qs(urlsplit(answer.headers["location"]).query)["code"][0]
     exchanged = c.post(
@@ -646,3 +657,104 @@ def test_the_page_text_meets_the_contrast_minimum(scheme: str) -> None:
         ("error", "panel"),
     ):
         assert _contrast(token(fg), token(bg)) >= 4.5, (scheme, fg, bg)
+
+
+# --------------------------------------------------------------------- #
+# an email for each person (C4)
+# --------------------------------------------------------------------- #
+
+
+def _id_claims(issued: dict[str, Any]) -> dict[str, Any]:
+    import jwt
+
+    claims: dict[str, Any] = jwt.decode(issued["id_token"], options={"verify_signature": False})
+    return claims
+
+
+def _userinfo(c: TestClient, issued: dict[str, Any]) -> dict[str, Any]:
+    answer = c.get("/oidc/userinfo", headers={"Authorization": f"Bearer {issued['access_token']}"})
+    assert answer.status_code == 200, answer.text
+    body: dict[str, Any] = answer.json()
+    return body
+
+
+def test_an_email_reaches_an_app_only_with_the_email_scope_and_never_as_verified(
+    active_client: TestClient,
+) -> None:
+    made = _client(active_client)
+    active_client.post(
+        "/v1/people", json={"name": "Ada", "password": FIRST, "email": "ada@example.org"}
+    )
+    asked = _tokens(active_client, made, name="Ada", password=FIRST, scope="openid email profile")
+    for claims in (_id_claims(asked), _userinfo(active_client, asked)):
+        assert claims["email"] == "ada@example.org"
+        assert claims["email_verified"] is False, "Eugene sends no mail and proves nothing"
+    assert asked["scope"] == "openid profile email"
+    plain = _tokens(active_client, made, name="Ada", password=FIRST)
+    for claims in (_id_claims(plain), _userinfo(active_client, plain)):
+        assert "email" not in claims and "email_verified" not in claims
+
+
+def test_without_an_email_nothing_stands_in_for_one(active_client: TestClient) -> None:
+    made = _client(active_client)
+    active_client.post("/v1/people", json={"name": "Bo", "password": FIRST})
+    issued = _tokens(active_client, made, name="Bo", password=FIRST, scope="openid email")
+    assert "email" not in _id_claims(issued)
+    assert "email" not in _userinfo(active_client, issued)
+
+
+def test_a_scope_eugene_does_not_know_is_ignored_and_discovery_names_email(
+    active_client: TestClient,
+) -> None:
+    made = _client(active_client)
+    issued = _tokens(active_client, made, scope="openid groups email")
+    assert issued["scope"] == "openid email"
+    found = active_client.get("/oidc/.well-known/openid-configuration").json()
+    assert found["scopes_supported"] == ["openid", "profile", "email"]
+    assert {"email", "email_verified"} <= set(found["claims_supported"])
+
+
+def test_two_people_cannot_share_an_email_in_any_case(active_client: TestClient) -> None:
+    ada = active_client.post(
+        "/v1/people", json={"name": "Ada", "password": FIRST, "email": "Ada@Example.org"}
+    ).json()
+    taken = active_client.post(
+        "/v1/people", json={"name": "Bo", "password": FIRST, "email": "ada@example.ORG"}
+    )
+    assert taken.status_code == 409 and "email" in taken.json()["detail"]["title"]
+    bo = active_client.post(
+        "/v1/people", json={"name": "Bo", "password": FIRST, "email": "bo@example.org"}
+    ).json()
+    moved = active_client.patch(f"/v1/people/{bo['id']}", json={"email": "ADA@example.org"})
+    assert moved.status_code == 409
+    kept = active_client.patch(f"/v1/people/{ada['id']}", json={"email": "ada@example.org"})
+    assert kept.status_code == 200, "a person may keep their own address"
+    cleared = active_client.patch(f"/v1/people/{ada['id']}", json={"email": None})
+    assert cleared.status_code == 200 and "email" not in cleared.json()
+    reused = active_client.patch(f"/v1/people/{bo['id']}", json={"email": "ada@example.org"})
+    assert reused.status_code == 200 and reused.json()["email"] == "ada@example.org"
+
+
+def test_an_email_that_is_not_one_is_refused(active_client: TestClient) -> None:
+    refused = active_client.post(
+        "/v1/people", json={"name": "Cy", "password": FIRST, "email": "not an address"}
+    )
+    assert refused.status_code == 422
+
+
+def test_the_log_carries_an_email_and_refuses_a_bad_one() -> None:
+    from eugene_plexus_control import applied
+
+    record = {
+        "id": "p1",
+        "name": "Ada",
+        "email": "ada@example.org",
+        "passwordVerifier": "$argon2id$v=19$m=65536,t=3,p=4$x$y",
+        "apps": None,
+        "disabled": False,
+        "createdAt": "2026-10-01T00:00:00+00:00",
+        "passwordChangedAt": "2026-10-01T00:00:00+00:00",
+    }
+    assert applied._person_record(dict(record))["email"] == "ada@example.org"
+    with pytest.raises(applied.ApplyError, match="email"):
+        applied._person_record({**record, "email": 7})

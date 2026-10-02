@@ -772,6 +772,7 @@ def _person_record(raw: Any) -> dict[str, Any]:
         "id",
         "name",
         "displayName",
+        "email",
         "passwordVerifier",
         "apps",
         "disabled",
@@ -789,6 +790,9 @@ def _person_record(raw: Any) -> dict[str, Any]:
         raise ApplyError(f"{OPERATOR_NAME!r} is the owner's name")
     if raw.get("displayName") is not None and not isinstance(raw["displayName"], str):
         raise ApplyError("invalid person displayName")
+    email = raw.get("email")
+    if email is not None and (not isinstance(email, str) or "@" not in email):
+        raise ApplyError("invalid person email")
     apps = raw.get("apps")
     if apps is not None and (
         not isinstance(apps, list) or any(not isinstance(a, str) or not a for a in apps)

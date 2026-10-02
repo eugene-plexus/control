@@ -1593,6 +1593,7 @@ class SnapshotPerson(BaseModel):
     id: str
     name: str
     displayName: str | None = None
+    email: str | None = None
     passwordVerifier: str = Field(
         ..., description="Argon2id, the passphrase's parameters."
     )
@@ -1632,6 +1633,10 @@ class Person(BaseModel):
         ..., description='What they sign in with. Unique, compared case-folded.'
     )
     displayName: str | None = None
+    email: str | None = Field(
+        None,
+        description='Optional, and unique compared case-folded. Given to an app that\nasks for the `email` scope, with `email_verified: false`: Eugene\nsends no mail and has proved nothing about it. Some apps (Open\nWebUI) identify people by it (C4).\n',
+    )
     apps: list[str] | None = Field(
         None,
         description='The `clientId`s they may sign in to. Null is every app on the install.',
@@ -1657,6 +1662,7 @@ class PersonCreateRequest(BaseModel):
         ..., max_length=64, min_length=1, pattern='^[^\\s@][^@]*[^\\s@]$|^[^\\s@]$'
     )
     displayName: str | None = Field(None, max_length=120)
+    email: str | None = Field(None, max_length=254, pattern='^[^@\\s]+@[^@\\s]+$')
     password: str = Field(..., max_length=1024, min_length=12)
     apps: list[str] | None = None
 
@@ -1666,6 +1672,12 @@ class PersonUpdateRequest(BaseModel):
         extra='forbid',
     )
     displayName: str | None = Field(None, max_length=120)
+    email: str | None = Field(
+        None,
+        description='A new address, or `null` to clear it.',
+        max_length=254,
+        pattern='^[^@\\s]+@[^@\\s]+$',
+    )
     apps: list[str] | None = None
     disabled: bool | None = None
 

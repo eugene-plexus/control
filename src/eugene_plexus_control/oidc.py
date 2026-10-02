@@ -143,13 +143,20 @@ class Subject:
     name: str
     preferred_username: str
     role: str  # "operator" | "member"
+    email: str | None = None
 
-    def claims(self) -> dict[str, Any]:
-        return {
+    def claims(self, scope: str) -> dict[str, Any]:
+        """What an app is told about them. The address only with the
+        `email` scope, and never as verified: Eugene sends no mail (C4)."""
+        claims: dict[str, Any] = {
             "name": self.name,
             "preferred_username": self.preferred_username,
             "eugene_role": self.role,
         }
+        if self.email and "email" in scope.split():
+            claims["email"] = self.email
+            claims["email_verified"] = False
+        return claims
 
 
 OWNER = Subject(sub=OPERATOR_NAME, name="Owner", preferred_username=OPERATOR_NAME, role="operator")
@@ -161,6 +168,7 @@ def subject_of(person: dict[str, Any]) -> Subject:
         name=person.get("displayName") or person["name"],
         preferred_username=person["name"],
         role="member",
+        email=person.get("email"),
     )
 
 
@@ -341,7 +349,7 @@ def token_response(
         "jti": secrets.token_urlsafe(12),
         "auth_time": int(auth_at),
         "azp": client_id,
-        **subject.claims(),
+        **subject.claims(scope),
     }
     if nonce is not None:
         id_claims["nonce"] = nonce

@@ -36,6 +36,15 @@ router = APIRouter(tags=["oidc"])
 
 _NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
+#: The scopes honoured, in the order a granted scope lists them. Anything
+#: else asked for is ignored rather than refused (OIDC Core 3.1.2.1).
+GRANTED_SCOPES = ("openid", "profile", "email")
+
+
+def _granted_scope(asked: str) -> str:
+    wanted = set(asked.split())
+    return " ".join(s for s in GRANTED_SCOPES if s in wanted)
+
 
 def _provider(request: Request) -> oidc.Provider:
     provider = getattr(request.app.state, "oidc", None)
@@ -144,7 +153,7 @@ async def discovery(request: Request) -> JSONResponse:
             "token_endpoint_auth_methods_supported": ["client_secret_basic"],
             "revocation_endpoint_auth_methods_supported": ["client_secret_basic"],
             "code_challenge_methods_supported": ["S256"],
-            "scopes_supported": ["openid", "profile"],
+            "scopes_supported": list(GRANTED_SCOPES),
             "claims_supported": [
                 "sub",
                 "iss",
@@ -157,6 +166,8 @@ async def discovery(request: Request) -> JSONResponse:
                 "name",
                 "preferred_username",
                 "eugene_role",
+                "email",
+                "email_verified",
             ],
             "authorization_response_iss_parameter_supported": True,
             "request_parameter_supported": False,
@@ -242,7 +253,7 @@ async def authorize(request: Request) -> Response:
             state=q["state"],
             nonce=q["nonce"],
             challenge=challenge,
-            scope="openid profile" if "profile" in q["scope"].split() else "openid",
+            scope=_granted_scope(q["scope"]),
             issuer=issuer,
             expires=time.time() + oidc.REQUEST_TTL_SECONDS,
         )
@@ -514,7 +525,8 @@ async def userinfo(request: Request) -> JSONResponse:
             status_code=401,
             headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
         )
-    return JSONResponse({"sub": subject.sub, **subject.claims()}, headers=_NO_STORE)
+    scope = str(claims.get("scope") or "openid")
+    return JSONResponse({"sub": subject.sub, **subject.claims(scope)}, headers=_NO_STORE)
 
 
 @router.post("/oidc/revoke", operation_id="oidcRevoke")

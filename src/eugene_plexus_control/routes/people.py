@@ -93,6 +93,22 @@ def _check_name(machine: StateMachine, name: str, *, except_id: str | None = Non
     return name
 
 
+def _check_email(
+    machine: StateMachine, email: str | None, *, except_id: str | None = None
+) -> str | None:
+    """An address, or None. Unique compared case-folded: an app that knows
+    people by it (Open WebUI) refuses a second person with the same one."""
+    email = (email or "").strip()
+    if not email:
+        return None
+    if any(
+        (p.get("email") or "").casefold() == email.casefold() and p["id"] != except_id
+        for p in machine.state.people.values()
+    ):
+        raise problem(409, "That email is taken", f"Someone on this install already has {email!r}.")
+    return email
+
+
 def _check_apps(machine: StateMachine, apps: list[str] | None) -> list[str] | None:
     if apps is None:
         return None
@@ -127,6 +143,9 @@ async def create_person(request: Request, body: PersonCreateRequest) -> Person:
     }
     if body.displayName and body.displayName.strip():
         record["displayName"] = body.displayName.strip()
+    email = _check_email(machine, body.email)
+    if email:
+        record["email"] = email
     machine.append(OP_PUT_PERSON, {"person": record})
     return _view(machine.state.people[record["id"]])
 
@@ -142,6 +161,12 @@ async def update_person(request: Request, person_id: str, body: PersonUpdateRequ
             record["displayName"] = display
         else:
             record.pop("displayName", None)
+    if "email" in changes:
+        email = _check_email(machine, changes["email"], except_id=person_id)
+        if email:
+            record["email"] = email
+        else:
+            record.pop("email", None)
     if "apps" in changes:
         record["apps"] = _check_apps(machine, changes["apps"])
     if "disabled" in changes and changes["disabled"] is not None:
