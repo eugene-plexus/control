@@ -22,13 +22,12 @@ from .._generated.models import (
     ClientKeyUpdateRequest,
 )
 from ..applied import (
-    OP_PUT_CLIENT_ADMISSION,
     OP_PUT_CLIENT_KEY,
     OP_REVOKE_CLIENT_KEY,
     OP_SET_CLIENT_KEY_LIMITS,
     ApplyError,
 )
-from ..client_admission import AdmissionClock, AdmissionRefusal, decide, validate_limits
+from ..client_admission import AdmissionClock, AdmissionRefusal, validate_limits
 from ..dependencies import (
     ActingOperator,
     problem,
@@ -36,7 +35,7 @@ from ..dependencies import (
     require_key_policy,
     require_operator,
 )
-from ..state_machine import StateMachine
+from ..state_machine import NotActive, StateMachine
 
 router = APIRouter(tags=["client keys"])
 log = logging.getLogger(__name__)
@@ -206,24 +205,15 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
         if clock is None:
             clock = AdmissionClock(ledger["clock"])
             request.app.state.admission_clock = clock
-        result, candidate = decide(
-            ledger,
-            machine.state.client_keys.get(body.keyId),
-            key_id=body.keyId,
-            action=body.action.value,
-            request_id=body.requestId,
-            model=body.model,
-            now=clock.now(ledger["clock"]),
-        )
-        if candidate is not None:
-            machine.append(
-                OP_PUT_CLIENT_ADMISSION,
-                {
-                    "clock": candidate["clock"],
-                    "keyId": body.keyId,
-                    "bucket": candidate["buckets"].get(body.keyId, {}),
-                },
+        result = await request.app.state.admission_worker.run(
+            lambda: machine.admit(
+                clock=clock,
+                key_id=body.keyId,
+                action=body.action.value,
+                request_id=body.requestId,
+                model=body.model,
             )
+        )
         return ClientAdmissionResult.model_validate(result)
     except AdmissionRefusal as exc:
         raise HTTPException(
@@ -231,7 +221,7 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
             detail=exc.detail,
             headers={"Retry-After": str(exc.retry)} if exc.retry else None,
         ) from exc
-    except (OSError, ValueError, ApplyError) as exc:
+    except (OSError, ValueError, ApplyError, NotActive) as exc:
         raise problem(
             503, "Admission unavailable", "The authority could not commit admission state."
         ) from exc

@@ -1,5 +1,8 @@
 """A5: one durable allowance shared by every gateway using the registry."""
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from eugene_plexus_control import client_admission as admission
@@ -122,6 +125,41 @@ def test_failed_commit_does_not_grant_admission(active_client, monkeypatch):
     monkeypatch.setattr(c.app.state.machine._store, "append", fail)
     assert call(c, key, "acquire").status_code == 503
     assert c.app.state.machine.state.client_admission == before
+
+
+def test_slow_admission_disk_does_not_block_health(active_client, monkeypatch):
+    c = active_client
+    key = mint(c)["key"]["id"]
+    entered, release = threading.Event(), threading.Event()
+    original = c.app.state.machine._store.append
+
+    def slow(entry):
+        entered.set()
+        assert release.wait(5)
+        return original(entry)
+
+    monkeypatch.setattr(c.app.state.machine._store, "append", slow)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(call, c, key, "acquire")
+        assert entered.wait(2)
+        timer = threading.Timer(1, release.set)
+        timer.start()
+        try:
+            response = c.get("/healthz")
+            assert response.status_code == 200
+            assert not release.is_set(), "health waited for admission fsync"
+        finally:
+            release.set()
+            timer.cancel()
+        assert pending.result(timeout=2).status_code == 200
+
+
+def test_concurrent_acquires_share_one_atomic_allowance(active_client):
+    c = active_client
+    key = mint(c, maxConcurrentRequests=1)["key"]["id"]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(lambda i: call(c, key, "acquire", f"parallel-{i}"), range(8)))
+    assert sorted(r.status_code for r in responses) == [200] + [429] * 7
 
 
 def test_admission_and_edit_audiences(active_client):

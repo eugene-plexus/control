@@ -85,10 +85,10 @@ class ReplicationPosition:
 class StateMachine:
     """Applied state, the log, and the rule that only one thing writes.
 
-    Holds a single lock. Reads take it too, briefly, so a caller can
-    never observe state between "durable" and "applied" — a window that
-    would let `GET /v1/nodes` return a node the log does not yet
-    describe.
+    A single lock serializes durable mutations. Ordinary reads observe the
+    immutable last committed snapshot without waiting for fsync; operations
+    that need a multi-field snapshot still acquire the lock. Publication follows
+    the durable append, so readers cannot see uncommitted state.
     """
 
     def __init__(
@@ -136,30 +136,60 @@ class StateMachine:
 
     @property
     def state(self) -> AppliedState:
-        with self._lock:
-            return self._state
+        # apply() builds an immutable candidate and append publishes it only
+        # after fsync. A reader can safely keep the previous committed snapshot
+        # while the writer waits for disk, without blocking the HTTP event loop.
+        return self._state
 
     @property
     def role(self) -> str:
-        with self._lock:
-            return self._role
+        return self._role
 
     @property
     def is_active(self) -> bool:
-        with self._lock:
-            return self._role == ROLE_ACTIVE
+        return self._role == ROLE_ACTIVE
 
     @property
     def dropped_tail_lines(self) -> int:
         """Non-zero after an unclean kill. Surfaced on `/healthz` so an
         operator learns about it from the dashboard rather than from the
         logs of a process that has since restarted."""
-        with self._lock:
-            return self._dropped_tail_lines
+        return self._dropped_tail_lines
 
     def position(self) -> ReplicationPosition:
+        state = self._state
+        return ReplicationPosition(applied_index=state.index, epoch=state.epoch)
+
+    def admit(
+        self, *, clock: Any, key_id: str, action: str, request_id: str, model: str | None
+    ) -> dict[str, Any]:
+        """Read, decide and commit under one lock, including policy edits."""
+        from .applied import OP_PUT_CLIENT_ADMISSION
+        from .client_admission import decide
+
         with self._lock:
-            return ReplicationPosition(applied_index=self._state.index, epoch=self._state.epoch)
+            if self._role != ROLE_ACTIVE:
+                raise NotActive("Contact the active control root for admission.")
+            ledger = self._state.client_admission
+            result, candidate = decide(
+                ledger,
+                self._state.client_keys.get(key_id),
+                key_id=key_id,
+                action=action,
+                request_id=request_id,
+                model=model,
+                now=clock.now(ledger["clock"]),
+            )
+            if candidate is not None:
+                self.append(
+                    OP_PUT_CLIENT_ADMISSION,
+                    {
+                        "clock": candidate["clock"],
+                        "keyId": key_id,
+                        "bucket": candidate["buckets"].get(key_id, {}),
+                    },
+                )
+            return result
 
     def first_available_index(self) -> int:
         with self._lock:

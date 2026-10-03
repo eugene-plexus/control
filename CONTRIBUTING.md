@@ -75,7 +75,11 @@ After that, `git commit` runs `ruff check --fix` and `ruff format` on staged Pyt
 - **Ruff** for lint and format. `ruff check .` and `ruff format .` should both be clean before you push. CI enforces.
 - **Mypy strict** for type-checking. New code must type-check; the `_generated/` directory is excluded.
 - **No comments explaining what code does** — let names do the work. Reserve comments for *why* a non-obvious choice was made.
-- **Async-first** on the request path. The one deliberate exception is the log append, which is synchronous and fsync'd inside the writer's lock: it is the serialization point of the whole component, so moving it off the event loop would buy concurrency we do not want.
+- **Async-first** on the request path. Admission runs its complete decision and
+  durable commit on one bounded worker under the state-machine lock. The log
+  append remains synchronous and fsync'd under the writer's lock; committed-state
+  reads stay responsive while it waits. Preserve this serialization when moving
+  any additional mutations off the event loop.
 
 ## Running checks
 

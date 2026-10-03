@@ -31,6 +31,7 @@ from fastapi import FastAPI
 
 from . import __version__, keyring_store, passphrase_file, security
 from . import config as config_module
+from .admission_worker import AdmissionWorker
 from .applied import normalize_url
 from .auth_state import AuthState
 from .join_tokens import JoinTokenStore
@@ -87,6 +88,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     machine = StateMachine(LogStore(settings.state_dir), role=role)
     machine.load()
     app.state.machine = machine
+    app.state.admission_worker = AdmissionWorker()
 
     if not hasattr(app.state, "auth_state"):
         app.state.auth_state = AuthState()
@@ -170,6 +172,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             with suppress(asyncio.CancelledError, Exception):
                 await app.state.node_poller
         await app.state.nodes_client.aclose()
+        await app.state.admission_worker.close()
 
 
 def _auto_unlock(app: FastAPI, machine: StateMachine) -> None:
