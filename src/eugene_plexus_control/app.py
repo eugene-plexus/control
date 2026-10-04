@@ -125,7 +125,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.nodes_client = NodesClient(
         timeout_provider=lambda: config_module.effective(machine.state.config)[
             "nodeRequestTimeoutSeconds"
-        ]
+        ],
+        local_agent_url=settings.agent_url,
+        local_agent_public_origin=settings.agent_public_origin,
     )
 
     # Which node this control root runs on, so `POST /v1/runtimes` can

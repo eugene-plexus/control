@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     and a trust root should not open itself to the LAN without being
     asked."""
 
+    agent_url: str | None = None
+    """The supervising agent's private address, supplied by that agent."""
+    agent_public_origin: str | None = None
+    """Its explicit HTTPS entry-point origin; local calls stay on agent_url."""
+
     safe_mode: bool = False
     """Skip the persisted config at startup and run on built-in
     defaults. Set by the agent as EUGENE_PLEXUS_CONTROL_SAFE_MODE=1

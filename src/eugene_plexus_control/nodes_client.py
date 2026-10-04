@@ -89,13 +89,32 @@ class NodesClient:
     tune.
     """
 
-    def __init__(self, *, timeout_provider: Any) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_provider: Any,
+        local_agent_url: str | None = None,
+        local_agent_public_origin: str | None = None,
+    ) -> None:
         # `internal_client`: the shared SSL context (a bare constructor
         # parses certifi's PEM bundle, ~104 ms of synchronous CPU on the
         # event loop) and no proxy, because every node of this install
         # is loopback or the operator's own LAN.
         self._client = internal_client()
         self._timeout_provider = timeout_provider
+        self._local_agent_url = local_agent_url
+        self._local_agent_public_origin = local_agent_public_origin
+
+    def _transport_url(self, url: str) -> str:
+        # Only a startup-configured exact origin can map to the supervising
+        # agent. Keep the original per-node bearer/audience on every request.
+        if (
+            self._local_agent_url
+            and self._local_agent_public_origin
+            and url.rstrip("/") == self._local_agent_public_origin.rstrip("/")
+        ):
+            return self._local_agent_url.rstrip("/")
+        return url.rstrip("/")
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -110,7 +129,7 @@ class NodesClient:
     async def _get(self, url: str, path: str, token: str | None) -> Any:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         response = await self._client.get(
-            f"{url.rstrip('/')}{path}", headers=headers, timeout=self._timeout
+            f"{self._transport_url(url)}{path}", headers=headers, timeout=self._timeout
         )
         response.raise_for_status()
         return response.json()
@@ -231,7 +250,7 @@ class NodesClient:
         """
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         response = await self._client.post(
-            f"{url.rstrip('/')}{path}", headers=headers, json=body, timeout=self._timeout
+            f"{self._transport_url(url)}{path}", headers=headers, json=body, timeout=self._timeout
         )
         response.raise_for_status()
         try:
@@ -252,7 +271,7 @@ class NodesClient:
         """
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         response = await self._client.post(
-            f"{url.rstrip('/')}/v1/runtimes",
+            f"{self._transport_url(url)}/v1/runtimes",
             headers=headers,
             json=spec,
             timeout=self._timeout,
