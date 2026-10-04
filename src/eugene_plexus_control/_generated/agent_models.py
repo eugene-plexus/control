@@ -2808,6 +2808,10 @@ class Arg(RootModel[str]):
     root: str = Field(..., max_length=512)
 
 
+class Environment(RootModel[str]):
+    root: str = Field(..., max_length=2048)
+
+
 class AppHubSurface(StrEnum):
     """
     A public hub surface an app's client key may be used on.
@@ -3799,11 +3803,12 @@ class AppManifest(BaseModel):
         description='Arguments after the entry, with the placeholders `environment`\ndescribes. Empty for an app that reads `EUGENE_PLEXUS_APP_*`.\n',
         max_length=32,
     )
-    environment: dict[constr(pattern=r'^[A-Za-z_][A-Za-z0-9_]{0,127}$'), str] | None = (
-        Field(
-            None,
-            description="The app's own variables, for an app that is not ours and reads\nits settings from names of its own (C4). Each value is literal\ntext with placeholders filled in at every start:\n\n* `{bindHost}`, `{port}` — where to listen;\n* `{dataDir}` — its private data directory;\n* `{gatewayUrl}` — the gateway, as `EUGENE_PLEXUS_APP_GATEWAY_URL`;\n* `{appUrl}` — the address the console opens it at;\n* `{oidcIssuer}`, `{oidcClientId}` — with `signIn`;\n* `{clientKey}`, `{oidcClientSecret}`, `{appSecret}` — secrets.\n  `{appSecret}` is a random value made at its first start and\n  kept in its data directory.\n\n**Secrets are filled in by the launcher inside the app's own\naccount**, from the files it is given, so they never appear in\nthe spec the agent writes, its logs or the service definition.\nThey are in the app's process environment, as a program that\nreads no files needs them. A name beginning `EUGENE_PLEXUS_` is\nrefused: those are ours.\n",
-        )
+    environment: (
+        dict[constr(pattern=r'^[A-Za-z_][A-Za-z0-9_]{0,127}$'), Environment] | None
+    ) = Field(
+        None,
+        description="The app's own variables, for an app that is not ours and reads\nits settings from names of its own (C4). Each value is literal\ntext with placeholders filled in at every start:\n\n* `{bindHost}`, `{port}` — where to listen;\n* `{dataDir}` — its private data directory;\n* `{gatewayUrl}` — the gateway, as `EUGENE_PLEXUS_APP_GATEWAY_URL`;\n* `{appUrl}` — the address the console opens it at;\n* `{oidcIssuer}`, `{oidcClientId}` — with `signIn`;\n* `{clientKey}`, `{oidcClientSecret}`, `{appSecret}` — secrets.\n  `{appSecret}` is a random value made at its first start and\n  kept in its data directory.\n\n**Secrets are filled in by the launcher inside the app's own\naccount**, from the files it is given, so they never appear in\nthe spec the agent writes, its logs or the service definition.\nThey are in the app's process environment, as a program that\nreads no files needs them. A name beginning `EUGENE_PLEXUS_` is\nrefused: those are ours.\n",
+        max_length=64,
     )
     healthPath: str | None = Field(
         '/healthz',
