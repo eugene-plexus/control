@@ -407,5 +407,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(oidc_routes.router)
     app.include_router(people_routes.router)
     app.include_router(people_routes.app_clients)
+    from .routes import node_helpers
+
+    app.include_router(node_helpers.admin)
+    app.include_router(node_helpers.router)
 
     return app

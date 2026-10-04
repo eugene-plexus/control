@@ -51,6 +51,7 @@ from eugene_plexus_control.applied import (
     OP_PUT_CLIENT_ADMISSION,
     OP_PUT_CLIENT_KEY,
     OP_PUT_COMPONENT,
+    OP_PUT_NODE_HELPER,
     OP_PUT_OIDC_CLIENT,
     OP_PUT_OIDC_KEY,
     OP_PUT_PERSON,
@@ -88,6 +89,7 @@ EXERCISED_OPS = {
     OP_UPDATE_NODE,
     OP_REVOKE_NODE,
     OP_PUT_COMPONENT,
+    OP_PUT_NODE_HELPER,
     OP_DELETE_COMPONENT,
     OP_PUT_RUNTIME,
     OP_DELETE_RUNTIME,
@@ -185,6 +187,28 @@ def _write_history(machine: StateMachine) -> bytes:
                 {"kind": "cpu", "memoryTotalBytes": 103079215104},
             ],
             "enrolledAt": "2026-09-09T11:22:33.444444+00:00",
+        },
+    )
+    member = machine.state.nodes["gpu-büro"]
+    machine.append(
+        OP_PUT_NODE_HELPER,
+        {
+            "helper": {
+                "node": member.name,
+                "nodeKey": member.signingPublicKey,
+                "enrolledAt": member.enrolledAt,
+                "enabled": True,
+                "folders": [
+                    {
+                        "id": "notes",
+                        "name": "Notes",
+                        "path": "/srv/notes",
+                        "identity": "device:inode:birth",
+                        "writable": False,
+                        "ownerAccess": "none",
+                    }
+                ],
+            }
         },
     )
     machine.append(

@@ -17,6 +17,105 @@ from pydantic import (
 )
 
 
+class HelperGrant(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    folderId: str = Field(..., max_length=64, min_length=1)
+    writable: bool
+
+
+class OwnerAccess(StrEnum):
+    none = 'none'
+    read = 'read'
+    write = 'write'
+
+
+class HelperFolder(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(..., max_length=80, min_length=1)
+    path: str = Field(..., max_length=4096, min_length=1)
+    identity: str = Field(..., max_length=256, min_length=1)
+    writable: bool
+    ownerAccess: OwnerAccess
+
+
+class NodeHelper(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    node: str = Field(..., max_length=256, min_length=1)
+    nodeKey: str = Field(..., max_length=256, min_length=1)
+    enrolledAt: str
+    enabled: bool
+    folders: list[HelperFolder] = Field(..., max_length=64)
+
+
+class HelperFolderCreate(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=80, min_length=1)
+    path: str = Field(..., max_length=4096, min_length=1)
+    writable: bool | None = False
+    ownerAccess: OwnerAccess | None = 'none'
+
+
+class HelperReport(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    supported: bool
+    ready: bool
+    reason: str | None = Field(None, max_length=1024)
+    account: str | None = Field(None, max_length=256)
+
+
+class HelperOperationStatus(StrEnum):
+    done = 'done'
+    failed = 'failed'
+    uncertain = 'uncertain'
+
+
+class Tool(StrEnum):
+    list_directory = 'list_directory'
+    read_text = 'read_text'
+    write_text = 'write_text'
+
+
+class HelperCall(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    operationId: str | None = Field(
+        None, max_length=64, min_length=16, pattern='^[a-zA-Z0-9_-]+$'
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    folderId: str = Field(..., max_length=64, min_length=1)
+    tool: Tool
+    arguments: dict[str, Any]
+
+
+class HelperDiscovery(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+
+
+class HelperCancel(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    operationId: str = Field(
+        ..., max_length=64, min_length=16, pattern='^[a-zA-Z0-9_-]+$'
+    )
+
+
 class AllowedModel(RootModel[str]):
     root: str = Field(..., max_length=256, min_length=1)
 
@@ -1589,26 +1688,13 @@ class LogOp(StrEnum):
     revokeSession = 'revokeSession'
     promote = 'promote'
     putPerson = 'putPerson'
+    putNodeHelper = 'putNodeHelper'
     setPersonPassword = 'setPersonPassword'
     deletePerson = 'deletePerson'
     putOidcClient = 'putOidcClient'
     deleteOidcClient = 'deleteOidcClient'
     putOidcKey = 'putOidcKey'
     revokeSignIn = 'revokeSignIn'
-
-
-class SnapshotPerson(BaseModel):
-    id: str
-    name: str
-    displayName: str | None = None
-    email: str | None = None
-    passwordVerifier: str = Field(
-        ..., description="Argon2id, the passphrase's parameters."
-    )
-    apps: list[str] | None = None
-    disabled: bool
-    createdAt: AwareDatetime
-    passwordChangedAt: AwareDatetime
 
 
 class SnapshotOidcClient(BaseModel):
@@ -1627,67 +1713,6 @@ class SnapshotOidcKey(BaseModel):
     sealedKey: str
     publicJwk: dict[str, Any]
     createdAt: AwareDatetime
-
-
-class Person(BaseModel):
-    """
-    Someone the operator lets sign in to apps (C2). Not an operator:
-    a person's sign-in opens their apps and nothing in the hub.
-
-    """
-
-    id: str = Field(..., description='Stable; the `sub` in their ID tokens.')
-    name: str = Field(
-        ..., description='What they sign in with. Unique, compared case-folded.'
-    )
-    displayName: str | None = None
-    email: str | None = Field(
-        None,
-        description='Optional, and unique compared case-folded. Given to an app that\nasks for the `email` scope, with `email_verified: false`: Eugene\nsends no mail and has proved nothing about it. Some apps (Open\nWebUI) identify people by it (C4).\n',
-    )
-    apps: list[str] | None = Field(
-        None,
-        description='The `clientId`s they may sign in to. Null is every app on the install.',
-    )
-    disabled: bool
-    createdAt: AwareDatetime
-    passwordChangedAt: AwareDatetime
-
-
-class PersonList(BaseModel):
-    people: list[Person]
-    operatorName: str | None = Field(
-        None,
-        description='The name the owner signs in with, once the install has people.',
-    )
-
-
-class PersonCreateRequest(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    name: str = Field(
-        ..., max_length=64, min_length=1, pattern='^[^\\s@][^@]*[^\\s@]$|^[^\\s@]$'
-    )
-    displayName: str | None = Field(None, max_length=120)
-    email: str | None = Field(None, max_length=254, pattern='^[^@\\s]+@[^@\\s]+$')
-    password: str = Field(..., max_length=1024, min_length=12)
-    apps: list[str] | None = None
-
-
-class PersonUpdateRequest(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    displayName: str | None = Field(None, max_length=120)
-    email: str | None = Field(
-        None,
-        description='A new address, or `null` to clear it.',
-        max_length=254,
-        pattern='^[^@\\s]+@[^@\\s]+$',
-    )
-    apps: list[str] | None = None
-    disabled: bool | None = None
 
 
 class PersonPasswordRequest(BaseModel):
@@ -1913,6 +1938,15 @@ class AuthInitializeRequest(BaseModel):
     )
 
 
+class HelperResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    status: HelperOperationStatus
+    result: dict[str, Any] | None = None
+    message: str | None = Field(None, max_length=1024)
+
+
 class InputAudio(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -2124,6 +2158,101 @@ class LogEntry(BaseModel):
         None,
         description='**Informational only, never used for ordering.** Recorded so\nan operator can read the log; deliberately not load-bearing,\nwhich is what keeps clock skew between buildings out of the\ncorrectness argument.\n',
     )
+
+
+class SnapshotPerson(BaseModel):
+    helperGrants: list[HelperGrant] | None = Field(
+        None,
+        description='Explicit access to folders on enrolled nodes; absent means no access.',
+        max_length=256,
+    )
+    id: str
+    name: str
+    displayName: str | None = None
+    email: str | None = None
+    passwordVerifier: str = Field(
+        ..., description="Argon2id, the passphrase's parameters."
+    )
+    apps: list[str] | None = None
+    disabled: bool
+    createdAt: AwareDatetime
+    passwordChangedAt: AwareDatetime
+
+
+class Person(BaseModel):
+    """
+    Someone the operator lets sign in to apps (C2). Not an operator:
+    a person's sign-in opens their apps and nothing in the hub.
+
+    """
+
+    helperGrants: list[HelperGrant] | None = Field(
+        None,
+        description='Explicit access to folders on enrolled nodes; absent means no access.',
+        max_length=256,
+    )
+    id: str = Field(..., description='Stable; the `sub` in their ID tokens.')
+    name: str = Field(
+        ..., description='What they sign in with. Unique, compared case-folded.'
+    )
+    displayName: str | None = None
+    email: str | None = Field(
+        None,
+        description='Optional, and unique compared case-folded. Given to an app that\nasks for the `email` scope, with `email_verified: false`: Eugene\nsends no mail and has proved nothing about it. Some apps (Open\nWebUI) identify people by it (C4).\n',
+    )
+    apps: list[str] | None = Field(
+        None,
+        description='The `clientId`s they may sign in to. Null is every app on the install.',
+    )
+    disabled: bool
+    createdAt: AwareDatetime
+    passwordChangedAt: AwareDatetime
+
+
+class PersonList(BaseModel):
+    people: list[Person]
+    operatorName: str | None = Field(
+        None,
+        description='The name the owner signs in with, once the install has people.',
+    )
+
+
+class PersonCreateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    helperGrants: list[HelperGrant] | None = Field(
+        None,
+        description='Explicit access to folders on enrolled nodes; absent means no access.',
+        max_length=256,
+    )
+    name: str = Field(
+        ..., max_length=64, min_length=1, pattern='^[^\\s@][^@]*[^\\s@]$|^[^\\s@]$'
+    )
+    displayName: str | None = Field(None, max_length=120)
+    email: str | None = Field(None, max_length=254, pattern='^[^@\\s]+@[^@\\s]+$')
+    password: str = Field(..., max_length=1024, min_length=12)
+    apps: list[str] | None = None
+
+
+class PersonUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    helperGrants: list[HelperGrant] | None = Field(
+        None,
+        description='Explicit access to folders on enrolled nodes; absent means no access.',
+        max_length=256,
+    )
+    displayName: str | None = Field(None, max_length=120)
+    email: str | None = Field(
+        None,
+        description='A new address, or `null` to clear it.',
+        max_length=254,
+        pattern='^[^@\\s]+@[^@\\s]+$',
+    )
+    apps: list[str] | None = None
+    disabled: bool | None = None
 
 
 class ComponentPlacementList(BaseModel):
@@ -2487,6 +2616,7 @@ class Snapshot(BaseModel):
         None,
         description='The people who may sign in to apps, as `putPerson`,\n`setPersonPassword` and `deletePerson` left them, with their\nArgon2id verifiers: as `passphraseVerifier` is here, and for the\nsame reason (a promoted standby signs people in).\n',
     )
+    nodeHelpers: list[NodeHelper] | None = None
     oidcClients: list[SnapshotOidcClient] | None = None
     oidcKeys: list[SnapshotOidcKey] | None = Field(
         None,

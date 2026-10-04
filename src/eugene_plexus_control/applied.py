@@ -92,6 +92,7 @@ OP_PUT_CLIENT_ADMISSION = "putClientAdmission"
 OP_REVOKE_SESSION = "revokeSession"
 # Signing in with Eugene (C2, docs/design/sign-in-with-eugene.md).
 OP_PUT_PERSON = "putPerson"
+OP_PUT_NODE_HELPER = "putNodeHelper"
 OP_SET_PERSON_PASSWORD = "setPersonPassword"
 OP_DELETE_PERSON = "deletePerson"
 OP_PUT_OIDC_CLIENT = "putOidcClient"
@@ -123,6 +124,7 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_PUT_CLIENT_ADMISSION,
         OP_REVOKE_SESSION,
         OP_PUT_PERSON,
+        OP_PUT_NODE_HELPER,
         OP_SET_PERSON_PASSWORD,
         OP_DELETE_PERSON,
         OP_PUT_OIDC_CLIENT,
@@ -346,6 +348,7 @@ class AppliedState:
     """People who may sign in to apps (C2), by id, as `SnapshotPerson`:
     their Argon2id verifiers included, for the reason `passphraseVerifier`
     is replicated -- a promoted standby signs them in."""
+    node_helpers: dict[str, dict[str, Any]] = field(default_factory=dict)
     oidc_clients: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Apps that sign in with Eugene, by `clientId`, as `SnapshotOidcClient`."""
     oidc_keys: tuple[dict[str, Any], ...] = ()
@@ -775,6 +778,7 @@ def _person_record(raw: Any) -> dict[str, Any]:
         "email",
         "passwordVerifier",
         "apps",
+        "helperGrants",
         "disabled",
         "createdAt",
         "passwordChangedAt",
@@ -800,6 +804,22 @@ def _person_record(raw: Any) -> dict[str, Any]:
         raise ApplyError("invalid person apps")
     if not isinstance(raw.get("disabled"), bool):
         raise ApplyError("invalid person disabled")
+    grants = raw.get("helperGrants", [])
+    if not isinstance(grants, list) or len(grants) > 256:
+        raise ApplyError("invalid helper grants")
+    seen: set[str] = set()
+    for grant in grants:
+        if (
+            not isinstance(grant, dict)
+            or set(grant) != {"folderId", "writable"}
+            or not isinstance(grant["folderId"], str)
+            or not grant["folderId"]
+            or len(grant["folderId"]) > 64
+            or type(grant["writable"]) is not bool
+            or grant["folderId"] in seen
+        ):
+            raise ApplyError("invalid helper grant")
+        seen.add(grant["folderId"])
     _timestamp(raw, "createdAt", "person")
     _timestamp(raw, "passwordChangedAt", "person")
     return dict(raw)
@@ -917,6 +937,35 @@ def _apply_revoke_sign_in(state: AppliedState, payload: dict[str, Any], index: i
     return replace(state, revoked_sign_ins=kept)
 
 
+def _helper_record(raw: Any) -> dict[str, Any]:
+    from ._generated.models import NodeHelper
+
+    try:
+        record = NodeHelper.model_validate(raw).model_dump(mode="json")
+    except (ValueError, TypeError) as exc:
+        raise ApplyError("invalid node helper configuration") from exc
+    ids = [f["id"] for f in record["folders"]]
+    if len(ids) != len(set(ids)):
+        raise ApplyError("duplicate helper folder")
+    if any(f["ownerAccess"] == "write" and not f["writable"] for f in record["folders"]):
+        raise ApplyError("owner write access exceeds folder permission")
+    return record
+
+
+def _apply_put_node_helper(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    record = _helper_record(payload.get("helper"))
+    node = state.nodes.get(record["node"])
+    if (
+        node is None
+        or record["nodeKey"] != node.signingPublicKey
+        or record["enrolledAt"] != node.enrolledAt
+    ):
+        raise ApplyError("helper does not name this enrolled machine")
+    return replace(state, node_helpers={**state.node_helpers, record["node"]: record})
+
+
 _Handler = Callable[["AppliedState", dict[str, Any], int], "AppliedState"]
 
 _HANDLERS: dict[str, _Handler] = {
@@ -936,6 +985,7 @@ _HANDLERS: dict[str, _Handler] = {
     OP_PUT_CLIENT_ADMISSION: _apply_put_client_admission,
     OP_REVOKE_SESSION: _apply_revoke_session,
     OP_PUT_PERSON: _apply_put_person,
+    OP_PUT_NODE_HELPER: _apply_put_node_helper,
     OP_SET_PERSON_PASSWORD: _apply_set_person_password,
     OP_DELETE_PERSON: _apply_delete_person,
     OP_PUT_OIDC_CLIENT: _apply_put_oidc_client,
@@ -1014,6 +1064,7 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
         "sealedRecoveryKey": identity.sealedRecoveryKey,
         "signingKeyId": identity.signingKeyId,
         "people": [state.people[key] for key in sorted(state.people)],
+        "nodeHelpers": [state.node_helpers[key] for key in sorted(state.node_helpers)],
         "oidcClients": [state.oidc_clients[key] for key in sorted(state.oidc_clients)],
         "oidcKeys": [dict(k) for k in state.oidc_keys],
         "revokedSignIns": [
@@ -1093,6 +1144,9 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         client_keys=_key_records(raw.get("clientKeys", [])),
         revoked_sessions={str(r["jti"]): int(r["exp"]) for r in raw.get("revokedSessions") or []},
         people={(p := _person_record(item))["id"]: p for item in raw.get("people") or []},
+        node_helpers={
+            (h := _helper_record(item))["node"]: h for item in raw.get("nodeHelpers") or []
+        },
         oidc_clients={
             (c := _oidc_client_record(item))["clientId"]: c for item in raw.get("oidcClients") or []
         },
