@@ -80,7 +80,13 @@ def trust_keys(state: AppliedState) -> list[tokens.TrustKey]:
                 kid=kid,
                 issuer=tokens.node_recipient(record.name),
                 public=public,
-                grants=frozenset(record.grants) | {tokens.GRANT_NODE},
+                # A Job Site holds `files` instead of `node` (remote-nodes.md
+                # §3.2): the one grant set here never gains `node`.
+                grants=(
+                    frozenset({tokens.GRANT_FILES})
+                    if tokens.GRANT_FILES in record.grants
+                    else frozenset(record.grants) | {tokens.GRANT_NODE}
+                ),
             )
         )
     return keys

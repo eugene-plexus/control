@@ -38,6 +38,7 @@ from .join_tokens import JoinTokenStore
 from .log_store import LogStore
 from .nodes_client import NodesClient
 from .replication import Follower
+from .root_tls import RootTls
 from .routes import admin as admin_routes
 from .routes import auth as auth_routes
 from .routes import client_keys as client_key_routes
@@ -121,6 +122,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.join_tokens = JoinTokenStore()
     app.state.node_probes = {}
+    app.state.node_contacts = {}
+    app.state.root_tls = RootTls(
+        Path(settings.state_dir), settings.nodes_origin, settings.nodes_probe
+    )
+    app.state.root_tls_task = None
     app.state.standby_reports = {}
     app.state.nodes_client = NodesClient(
         timeout_provider=lambda: config_module.effective(machine.state.config)[
@@ -153,6 +159,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("running as a STANDBY control root, following %s", settings.active_url)
     else:
         app.state.node_poller = asyncio.create_task(_poll_nodes(app), name="control-node-poller")
+        if settings.nodes_origin:
+            app.state.root_tls_task = asyncio.create_task(
+                app.state.root_tls.run(), name="control-root-tls"
+            )
         log.info(
             "running as the ACTIVE control root at epoch %d, applied index %d",
             machine.state.epoch,
@@ -173,6 +183,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.node_poller.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await app.state.node_poller
+        if app.state.root_tls_task is not None:
+            app.state.root_tls_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await app.state.root_tls_task
         await app.state.nodes_client.aclose()
         await app.state.admission_worker.close()
 

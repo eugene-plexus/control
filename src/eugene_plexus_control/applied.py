@@ -201,7 +201,11 @@ class NodeRecord:
     never been anywhere else (2026-09-25)."""
     grants: tuple[str, ...] = ("node",)
     """What the node's key may issue. `gateway` comes from the join token
-    that enrolled it, which the operator minted; never from the node."""
+    that enrolled it, which the operator minted; never from the node.
+    A Job Site holds exactly `("files",)` (remote-nodes.md §3.2)."""
+    owner: str | None = None
+    """A Job Site's owner: the person who confirmed its join at the
+    machine with their own password. None for every other node."""
     agentVersion: str | None = None
     os: str | None = None
     arch: str | None = None
@@ -444,6 +448,7 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
         signingPublicKey=_optional_str(payload, "signingPublicKey"),
         tokenPublicKey=_optional_str(payload, "tokenPublicKey"),
         grants=_grants(payload.get("grants"), index),
+        owner=_optional_str(payload, "owner"),
         agentVersion=_optional_str(payload, "agentVersion"),
         os=_optional_str(payload, "os"),
         arch=_optional_str(payload, "arch"),
@@ -457,11 +462,17 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
     return replace(state, nodes={**state.nodes, name: record})
 
 
-_NODE_GRANTS = frozenset({"node", "gateway"})
+_NODE_GRANTS = frozenset({"node", "gateway", "files"})
+
+
+def is_job_site(record: NodeRecord | None) -> bool:
+    """A machine joined as a Job Site: files only, no address, no inference work."""
+    return record is not None and "files" in record.grants
 
 
 def _grants(raw: Any, index: int) -> tuple[str, ...]:
-    """A node's grants, always including `node`, sorted so replay is byte-stable."""
+    """A node's grants, sorted so replay is byte-stable: always including
+    `node`, except a Job Site's, which are exactly `files`."""
     if raw is None:
         return ("node",)
     if not isinstance(raw, list) or not all(isinstance(g, str) for g in raw):
@@ -469,6 +480,10 @@ def _grants(raw: Any, index: int) -> tuple[str, ...]:
     unknown = set(raw) - _NODE_GRANTS
     if unknown:
         raise ApplyError(f"entry {index}: a node cannot hold {sorted(unknown)}")
+    if "files" in raw:
+        if set(raw) != {"files"}:
+            raise ApplyError(f"entry {index}: a job site holds files and nothing else")
+        return ("files",)
     return tuple(sorted(set(raw) | {"node"}))
 
 
@@ -958,11 +973,23 @@ def _helper_record(raw: Any) -> dict[str, Any]:
         record = NodeHelper.model_validate(raw).model_dump(mode="json")
     except (ValueError, TypeError) as exc:
         raise ApplyError("invalid node helper configuration") from exc
+    for folder in record["folders"]:
+        # Only a Job Site's folders carry who may use them. An empty list is
+        # left out, so every other node's record is byte-identical to the
+        # one it was before Job Sites, and a standby on that build reads it.
+        if not folder.get("people"):
+            folder.pop("people", None)
     ids = [f["id"] for f in record["folders"]]
     if len(ids) != len(set(ids)):
         raise ApplyError("duplicate helper folder")
     if any(f["ownerAccess"] == "write" and not f["writable"] for f in record["folders"]):
         raise ApplyError("owner write access exceeds folder permission")
+    for folder in record["folders"]:
+        people = [p["person"] for p in folder.get("people", [])]
+        if len(people) != len(set(people)):
+            raise ApplyError("a person is named twice on one folder")
+        if any(p["writable"] and not folder["writable"] for p in folder.get("people", [])):
+            raise ApplyError("a person's write access exceeds folder permission")
     return record
 
 
@@ -1047,6 +1074,7 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
                 "signingPublicKey": n.signingPublicKey,
                 "tokenPublicKey": n.tokenPublicKey,
                 "grants": list(n.grants),
+                "owner": n.owner,
                 "advertiseSequence": n.advertiseSequence,
                 "agentVersion": n.agentVersion,
                 "os": n.os,
@@ -1135,6 +1163,7 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
                 signingPublicKey=n.get("signingPublicKey"),
                 tokenPublicKey=n.get("tokenPublicKey"),
                 grants=tuple(n.get("grants") or ("node",)),
+                owner=n.get("owner"),
                 advertiseSequence=int(n.get("advertiseSequence") or 0),
                 agentVersion=n.get("agentVersion"),
                 os=n.get("os"),

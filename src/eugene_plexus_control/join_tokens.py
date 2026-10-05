@@ -64,6 +64,7 @@ class MintedToken:
     expires_at: float
     node_name: str | None
     grants: tuple[str, ...] = ()
+    owner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,7 @@ class TokenRecord:
     node_name: str | None
     used: bool
     grants: tuple[str, ...] = ()
+    owner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,8 @@ class _Record:
     grants: tuple[str, ...] = ()
     """Extra trust-bundle grants for the node this token enrolls. The
     operator chose them when minting; the node never asks."""
+    owner: str | None = None
+    """The person a Job Site invitation names (`files` only)."""
 
 
 class JoinTokenStore:
@@ -108,7 +112,12 @@ class JoinTokenStore:
         self._records: dict[str, _Record] = {}
 
     def mint(
-        self, *, ttl_seconds: int, node_name: str | None, grants: tuple[str, ...] = ()
+        self,
+        *,
+        ttl_seconds: int,
+        node_name: str | None,
+        grants: tuple[str, ...] = (),
+        owner: str | None = None,
     ) -> MintedToken:
         token = security.generate_join_token()
         token_hash = security.hash_join_token(token)
@@ -127,12 +136,53 @@ class JoinTokenStore:
                 expires_at=expires_at,
                 node_name=node_name,
                 grants=grants,
+                owner=owner,
             )
         # Returned once and never stored in recoverable form. A lost
         # token is re-minted, not looked up.
         return MintedToken(
-            id=token_id, token=token, expires_at=expires_at, node_name=node_name, grants=grants
+            id=token_id,
+            token=token,
+            expires_at=expires_at,
+            node_name=node_name,
+            grants=grants,
+            owner=owner,
         )
+
+    def outstanding_for(self, owner: str) -> int:
+        """Unspent, unexpired Job Site invitations naming one person."""
+        with self._lock:
+            self._sweep_locked()
+            return sum(1 for r in self._records.values() if r.owner == owner and not r.used)
+
+    def peek(self, token: str, *, node_name: str) -> TokenRecord:
+        """What `consume` would spend, without spending it. Raises as it would.
+
+        For a Job Site invitation the person's password is checked between
+        the two, after this cheap look-up: a mistyped password must not
+        cost the token, and an unknown token must not cost an Argon2 check.
+        """
+        token_hash = security.hash_join_token(token)
+        with self._lock:
+            self._sweep_locked()
+            record = self._records.get(token_hash)
+            if record is None or record.expires_at <= time.time():
+                raise JoinTokenError("join token is unknown or has expired")
+            if record.used:
+                raise JoinTokenConsumed("this join token has already enrolled a node")
+            if record.node_name is not None and record.node_name != node_name:
+                raise JoinTokenError(
+                    f"this join token is bound to node {record.node_name!r} and cannot "
+                    f"enroll {node_name!r}"
+                )
+            return TokenRecord(
+                id=record.id,
+                expires_at=record.expires_at,
+                node_name=record.node_name,
+                used=record.used,
+                grants=record.grants,
+                owner=record.owner,
+            )
 
     def list(self) -> list[TokenRecord]:
         """Outstanding tokens, soonest to expire first.
@@ -153,6 +203,7 @@ class JoinTokenStore:
                 node_name=r.node_name,
                 used=r.used,
                 grants=r.grants,
+                owner=r.owner,
             )
             for r in records
         ]
@@ -206,6 +257,7 @@ class JoinTokenStore:
                 node_name=record.node_name,
                 used=True,
                 grants=record.grants,
+                owner=record.owner,
             )
             return record.grants
 

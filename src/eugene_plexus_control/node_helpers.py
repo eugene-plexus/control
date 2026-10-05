@@ -58,22 +58,76 @@ def find_folder(state: Any, folder_id: str) -> tuple[dict[str, Any], dict[str, A
     raise problem(403, "Folder unavailable", "This folder is no longer granted to you.")
 
 
+PRODUCTION = "production"
+DEV = "dev"
+
+
+def install_mode(state: Any) -> str:
+    """`production` unless the owner chose dev (J13, J18). An install that
+    never recorded one is in production: a new install starts there, and an
+    old one had no job sites, so it has nothing to hide or show."""
+    return DEV if state.config.get("installMode") == DEV else PRODUCTION
+
+
+def mode_view(state: Any) -> dict[str, Any]:
+    return {"mode": install_mode(state), "changedAt": state.config.get("installModeChangedAt")}
+
+
+def is_site(state: Any, node: str) -> bool:
+    """A Job Site: its folders and their grants are its owner's (J11)."""
+    record = state.nodes.get(node)
+    return record is not None and "files" in record.grants
+
+
 def grants_for(state: Any, subject: str) -> list[dict[str, Any]]:
+    """Every folder `subject` may use, and whether to write.
+
+    Eugene's owner (`operator`) has the folders they gave themselves
+    (`ownerAccess`), on a Job Site **only while the install is in dev mode**
+    (J13b): switching to production ends them at once, because this is
+    checked at every use. A person has their `helperGrants` on ordinary
+    nodes, which Eugene's owner writes, and on a Job Site exactly what its
+    owner wrote on the folder (`people`), which nobody else can.
+    """
+    dev = install_mode(state) == DEV
+    members = [n for n in state.nodes if state.nodes[n].signingPublicKey]
     if subject == "operator":
         return [
             {"folderId": folder["id"], "writable": folder["ownerAccess"] == "write"}
-            for node in state.nodes
-            if state.nodes[node].signingPublicKey
+            for node in members
+            if dev or not is_site(state, node)
             for folder in configuration(state, node)["folders"]
             if folder["ownerAccess"] != "none"
         ]
-    return list(state.people.get(subject, {}).get("helperGrants") or [])
+    site_folders = {
+        folder["id"]: folder
+        for node in members
+        if is_site(state, node)
+        for folder in configuration(state, node)["folders"]
+    }
+    granted = [
+        g
+        for g in state.people.get(subject, {}).get("helperGrants") or []
+        if g["folderId"] not in site_folders
+    ]
+    for folder in site_folders.values():
+        for entry in folder.get("people") or []:
+            if entry["person"] == subject:
+                granted.append({"folderId": folder["id"], "writable": bool(entry["writable"])})
+    return granted
 
 
 def check_grants(state: Any, values: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     for value in values:
-        _, folder = find_folder(state, value["folderId"])
+        config, folder = find_folder(state, value["folderId"])
+        if is_site(state, config["node"]):
+            raise problem(
+                403,
+                "A job site's folder",
+                f"{config['node']} is a job site: only its owner gives people its folders, "
+                "from Workbench.",
+            )
         if value["folderId"] in seen:
             raise problem(422, "Duplicate folder", "Assign each folder only once.")
         if value["writable"] and not folder["writable"]:

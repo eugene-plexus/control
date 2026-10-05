@@ -24,7 +24,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request, status
 
-from .. import node_address, sealing, tokens, trust
+from .. import capabilities, node_address, oidc, sealing, security, tokens, trust
 from .._generated.models import (
     Enrollment,
     EnrollmentRequest,
@@ -40,6 +40,7 @@ from .._generated.models import (
     Reason,
     SignedTrustBundle,
     TrustChange,
+    TrustGrant,
 )
 from ..applied import (
     OP_ENROLL_NODE,
@@ -49,7 +50,7 @@ from ..applied import (
     normalize_url,
 )
 from ..auth_state import AuthState
-from ..dependencies import problem, require_authorized, require_operator
+from ..dependencies import problem, require_authorized, via_public_nodes
 from ..join_tokens import JoinTokenConsumed, JoinTokenError, JoinTokenStore
 from ..state_machine import NotActive, StateMachine
 
@@ -67,9 +68,15 @@ async def list_nodes(request: Request) -> NodeList:
     """
     machine: StateMachine = request.app.state.machine
     probes = getattr(request.app.state, "node_probes", {})
+    contacts = getattr(request.app.state, "node_contacts", {})
     return NodeList(
         nodes=[
-            _to_node(record, probes.get(record.name))
+            _to_node(
+                record,
+                probes.get(record.name),
+                contacts.get(record.name),
+                machine.state.people,
+            )
             for record in sorted(machine.state.nodes.values(), key=lambda r: r.name)
         ]
     )
@@ -85,7 +92,7 @@ async def list_nodes(request: Request) -> NodeList:
 @router.get(
     "/v1/nodes/join-tokens",
     response_model=JoinTokenList,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(capabilities.require(capabilities.MEMBERSHIP))],
 )
 async def list_join_tokens(request: Request) -> JoinTokenList:
     """What is outstanding. **No tokens in it** — there are none to give.
@@ -103,6 +110,7 @@ async def list_join_tokens(request: Request) -> JoinTokenList:
                 nodeName=record.node_name,
                 used=record.used,
                 grants=[Grant(g) for g in record.grants] or None,
+                owner=record.owner,
             )
             for record in store.list()
         ]
@@ -112,7 +120,7 @@ async def list_join_tokens(request: Request) -> JoinTokenList:
 @router.delete(
     "/v1/nodes/join-tokens/{id}",
     status_code=204,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(capabilities.require(capabilities.MEMBERSHIP))],
 )
 async def revoke_join_token(request: Request, id: str) -> None:
     """Withdraw a token before it expires.
@@ -149,7 +157,8 @@ async def get_node(request: Request, name: str) -> Node:
             status.HTTP_404_NOT_FOUND, "No such node", f"No node named {name!r} is enrolled."
         )
     probes = getattr(request.app.state, "node_probes", {})
-    return _to_node(record, probes.get(name))
+    contacts = getattr(request.app.state, "node_contacts", {})
+    return _to_node(record, probes.get(name), contacts.get(name), machine.state.people)
 
 
 @router.patch("/v1/nodes/{name}", response_model=NodeAddressAck)
@@ -327,7 +336,7 @@ async def announce_node_address(
     "/v1/nodes/{name}",
     response_model=TrustChange,
     status_code=202,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(capabilities.require(capabilities.MEMBERSHIP))],
 )
 async def revoke_node(request: Request, name: str) -> TrustChange:
     """Revoke a node: its key leaves the trust bundle. **Nothing is rotated.**
@@ -346,6 +355,11 @@ async def revoke_node(request: Request, name: str) -> TrustChange:
     The runtimes the node hosted become un-declared; the model files on
     that host's disk are untouched.
     """
+    return revoke(request, name)
+
+
+def revoke(request: Request, name: str) -> TrustChange:
+    """`DELETE /v1/nodes/{name}`, and a Job Site's owner leaving (§3.3)."""
     machine: StateMachine = request.app.state.machine
     auth: AuthState = request.app.state.auth_state
     if name not in machine.state.nodes:
@@ -381,7 +395,7 @@ async def revoke_node(request: Request, name: str) -> TrustChange:
     "/v1/nodes/join-token",
     response_model=JoinToken,
     status_code=201,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(capabilities.require(capabilities.MEMBERSHIP))],
 )
 async def mint_join_token(request: Request, body: JoinTokenRequest | None = None) -> JoinToken:
     """Mint a single-use, short-lived, optionally node-scoped token.
@@ -407,12 +421,14 @@ async def mint_join_token(request: Request, body: JoinTokenRequest | None = None
     node_name = body.nodeName if body else None
     requested = body.grants or [] if body else []
     grants = tuple(sorted({str(getattr(g, "value", g)) for g in requested}))
+    owner = check_site_invitation(machine, grants, body.owner if body else None)
 
-    minted = store.mint(ttl_seconds=ttl, node_name=node_name, grants=grants)
+    minted = store.mint(ttl_seconds=ttl, node_name=node_name, grants=grants, owner=owner)
     log.info(
-        "minted a join token%s%s, valid for %ds",
+        "minted a join token%s%s%s, valid for %ds",
         f" bound to node {node_name!r}" if node_name else "",
         f" granting {', '.join(grants)}" if grants else "",
+        f" for a job site of {owner}" if owner else "",
         ttl,
     )
     return JoinToken(
@@ -421,7 +437,44 @@ async def mint_join_token(request: Request, body: JoinTokenRequest | None = None
         expiresAt=datetime.fromtimestamp(minted.expires_at, tz=UTC),
         nodeName=minted.node_name,
         grants=[Grant(g) for g in minted.grants] or None,
+        owner=minted.owner,
+        rootKey=machine.state.identity.controlPublicKey,
     )
+
+
+def check_site_invitation(
+    machine: StateMachine, grants: tuple[str, ...], owner: str | None
+) -> str | None:
+    """The person a Job Site invitation names, checked; None for any other token."""
+    if tokens.GRANT_FILES not in grants:
+        if owner:
+            raise problem(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Not a job site",
+                "Only a job site invitation (grants: files) names a person.",
+            )
+        return None
+    if tokens.GRANT_GATEWAY in grants:
+        raise problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "A job site runs no gateway",
+            "A job site serves files only, so it cannot also hold the gateway grant.",
+        )
+    person = machine.state.people.get(owner or "")
+    if person is None:
+        raise problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Name the person",
+            "A job site belongs to a person on this install, who confirms the join at the "
+            "machine with their own password. Name them by id (People).",
+        )
+    if person.get("disabled"):
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "Person is turned off",
+            f"{person['name']} cannot sign in, so they could not confirm a job site.",
+        )
+    return str(person["id"])
 
 
 @router.post("/v1/nodes/enroll", response_model=Enrollment, status_code=201)
@@ -492,7 +545,53 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
             "copied node.yaml is not a new node.",
         )
 
+    # Before the token is consumed: a locked root used to spend the
+    # single-use credential and then answer 503.
+    if auth.signing_key is None or auth.control_private_key is None:
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Locked",
+            "This control root has not been unlocked, so it cannot sign the trust bundle a "
+            "new node needs. Log in first; the join token was not used.",
+        )
+
+    if via_public_nodes(request) and auth.is_login_rate_limited(
+        JOIN_FAILURE_BUCKET, window_seconds=JOIN_WINDOW_SECONDS, max_in_window=JOIN_FAILURES
+    ):
+        raise problem(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Too many failed joins",
+            f"Too many unknown join tokens arrived through the public node route. Wait "
+            f"{JOIN_WINDOW_SECONDS} seconds and try again.",
+        )
+    try:
+        invitation = store.peek(body.token, node_name=body.name)
+    except JoinTokenConsumed as exc:
+        raise problem(status.HTTP_409_CONFLICT, "Token already used", str(exc)) from exc
+    except JoinTokenError as exc:
+        if via_public_nodes(request):
+            _record_join_failure(request)
+        raise problem(status.HTTP_401_UNAUTHORIZED, "Join token rejected", str(exc)) from exc
+    job_site = tokens.GRANT_FILES in invitation.grants
+
+    if via_public_nodes(request) and not job_site:
+        # J3: the one rule that stops a rogue machine on the internet
+        # announcing an address and being sent prompts.
+        raise problem(
+            status.HTTP_403_FORBIDDEN,
+            "Only job sites join this way",
+            "Through the public node route a machine can join only as a job site. Join an "
+            "ordinary node from the network it shares with this root.",
+        )
+
     announced_url = normalize_url(str(body.url)) if body.url else None
+    if job_site and announced_url:
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "A job site has no address",
+            "A job site connects out to this root and nothing connects to it, so it sends no "
+            "address. The join token was not used.",
+        )
     reason = node_address.rejection(announced_url) if announced_url else None
     if reason is not None:
         # Checked **before** the join token is consumed: a single-use
@@ -504,14 +603,15 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
             f"{body.url} cannot be this node's address: {reason}.",
         )
 
-    # Before the token is consumed: a locked root used to spend the
-    # single-use credential and then answer 503.
-    if auth.signing_key is None or auth.control_private_key is None:
+    owner: str | None = None
+    if job_site:
+        owner = _confirm_site_owner(request, invitation.owner, body.owner)
+    elif body.owner is not None:
         raise problem(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Locked",
-            "This control root has not been unlocked, so it cannot sign the trust bundle a "
-            "new node needs. Log in first; the join token was not used.",
+            status.HTTP_400_BAD_REQUEST,
+            "Not a job site",
+            "Only a job site invitation is confirmed with a person's sign-in. The join token "
+            "was not used.",
         )
 
     try:
@@ -533,7 +633,8 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         "publicKey": body.publicKey,
         "signingPublicKey": body.signingPublicKey,
         "tokenPublicKey": body.tokenPublicKey,
-        "grants": sorted({"node", *grants}),
+        "grants": ["files"] if job_site else sorted({"node", *grants}),
+        "owner": owner,
         "url": announced_url,
         "agentVersion": body.agentVersion,
         "os": body.os.value if body.os else None,
@@ -568,7 +669,75 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         trustBundle=SignedTrustBundle(jws=bundle.jws),
         controlPublicKey=identity.controlPublicKey or "",
         recoveryPublicKey=recovery_public,
+        grants=[TrustGrant(g) for g in machine.state.nodes[body.name].grants],
     )
+
+
+JOIN_FAILURE_BUCKET = "join:any"
+JOIN_FAILURES = 30
+JOIN_WINDOW_SECONDS = 60
+
+
+def _record_join_failure(request: Request) -> None:
+    auth: AuthState = request.app.state.auth_state
+    auth.record_login_failure(
+        JOIN_FAILURE_BUCKET, window_seconds=JOIN_WINDOW_SECONDS, max_in_window=JOIN_FAILURES
+    )
+
+
+def _confirm_site_owner(request: Request, invited: str | None, proof: Any) -> str:
+    """Rule 1 of §3.3: the person the invitation names signs in at the machine.
+
+    Checked after the token (cheap) and before it is spent, so a mistyped
+    password costs a retry, not the invitation. Counted against the same
+    limit as that person's sign-ins, so a join cannot be used to guess a
+    password faster than the sign-in page allows. Nothing is stored.
+    """
+    machine: StateMachine = request.app.state.machine
+    auth: AuthState = request.app.state.auth_state
+    person = machine.state.people.get(invited or "")
+    if person is None:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "Invited person is gone",
+            "The person this invitation names is no longer on this install. Ask for a new one.",
+        )
+    if proof is None:
+        raise problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Sign in to confirm",
+            f"This machine joins as {person['name']}'s job site. {person['name']} confirms by "
+            "signing in here with their own password. The join token was not used.",
+        )
+    bucket = f"oidc-name:{person['name'].casefold()}"
+    if auth.is_login_rate_limited(
+        bucket, window_seconds=oidc.SIGN_IN_WINDOW_SECONDS, max_in_window=oidc.SIGN_IN_FAILURES
+    ):
+        raise problem(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Too many failed sign-ins",
+            f"Wait {oidc.SIGN_IN_WINDOW_SECONDS} seconds and try again.",
+        )
+    matched = security.verify_passphrase(proof.password, person["passwordVerifier"])
+    if not matched or proof.name.strip().casefold() != person["name"].casefold():
+        auth.record_login_failure(
+            bucket, window_seconds=oidc.SIGN_IN_WINDOW_SECONDS, max_in_window=oidc.SIGN_IN_FAILURES
+        )
+        log.warning("a job site join was not confirmed: wrong sign-in for %s", person["name"])
+        raise problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Sign-in does not match",
+            "That name and password do not match the person this invitation names. The "
+            "join token was not used.",
+        )
+    auth.clear_login_failures(bucket)
+    if person.get("disabled"):
+        raise problem(
+            status.HTTP_403_FORBIDDEN,
+            "Signing in is turned off",
+            f"{person['name']} cannot sign in on this install, so cannot own a job site.",
+        )
+    return str(person["id"])
 
 
 # --------------------------------------------------------------------------- #
@@ -576,14 +745,25 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
 # --------------------------------------------------------------------------- #
 
 
-def _to_node(record: NodeRecord, probe: Any | None) -> Node:
+def _to_node(
+    record: NodeRecord,
+    probe: Any | None,
+    contact: datetime | None = None,
+    people: dict[str, dict[str, Any]] | None = None,
+) -> Node:
     """Applied state plus this root's observations, kept distinguishable.
 
     `reachable` defaults to False when nothing has polled yet, and that
     is the honest default: we have not seen this host. False means
     `down`, never `out` — nothing is reassigned on the strength of this
     field.
+
+    **A Job Site is never probed**: it has no address. Its status is its
+    last contact, and the probe's "no url recorded" is not a fault to show.
     """
+    if tokens.GRANT_FILES in record.grants:
+        probe = None
+    owner = (people or {}).get(record.owner or "")
     return Node.model_validate(
         {
             "name": record.name,
@@ -609,6 +789,9 @@ def _to_node(record: NodeRecord, probe: Any | None) -> Node:
             # to enrollment and keys when the cause was half a second of
             # clock skew on a worker refusing this root's tokens.
             "lastError": probe.error if probe is not None else None,
+            "owner": record.owner,
+            "ownerName": owner["name"] if owner else None,
+            "lastContactAt": contact,
         }
     )
 

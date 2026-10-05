@@ -219,6 +219,24 @@ FIELDS: list[ConfigField] = [
         requiresRestart=True,
     ),
     ConfigField(
+        key="installMode",
+        label="Install mode",
+        description=(
+            "Production restricts Eugene's owner: a job site's folders, who may use "
+            "them and what its tools returned are its owner's alone, and the owner's "
+            "reading of other people's chats stops at the first job-site result. Dev "
+            "mode is for developing Eugene: the owner sees all tool information, job-site "
+            "results included, and may give themselves a job site's folders. Every "
+            "person is told the mode and when it changes. Results made in production "
+            "stay hidden after a switch to dev."
+        ),
+        category="security",
+        valueType=ConfigValueType.enum,
+        default="production",
+        enumValues=["production", "dev"],
+        enumLabels=["Production", "Dev (the owner sees all tool information)"],
+    ),
+    ConfigField(
         key="oidcIssuer",
         label="Sign-in address for apps",
         description=(
@@ -244,6 +262,8 @@ FIELDS: list[ConfigField] = [
 #   * Where the active root is, for a standby — same reason.
 
 _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
+
+MODE_CHANGED_AT = "installModeChangedAt"
 
 
 def as_schema() -> ConfigSchema:
@@ -311,7 +331,9 @@ UNSET_MEANS: dict[str, str] = {
 
 
 def as_document(values: dict[str, Any]) -> ConfigDocument:
-    merged = {**defaults(), **values}
+    # `installModeChangedAt` rides in applied config beside the mode it
+    # dates, and is not a setting anyone edits.
+    merged = {**defaults(), **{k: v for k, v in values.items() if k != MODE_CHANGED_AT}}
     return ConfigDocument.model_validate(merged)
 
 

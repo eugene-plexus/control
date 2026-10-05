@@ -31,27 +31,12 @@ class OwnerAccess(StrEnum):
     write = 'write'
 
 
-class HelperFolder(BaseModel):
+class SitePersonGrant(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
-    id: str = Field(..., max_length=64, min_length=1)
-    name: str = Field(..., max_length=80, min_length=1)
-    path: str = Field(..., max_length=4096, min_length=1)
-    identity: str = Field(..., max_length=256, min_length=1)
+    person: str = Field(..., max_length=64, min_length=1)
     writable: bool
-    ownerAccess: OwnerAccess
-
-
-class NodeHelper(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    node: str = Field(..., max_length=256, min_length=1)
-    nodeKey: str = Field(..., max_length=256, min_length=1)
-    enrolledAt: str
-    enabled: bool
-    folders: list[HelperFolder] = Field(..., max_length=64)
 
 
 class HelperFolderCreate(BaseModel):
@@ -113,6 +98,94 @@ class HelperCancel(BaseModel):
     refreshToken: str = Field(..., max_length=16384, min_length=1)
     operationId: str = Field(
         ..., max_length=64, min_length=16, pattern='^[a-zA-Z0-9_-]+$'
+    )
+
+
+class InstallModeName(StrEnum):
+    production = 'production'
+    dev = 'dev'
+
+
+class JobSiteFolderPerson(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    person: str
+    name: str = Field(..., description='How the person signs in.')
+    writable: bool
+
+
+class JobSiteInviteRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    nodeName: str | None = Field(
+        None,
+        description="The machine's name in the install. Its own host name when left out.",
+        max_length=63,
+        min_length=1,
+        pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$',
+    )
+
+
+class JobSiteInvite(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    token: str = Field(..., description='Shown once.')
+    expiresAt: AwareDatetime
+    nodeName: str | None = None
+    nodesUrl: str = Field(
+        ..., description='The public node route the machine joins through.'
+    )
+    rootKey: str = Field(..., description="The root's identity key the machine pins.")
+    owner: str = Field(..., description='The sign-in name the machine will ask for.')
+
+
+class JobSiteEnable(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    enabled: bool
+
+
+class JobSiteFolderCreate(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    name: str = Field(..., max_length=80, min_length=1)
+    path: str = Field(..., max_length=4096, min_length=1)
+    writable: bool | None = False
+
+
+class JobSitePersonGrant(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(
+        ..., description='How the person signs in.', max_length=256, min_length=1
+    )
+    writable: bool
+
+
+class SignedRootTls(BaseModel):
+    jws: str = Field(
+        ...,
+        description='A JWS compact serialization with header\n`{"alg": "EdDSA", "typ": "ep-root-tls+jwt"}`, whose payload is\na `RootTls`, signed with this root\'s identity key (the key a\ntrust bundle\'s `authority` names, and a join command\'s\n`rootKey`).\n',
+    )
+
+
+class RootTlsKey(BaseModel):
+    spki: str = Field(
+        ...,
+        description="Base64url (no padding) of the SHA-256 of the presented\ncertificate's DER SubjectPublicKeyInfo.\n",
+    )
+    notAfter: int = Field(
+        ...,
+        description="The certificate's expiry, in seconds since the epoch. A site refuses a key past it.",
     )
 
 
@@ -285,12 +358,18 @@ class TrustGrant(StrEnum):
     * `gateway`: given to a node by the operator's join token, never
       claimed by the node. Service tokens with `sub: gateway` to
       other machines and to `control`.
+    * `files`: a Job Site's token key, **instead of** `node`, never
+      beside it (`docs/design/remote-nodes.md` §3.2). Service tokens
+      with `sub: agent` to `control`, and to **its own machine**.
+      Nothing else: a site that joined with a leaked token reaches no
+      other machine and no other component, on any network.
 
     """
 
     authority = 'authority'
     node = 'node'
     gateway = 'gateway'
+    files = 'files'
 
 
 class Role(StrEnum):
@@ -1503,6 +1582,7 @@ class NodeRole(StrEnum):
 
 class Grant(StrEnum):
     gateway = 'gateway'
+    files = 'files'
 
 
 class JoinTokenRequest(BaseModel):
@@ -1518,7 +1598,11 @@ class JoinTokenRequest(BaseModel):
     )
     grants: list[Grant] | None = Field(
         None,
-        description="Extra grants the node enrolled with this token receives in the\ntrust bundle. `gateway` lets it mint `sub: gateway` tokens to\nother machines, which the install's gateway needs in order to\nreach every node's drivers and agent. The wizard asks for it\non the machine that runs the gateway; `/nodes` does not.\n",
+        description="Extra grants the node enrolled with this token receives in the\ntrust bundle. `gateway` lets it mint `sub: gateway` tokens to\nother machines, which the install's gateway needs in order to\nreach every node's drivers and agent. The wizard asks for it\non the machine that runs the gateway; `/nodes` does not.\n\n`files` makes the machine a **Job Site** in place of an\nordinary node, and needs `owner`. It cannot be combined with\n`gateway`.\n",
+    )
+    owner: str | None = Field(
+        None,
+        description="The person this Job Site invitation names (`files` only). The\njoin succeeds only when that person signs in at the machine\nwith their own password (`EnrollmentRequest.owner`), and they\nbecome the site's owner. Eugene's owner invites; the person\nowns.\n",
     )
 
 
@@ -1536,6 +1620,13 @@ class JoinToken(BaseModel):
         None, description='The node name this token is bound to, when it is bound.'
     )
     grants: list[Grant] | None = None
+    owner: str | None = Field(
+        None, description='The person a Job Site invitation names.'
+    )
+    rootKey: str | None = Field(
+        None,
+        description="Base64 of this root's raw Ed25519 identity public key, for the\njoin command. A Job Site pins it **before** it sends anything\n(J7a): it checks the root's signed TLS key list\n(`GET /v1/trust/tls`) against it, and later every trust\nbundle.\n",
+    )
 
 
 class JoinTokenRecord(BaseModel):
@@ -1557,6 +1648,9 @@ class JoinTokenRecord(BaseModel):
     grants: list[Grant] | None = Field(
         None, description='What the node it enrolls will be granted, as minted.'
     )
+    owner: str | None = Field(
+        None, description='The person a Job Site invitation names.'
+    )
     used: bool = Field(
         ...,
         description='True once this token has enrolled a node. A spent token is\nkept until it expires so a replay answers 409 "already\nspent" rather than 401 "unknown" — so a listing shows it,\nand revoking it is allowed and pointless rather than\nrefused.\n',
@@ -1565,6 +1659,24 @@ class JoinTokenRecord(BaseModel):
 
 class JoinTokenList(BaseModel):
     tokens: list[JoinTokenRecord]
+
+
+class SiteOwnerProof(BaseModel):
+    """
+    The person a Job Site invitation names, confirming the join at the
+    machine with their own password (`docs/design/remote-nodes.md`
+    §3.3, rule 1). Required with a `files` join token and refused with
+    any other. Checked after the token, rate-limited as a sign-in is,
+    and never stored: the root records the site's owner from it, so
+    ownership comes from presence plus the person's own credential.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=256, min_length=1)
+    password: str = Field(..., max_length=1024, min_length=1)
 
 
 class NodeAddressAnnouncement(BaseModel):
@@ -1621,6 +1733,10 @@ class Enrollment(BaseModel):
     recoveryPublicKey: str | None = Field(
         None,
         description="The second recipient every secret on this node is sealed to.\nHeld by the control root under the passphrase-derived key, so\na dead node's credentials are recoverable by the operator and\nby nobody else.\n",
+    )
+    grants: list[TrustGrant] | None = Field(
+        None,
+        description="What this node's key was granted. `files` tells the agent it is\na Job Site: it announces no address, polls for no run\noperations, and refuses runtimes and engines.\n",
     )
 
 
@@ -1948,6 +2064,34 @@ class AuthInitializeRequest(BaseModel):
     )
 
 
+class HelperFolder(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(..., max_length=80, min_length=1)
+    path: str = Field(..., max_length=4096, min_length=1)
+    identity: str = Field(..., max_length=256, min_length=1)
+    writable: bool
+    ownerAccess: OwnerAccess
+    people: list[SitePersonGrant] | None = Field(
+        None,
+        description="On a Job Site only: who may use this folder, set by the site's owner and nobody else (J11). Empty on every other node, whose grants are each person's helperGrants. On a Job Site, `ownerAccess` (Eugene's owner's own access) may be set only in dev mode, and works only while the install is in dev mode (J13b).",
+        max_length=256,
+    )
+
+
+class NodeHelper(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    node: str = Field(..., max_length=256, min_length=1)
+    nodeKey: str = Field(..., max_length=256, min_length=1)
+    enrolledAt: str
+    enabled: bool
+    folders: list[HelperFolder] = Field(..., max_length=64)
+
+
 class HelperResult(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -1955,6 +2099,48 @@ class HelperResult(BaseModel):
     status: HelperOperationStatus
     result: dict[str, Any] | None = None
     message: str | None = Field(None, max_length=1024)
+
+
+class InstallMode(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    mode: InstallModeName
+    changedAt: AwareDatetime | None = Field(
+        None, description='When the mode last changed; null when it never has.'
+    )
+
+
+class JobSiteFolder(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str
+    name: str
+    path: str
+    writable: bool
+    people: list[JobSiteFolderPerson]
+
+
+class JobSitePeopleRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    people: list[JobSitePersonGrant] = Field(..., max_length=256)
+
+
+class RootTls(BaseModel):
+    """
+    What a Job Site checks a connection to this root against.
+    """
+
+    iat: int = Field(..., description='When it was signed, in seconds since the epoch.')
+    origin: str = Field(
+        ...,
+        description='The nodes name these keys were seen on, `https://host[:port]`.',
+    )
+    keys: list[RootTlsKey] = Field(..., max_length=8)
 
 
 class InputAudio(BaseModel):
@@ -2110,8 +2296,9 @@ class EnrollmentRequest(BaseModel):
     )
     url: AnyUrl | None = Field(
         None,
-        description="Where other hosts reach this agent — its `advertiseUrl`,\nconfigured or derived (`agent.yaml`, `GET /v1/node`). Becomes\n`Node.url`. The agent sends it because the agent knows which\ninterface it used to reach this root; a root deriving it from\nthe request's source address would be right on a flat mesh\nnetwork and wrong behind anything else.\n",
+        description="Where other hosts reach this agent — its `advertiseUrl`,\nconfigured or derived (`agent.yaml`, `GET /v1/node`). Becomes\n`Node.url`. The agent sends it because the agent knows which\ninterface it used to reach this root; a root deriving it from\nthe request's source address would be right on a flat mesh\nnetwork and wrong behind anything else.\n\n**Refused for a Job Site**, which has no address: nothing is\never sent to it.\n",
     )
+    owner: SiteOwnerProof | None = None
     agentVersion: str | None = None
     os: Os | None = None
     arch: Arch | None = None
@@ -2281,6 +2468,35 @@ class RuntimePlacementList(BaseModel):
     )
 
 
+class JobSite(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    node: str
+    enabled: bool
+    online: bool
+    ready: bool
+    supported: bool | None = None
+    reason: str | None = None
+    account: str | None = Field(
+        None, description='The OS account to give folder permission to.'
+    )
+    lastContactAt: AwareDatetime | None = None
+    folders: list[JobSiteFolder]
+
+
+class JobSiteList(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    sites: list[JobSite]
+    installMode: InstallMode
+    canInvite: bool = Field(
+        ...,
+        description='Whether the owner has opened the public route for machines, so this person can add one.',
+    )
+
+
 class Node(BaseModel):
     """
     One host in this install.
@@ -2321,7 +2537,19 @@ class Node(BaseModel):
     )
     grants: list[TrustGrant] | None = Field(
         None,
-        description="What this node's key may issue, as the trust bundle lists it:\nalways `node`, plus `gateway` when the join token that\nenrolled it said so. Given by the operator, never claimed by\nthe node.\n",
+        description="What this node's key may issue, as the trust bundle lists it:\n`node`, plus `gateway` when the join token that enrolled it\nsaid so. **A Job Site holds `files` instead of `node`**\n(`docs/design/remote-nodes.md` §3.2): it has no address, is\nsent no inference work, and its key opens only the helper\nroutes and the trust bundle. Given by the join token, never\nclaimed by the node.\n",
+    )
+    owner: str | None = Field(
+        None,
+        description="A Job Site's owner: the id of the person who confirmed the\njoin at the machine with their own password. Only that person\ngrants the site's folders to other people. `null` for every\nother node.\n",
+    )
+    ownerName: str | None = Field(
+        None,
+        description="The owner's sign-in name, for display. `null` when `owner` is.",
+    )
+    lastContactAt: AwareDatetime | None = Field(
+        None,
+        description="When this node last reached this root with its own token (the\nfile helper's poll). It is the status of a Job Site, which has\nno address to probe: *last contact N s ago*, never *down*.\nObservation, not applied state, so never replicated; `null`\nuntil it has called.\n",
     )
     trustBundleVersion: int | None = Field(
         None,

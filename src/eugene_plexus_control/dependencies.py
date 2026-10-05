@@ -18,6 +18,11 @@ levels, per `specs/docs/design/per-node-token-keys.md` D5:
   node acting for an operator who is acting on it. Only the routes an app
   install spends (its key and its sign-in registration), and each such
   route then confines the node to things named for itself.
+* `require_member_actor` — `require_node_actor`, or a **Job Site** speaking
+  for itself. The file helper's three routes take it, and nothing else:
+  a site's token is refused by every other route here
+  (`verify_bearer(..., sites=False)`, the default), so a route added later
+  cannot open to one by forgetting (remote-nodes.md §3.2).
 
 **There is no auth-disabled dev path.** A missing token key means the
 install has not been initialized, or is sealed, and the answer is 503.
@@ -48,6 +53,32 @@ from .auth_state import AuthState
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 READ_SERVICE_SUBS = frozenset({tokens.SUB_AGENT, tokens.SUB_GATEWAY})
+
+ENTRY_HEADER = "X-Eugene-Plexus-Entry"
+PUBLIC_NODES = "public-nodes"
+"""Set by the container's entry point on a request that arrived through the
+public node route (`public_nodes`, J3), and stripped by it from everything
+else. It can only narrow what a request may do: a caller who adds it by hand
+on the LAN gets the public route's rules, never more."""
+
+
+def via_public_nodes(request: Request) -> bool:
+    return request.headers.get(ENTRY_HEADER, "").strip().lower() == PUBLIC_NODES
+
+
+def is_job_site(request: Request, node: str | None) -> bool:
+    record = request.app.state.machine.state.nodes.get(node) if node else None
+    return record is not None and tokens.GRANT_FILES in record.grants
+
+
+def _refuse_job_site(request: Request, claims: tokens.Claims) -> None:
+    if claims.is_service and is_job_site(request, claims.issuer_node):
+        raise problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Invalid token",
+            f"{claims.issuer_node} is a job site: its token opens only the file helper's "
+            "routes and the trust bundle here.",
+        )
 
 
 def problem(status_code: int, title: str, detail: str) -> HTTPException:
@@ -95,11 +126,24 @@ def verify_bearer(
     token: str,
     *,
     classes: Collection[str],
+    sites: bool = False,
 ) -> tokens.Claims:
-    """Verify one bearer addressed to this root, or raise the 401 that says why."""
+    """Verify one bearer addressed to this root, or raise the 401 that says why.
+
+    A Job Site's service token is refused unless the route says `sites=True`.
+    """
     auth: AuthState = request.app.state.auth_state
     if auth.signing_key is None:
         raise _locked_or_uninitialized(request)
+    claims = verify_with_view(request, token, classes=classes)
+    if not sites:
+        _refuse_job_site(request, claims)
+    return claims
+
+
+def verify_with_view(request: Request, token: str, *, classes: Collection[str]) -> tokens.Claims:
+    """`tokens.verify` against the keys applied state names, needing no
+    private key: a sealed root still knows who its members are."""
     bundle = request.app.state.trust.view_for(request.app.state.machine.state)
     try:
         return tokens.verify(
@@ -191,7 +235,23 @@ def require_node_actor(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> tokens.Claims:
     """A member node speaking for itself: `sub: agent`, signed by its own key."""
-    claims = verify_bearer(request, _bearer(request, creds), classes=(tokens.TYP_SERVICE,))
+    return _actor(request, creds, sites=False)
+
+
+def require_member_actor(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> tokens.Claims:
+    """`require_node_actor`, or a Job Site speaking for itself (the file helper)."""
+    return _actor(request, creds, sites=True)
+
+
+def _actor(
+    request: Request, creds: HTTPAuthorizationCredentials | None, *, sites: bool
+) -> tokens.Claims:
+    claims = verify_bearer(
+        request, _bearer(request, creds), classes=(tokens.TYP_SERVICE,), sites=sites
+    )
     if claims.sub != tokens.SUB_AGENT or claims.issuer_node is None:
         raise problem(
             status.HTTP_401_UNAUTHORIZED,

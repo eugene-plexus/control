@@ -23,6 +23,9 @@ def quick_poll(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(node_helpers, "POLL_SECONDS", 0.03)
 
 
+PRODUCTION = {"mode": "production", "changedAt": None}
+
+
 def agent(keys: NodeKeys) -> dict[str, str]:
     return {"Authorization": "Bearer " + keys.service_token()}
 
@@ -130,7 +133,7 @@ def test_discovery_is_person_specific_and_never_returns_host_paths(
     owner = _tokens(c, app)
     assert c.post(
         "/oidc/node-helpers/folders", auth=auth(app), json={"refreshToken": owner["refresh_token"]}
-    ).json() == {"grants": []}
+    ).json() == {"grants": [], "installMode": PRODUCTION}
     _, issued = person(c, app, folder)
     data = c.post(
         "/oidc/node-helpers/folders", auth=auth(app), json={"refreshToken": issued["refresh_token"]}
@@ -143,7 +146,7 @@ def test_discovery_is_person_specific_and_never_returns_host_paths(
     bo = _tokens(c, app, name=other["name"])
     assert c.post(
         "/oidc/node-helpers/folders", auth=auth(app), json={"refreshToken": bo["refresh_token"]}
-    ).json() == {"grants": []}
+    ).json() == {"grants": [], "installMode": PRODUCTION}
 
 
 @pytest.mark.parametrize("kind", ["id_token", "access_token", "wrong-client", "non-workbench"])
@@ -223,7 +226,11 @@ def test_delivered_read_is_once_and_contents_never_enter_snapshot(
             ).status_code
             == 204
         )
-        assert pending.result(timeout=5).json() == result
+        assert pending.result(timeout=5).json() == {
+            **result,
+            "jobSite": False,
+            "installMode": "production",
+        }
         assert (
             c.post(
                 f"/v1/node-helpers/operations/{ident}/result", headers=agent(keys), json=result
@@ -292,7 +299,7 @@ def test_reusing_a_node_name_cannot_inherit_file_access(active_client: TestClien
     assert c.post("/v1/node-helpers/poll", headers=agent(keys), json=REPORT).status_code == 401
     assert c.post(
         "/oidc/node-helpers/folders", auth=auth(app), json={"refreshToken": issued["refresh_token"]}
-    ).json() == {"grants": []}
+    ).json() == {"grants": [], "installMode": PRODUCTION}
 
 
 @pytest.mark.parametrize("stage", ["before-submit", "queued", "running"])

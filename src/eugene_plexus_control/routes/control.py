@@ -11,17 +11,19 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 
-from .. import security, tokens, trust
+from .. import root_tls, security, tokens, trust
 from .._generated.models import (
     ControlStatus,
     LogPage,
     NodeRole,
     PromoteRequest,
     Reason,
+    SignedRootTls,
     SignedTrustBundle,
     Snapshot,
     StandbyStatus,
@@ -29,7 +31,14 @@ from .._generated.models import (
 )
 from ..applied import OP_ROTATE_SIGNING_KEY
 from ..auth_state import AuthState
-from ..dependencies import problem, require_authorized, require_operator, require_replica
+from ..dependencies import (
+    problem,
+    require_authorized,
+    require_operator,
+    require_replica,
+    verify_with_view,
+    via_public_nodes,
+)
 from ..state_machine import AlreadyActive, StateMachine
 
 log = logging.getLogger(__name__)
@@ -342,7 +351,30 @@ async def get_trust_bundle(request: Request) -> SignedTrustBundle:
     A sealed root serves the last one it signed, which it keeps on disk,
     so a node pulling during an outage keeps what it has rather than
     learning nothing.
+
+    **Except through the public node route** (J3): there it names every
+    machine, key and signed-out session to the internet, so a member's own
+    `sub: agent` token is required. A bearer sent on any route must verify.
+    Checked against the keys applied state names, which needs no private
+    key, so a sealed root still answers its members.
     """
+    authorization = request.headers.get("authorization")
+    if authorization or via_public_nodes(request):
+        scheme, _, bearer = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not bearer.strip():
+            raise problem(
+                status.HTTP_401_UNAUTHORIZED,
+                "Node token required",
+                "Through the public node route the trust bundle is given only to a member "
+                "machine presenting its own token.",
+            )
+        claims = verify_with_view(request, bearer.strip(), classes=(tokens.TYP_SERVICE,))
+        if claims.sub != tokens.SUB_AGENT or claims.issuer_node is None:
+            raise problem(
+                status.HTTP_401_UNAUTHORIZED,
+                "Node token required",
+                "Only a member machine's own agent token opens the trust bundle here.",
+            )
     publisher: trust.TrustPublisher = request.app.state.trust
     if publisher.current is None:
         raise problem(
@@ -352,6 +384,36 @@ async def get_trust_bundle(request: Request) -> SignedTrustBundle:
             "been unlocked since it was.",
         )
     return SignedTrustBundle(jws=publisher.current.jws)
+
+
+@router.get("/v1/trust/tls", response_model=SignedRootTls)
+async def get_root_tls(request: Request) -> SignedRootTls:
+    """The TLS keys this root's nodes name presents, signed by its identity (J7a).
+
+    Public keys only, so public on purpose: a Job Site fetches it before it
+    has any credential, over the connection it is checking.
+    """
+    watcher: root_tls.RootTls = request.app.state.root_tls
+    if watcher.origin is None:
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "No name for machines",
+            "This root has no nodes name, so machines outside its network cannot join it. "
+            "Its owner sets one in Settings, Container access setup.",
+        )
+    if not watcher.keys or time.perf_counter() - watcher.checked_at > root_tls.STALE_SECONDS:
+        await watcher.probe()
+    auth: AuthState = request.app.state.auth_state
+    jws = watcher.signed(auth.control_private_key)
+    if jws is None:
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "TLS keys unknown",
+            (watcher.error or "This root has not yet read the certificate its nodes name presents")
+            + ". No machine can join until it can, because a machine accepts only a key "
+            "this root has signed.",
+        )
+    return SignedRootTls(jws=jws)
 
 
 # --------------------------------------------------------------------------- #

@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials
 
 from .. import config as config_module
-from .. import keyring_store
+from .. import keyring_store, tokens
 from .._generated.models import (
     ConfigDocument,
     ConfigFieldStatus,
@@ -32,7 +33,7 @@ from .._generated.models import (
 )
 from ..applied import OP_PATCH_CONFIG
 from ..auth_state import AuthState
-from ..dependencies import require_authorized, require_operator
+from ..dependencies import problem, require_authorized, require_operator
 from ..state_machine import NotActive, StateMachine
 from .auth import install_id_of
 
@@ -140,6 +141,27 @@ def _security_mode_status(
     return None
 
 
+def _check_mode_change(
+    request: Request, machine: StateMachine, accepted: dict[str, object]
+) -> None:
+    """Switching the install mode is the `install-mode` capability (J15), and
+    is dated in the same entry so every person can be told (J18)."""
+    from .. import capabilities, node_helpers
+    from ..dependencies import verify_bearer
+
+    _, _, token = (request.headers.get("authorization") or "").partition(" ")
+    claims = verify_bearer(request, token.strip(), classes=(tokens.TYP_SESSION,))
+    if capabilities.INSTALL_MODE not in capabilities.held_by(claims):
+        raise problem(
+            status.HTTP_403_FORBIDDEN,
+            "Not permitted",
+            "Switching the install mode needs the 'install-mode' capability.",
+        )
+    if accepted["installMode"] != node_helpers.install_mode(machine.state):
+        accepted[config_module.MODE_CHANGED_AT] = datetime.now(UTC).isoformat()
+        log.warning("install mode switched to %s; every person is told", accepted["installMode"])
+
+
 @router.patch(
     "/v1/config", response_model=ConfigUpdateResult, dependencies=[Depends(require_operator)]
 )
@@ -160,6 +182,8 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
     bootstrap: config_module.BootstrapConfig = request.app.state.bootstrap_config
 
     accepted, rejected = config_module.validate_patch(body)
+    if "installMode" in accepted:
+        _check_mode_change(request, machine, accepted)
 
     # Snapshot before applying, so a securityMode transition is visible.
     # The keyring side-effects live at this layer rather than in the
