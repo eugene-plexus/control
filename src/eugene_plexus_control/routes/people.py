@@ -28,6 +28,7 @@ from .._generated.models import (
     OidcClientCreated,
     OidcClientCreateRequest,
     OidcClientList,
+    OidcClientRedirectsRequest,
     Person,
     PersonCreateRequest,
     PersonList,
@@ -39,11 +40,13 @@ from ..applied import (
     OP_DELETE_PERSON,
     OP_PUT_OIDC_CLIENT,
     OP_PUT_PERSON,
+    OP_SET_OIDC_CLIENT_REDIRECTS,
     OP_SET_PERSON_PASSWORD,
     OPERATOR_NAME,
 )
 from ..dependencies import (
     ActingOperator,
+    OperatorOrNode,
     problem,
     refuse_for_node,
     require_operator,
@@ -270,6 +273,41 @@ async def create_client(
         record["owner"] = body.owner
     machine.append(OP_PUT_OIDC_CLIENT, {"client": record})
     return OidcClientCreated(client=_client_view(record), clientSecret=secret)
+
+
+@app_clients.put(
+    "/v1/oidc/clients/{client_id}/redirect-uris",
+    response_model=OidcClient,
+    response_model_exclude_none=True,
+)
+async def set_client_redirects(
+    request: Request,
+    client_id: str,
+    body: OidcClientRedirectsRequest,
+    op: OperatorOrNode,
+) -> OidcClient:
+    """Where an app's sign-ins return to, and nothing else.
+
+    The same client id and secret, so the app's sign-ins carry on: this is
+    what lets a container moved onto one HTTPS port keep Workbench working
+    with nobody restarting it. A node may change only its own apps' clients.
+    """
+    machine = _active(request)
+    record = machine.state.oidc_clients.get(client_id)
+    if record is None:
+        raise problem(404, "No such app", "No app that signs in with Eugene has that id.")
+    if not op.may_name(record.get("owner")):
+        raise problem(
+            403,
+            "Not this machine's to change",
+            f"{op.node} may change where sign-ins return to only for its own apps, "
+            f"named app:<id>@{op.node}. Do this from a console signed in to the control root.",
+        )
+    redirects = _check_redirects([uri.root for uri in body.redirectUris])
+    if redirects == record.get("redirectUris"):
+        return _client_view(record)
+    machine.append(OP_SET_OIDC_CLIENT_REDIRECTS, {"clientId": client_id, "redirectUris": redirects})
+    return _client_view(machine.state.oidc_clients[client_id])
 
 
 @app_clients.delete("/v1/oidc/clients/{client_id}", status_code=204)

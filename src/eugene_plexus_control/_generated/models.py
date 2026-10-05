@@ -1641,7 +1641,9 @@ class LogOp(StrEnum):
     **The seven sign-in operations (C2, 2026-10-01)** replicate people,
     the apps that sign in, the provider's sealed RSA key and revoked
     sign-ins, so a promoted standby signs people in as the old root
-    did and keeps refusing what it refused.
+    did and keeps refusing what it refused. **`setOidcClientRedirects`**
+    (2026-10-05) replaces one client's redirect URIs and nothing else,
+    where `putOidcClient` only ever adds a client.
 
     The complete set of control-state mutations. Closed on purpose:
     **every change goes through one writer and one ordered path**, and
@@ -1695,6 +1697,7 @@ class LogOp(StrEnum):
     deleteOidcClient = 'deleteOidcClient'
     putOidcKey = 'putOidcKey'
     revokeSignIn = 'revokeSignIn'
+    setOidcClientRedirects = 'setOidcClientRedirects'
 
 
 class SnapshotOidcClient(BaseModel):
@@ -1752,6 +1755,13 @@ class OidcClientCreateRequest(BaseModel):
     name: str = Field(..., max_length=80, min_length=1)
     redirectUris: list[RedirectUri] = Field(..., max_length=20, min_length=1)
     owner: str | None = Field(None, max_length=120)
+
+
+class OidcClientRedirectsRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    redirectUris: list[RedirectUri] = Field(..., max_length=20, min_length=1)
 
 
 class OidcClientCreated(BaseModel):

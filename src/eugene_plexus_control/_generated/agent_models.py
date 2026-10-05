@@ -2804,6 +2804,31 @@ class FolderReachSource(StrEnum):
     override = 'override'
 
 
+class EntryPointPreviewRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    configuration: dict[str, Any] = Field(
+        ...,
+        description='Startup JSON, strictly validated by the entry point implementation.',
+    )
+
+
+class PublicEntryPoint(BaseModel):
+    """
+    Explicit external HTTPS origins for this node's optional single-port
+    container entry point. An absent optional service is not published.
+    These addresses select services, never users or permissions. Backend
+    listener addresses and this node's own controlUrl remain unchanged.
+
+    """
+
+    consoleUrl: AnyUrl
+    workbenchUrl: AnyUrl
+    inferenceUrl: AnyUrl | None = None
+    nodesUrl: AnyUrl | None = None
+
+
 class Arg(RootModel[str]):
     root: str = Field(..., max_length=512)
 
@@ -3698,6 +3723,52 @@ class LibraryFolderStatus(BaseModel):
     )
 
 
+class EntryPointPreview(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    configuration: dict[str, Any]
+    publicUrls: PublicEntryPoint
+    instructions: list[str]
+
+
+class EntryPointStatus(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    available: bool = Field(
+        ...,
+        description='This machine can run the entry point (a Linux container with the bundled proxy).',
+    )
+    unavailableReason: str | None = Field(
+        None, description='Why not, when `available` is false.'
+    )
+    path: str = Field(
+        ...,
+        description='The file this agent reads: `EUGENE_PLEXUS_AGENT_ENTRYPOINT_CONFIG`\nwhen set, otherwise `entrypoint.json` beside `agent.yaml`.\n',
+    )
+    active: bool = Field(..., description='The entry point is running in this process.')
+    publicUrls: PublicEntryPoint | None = None
+    configuration: dict[str, Any] | None = Field(
+        None, description='The configuration in effect, when `active`.'
+    )
+    confirmBy: AwareDatetime | None = Field(
+        None,
+        description='When a just-applied configuration goes back to what was there\nbefore, unless an operator request arrives through it first.\nAbsent once confirmed.\n',
+    )
+    fallback: str | None = Field(
+        None,
+        description='Why the file is not in effect, in one sentence, when it is not.',
+    )
+    reverted: str | None = Field(
+        None, description='Why the last applied configuration went back, when it did.'
+    )
+    restarting: bool | None = Field(
+        None,
+        description='True in the answer to an apply or turn-off; the agent restarts next.',
+    )
+
+
 class AppManifest(BaseModel):
     """
     What an app is, how to install it, and what it needs from the hub.
@@ -4393,6 +4464,7 @@ class NodeIdentity(BaseModel):
 
     """
 
+    entrypoint: PublicEntryPoint | None = None
     enrolled: bool = Field(
         ...,
         description='False on a fresh agent, and not an error state — supervision\nworks without a trust relationship, which is what lets the\nagent on the control host boot first and start the control\nroot.\n',

@@ -62,6 +62,7 @@ from eugene_plexus_control.applied import (
     OP_REVOKE_SIGN_IN,
     OP_ROTATE_SIGNING_KEY,
     OP_SET_CLIENT_KEY_LIMITS,
+    OP_SET_OIDC_CLIENT_REDIRECTS,
     OP_SET_PERSON_PASSWORD,
     OP_UPDATE_NODE,
     AppliedState,
@@ -108,6 +109,7 @@ EXERCISED_OPS = {
     OP_DELETE_OIDC_CLIENT,
     OP_PUT_OIDC_KEY,
     OP_REVOKE_SIGN_IN,
+    OP_SET_OIDC_CLIENT_REDIRECTS,
 }
 
 
@@ -383,6 +385,10 @@ def _write_history(machine: StateMachine) -> bytes:
                 "createdAt": when,
             }
         },
+    )
+    machine.append(
+        OP_SET_OIDC_CLIENT_REDIRECTS,
+        {"clientId": "app-two", "redirectUris": ["https://two.home.arpa/callback"]},
     )
     machine.append(
         OP_PUT_PERSON,

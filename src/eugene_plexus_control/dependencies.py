@@ -297,6 +297,42 @@ ActingOperator = Annotated[Operator, Depends(require_operator_or_acting_node)]
 """A route parameter that takes `require_operator_or_acting_node`."""
 
 
+def require_operator_or_node(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> Operator:
+    """`require_operator_or_acting_node`, or a member node on its own.
+
+    For the one route a node may call with no operator present: replacing
+    the return addresses of its own apps' sign-in clients (one HTTPS port,
+    2026-10-05). A container moved onto one HTTPS port changes where its
+    Workbench is opened, and the agent updates that at boot, when nobody is
+    signed in. The node gets nothing new by it: it runs those apps and holds
+    their client secrets, so every sign-in to them already passes through it.
+    The route confines it to clients named `app:<id>@<node>`.
+
+    The acting form (`SubjectToken`) needs no branch of its own here: a node
+    acting for an operator is confined to the same clients as the node on its
+    own, so the subject would add nothing (found by sabotage). A subject sent
+    anyway is ignored.
+    """
+    try:
+        return Operator(require_operator(request, creds))
+    except HTTPException as refused:
+        if refused.status_code != status.HTTP_401_UNAUTHORIZED:
+            raise
+        try:
+            actor = require_node_actor(request, creds)
+        except HTTPException:
+            raise refused from None
+    assert actor.issuer_node is not None  # require_node_actor said so
+    return Operator(actor, node=actor.issuer_node)
+
+
+OperatorOrNode = Annotated[Operator, Depends(require_operator_or_node)]
+"""A route parameter that takes `require_operator_or_node`."""
+
+
 def refuse_for_node(op: Operator, what: str) -> HTTPException:
     """The 403 for a node that reached past its own apps."""
     return problem(

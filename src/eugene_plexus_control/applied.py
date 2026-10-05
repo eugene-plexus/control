@@ -99,6 +99,7 @@ OP_PUT_OIDC_CLIENT = "putOidcClient"
 OP_DELETE_OIDC_CLIENT = "deleteOidcClient"
 OP_PUT_OIDC_KEY = "putOidcKey"
 OP_REVOKE_SIGN_IN = "revokeSignIn"
+OP_SET_OIDC_CLIENT_REDIRECTS = "setOidcClientRedirects"
 
 #: The owner's name on the sign-in page, which no person may take.
 OPERATOR_NAME = "operator"
@@ -131,6 +132,7 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_DELETE_OIDC_CLIENT,
         OP_PUT_OIDC_KEY,
         OP_REVOKE_SIGN_IN,
+        OP_SET_OIDC_CLIENT_REDIRECTS,
     }
 )
 
@@ -884,6 +886,18 @@ def _apply_put_oidc_client(
     return replace(state, oidc_clients={**state.oidc_clients, record["clientId"]: record})
 
 
+def _apply_set_oidc_client_redirects(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    """One client's redirect URIs, replaced; its id, secret and owner kept."""
+    client_id = payload.get("clientId")
+    if not isinstance(client_id, str) or client_id not in state.oidc_clients:
+        raise ApplyError(f"entry {index}: unknown sign-in client")
+    record = state.oidc_clients[client_id]
+    updated = _oidc_client_record({**record, "redirectUris": payload.get("redirectUris")})
+    return replace(state, oidc_clients={**state.oidc_clients, client_id: updated})
+
+
 def _apply_delete_oidc_client(
     state: AppliedState, payload: dict[str, Any], index: int
 ) -> AppliedState:
@@ -992,6 +1006,7 @@ _HANDLERS: dict[str, _Handler] = {
     OP_DELETE_OIDC_CLIENT: _apply_delete_oidc_client,
     OP_PUT_OIDC_KEY: _apply_put_oidc_key,
     OP_REVOKE_SIGN_IN: _apply_revoke_sign_in,
+    OP_SET_OIDC_CLIENT_REDIRECTS: _apply_set_oidc_client_redirects,
 }
 
 
