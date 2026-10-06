@@ -587,9 +587,16 @@ def test_production_hides_a_site_from_eugenes_owner_and_dev_mode_shows_it(root: 
     # Eugene's owner still cannot give another person the site's folder.
     assert c.put("/v1/node-helpers/desk", json={"enabled": False}).status_code == 403
 
-    # Back to production: the owner's own grant stops at once.
+    # Back to production: the owner's own grant stops at once, and is listed
+    # nowhere, though the site still lets them in.
     assert c.patch("/v1/config", json={"installMode": "production"}).status_code == 200
     assert read(c, app, owner_token, folder).status_code == 403
+    assert (
+        c.post("/oidc/sites/servers", auth=auth(app), json={"refreshToken": owner_token}).json()[
+            "servers"
+        ]
+        == []
+    )
 
 
 def test_the_mode_is_dated_only_when_it_changes(root: TestClient) -> None:
