@@ -807,3 +807,35 @@ def test_spki_pin_is_the_sha256_of_the_public_key_info() -> None:
     )
     expected = base64.urlsafe_b64encode(hashlib.sha256(spki).digest()).rstrip(b"=").decode()
     assert root_tls.spki_pin(der) == (expected, int(cert.not_valid_after_utc.timestamp()))
+
+
+def test_an_offer_nobody_claimed_is_offered_again(
+    root: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A site host restarted mid-poll: the old poll was offered the call and
+    its answer went nowhere. The restarted host must still get it."""
+    monkeypatch.setattr(sites, "OFFER_SECONDS", 0.05)
+    c = root
+    a = ada_with_a_folder(c)
+    a.held.summary["folders"][0]["people"] = [{"subject": a.person["id"], "writable": True}]
+    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+    with ThreadPoolExecutor() as pool:
+        pending = pool.submit(read, c, a, a.token)
+        lost = None
+        for _ in range(100):
+            polled = c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+            lost = polled.json()["operation"]
+            if lost:
+                break
+        assert lost, "the call was never offered"
+        time.sleep(0.1)  # the poll that took it is gone; nobody claims it
+        ident, _ = deliver(c, a.keys, a.site, a.held.report())
+        assert ident == lost
+        answer(
+            c,
+            a.keys,
+            a.site,
+            ident,
+            {"status": "done", "response": {"jsonrpc": "2.0", "id": 3, "result": {}}},
+        )
+        assert pending.result(timeout=5).json()["status"] == "done"

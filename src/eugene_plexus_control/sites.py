@@ -40,6 +40,10 @@ POLL_SECONDS = 8.0
 ONLINE_SECONDS = 25.0
 MAX_JOBS = 128
 MAX_JOBS_PER_SITE = 8
+#: How long an offered operation waits for its claim before it is offered
+#: again. A site claims at once; an offer it never claimed went to a poll
+#: whose site host was gone (restarted mid-poll), and must not strand the call.
+OFFER_SECONDS = 5.0
 
 OPERATOR = "operator"
 FILES = "files"
@@ -162,6 +166,7 @@ class Job:
     deadline: float
     state: str = "queued"
     write: bool = False
+    offered_at: float = 0.0
 
 
 class Broker:
@@ -292,9 +297,11 @@ class Broker:
         while True:
             self.changed.clear()
             if report.get("ready"):
+                now = time.perf_counter()
                 for job in self.jobs.values():
-                    if job.site == bound["site"] and job.state == "queued":
-                        job.state = "offered"
+                    stale = job.state == "offered" and now - job.offered_at > OFFER_SECONDS
+                    if job.site == bound["site"] and (job.state == "queued" or stale):
+                        job.state, job.offered_at = "offered", now
                         return job.id
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
