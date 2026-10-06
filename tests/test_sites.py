@@ -13,6 +13,7 @@ may give themselves its folders (J13b, J33).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import time
 from collections.abc import Iterator
@@ -23,6 +24,7 @@ from typing import Any
 
 import jwt
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from eugene_plexus_control import applied, root_tls, sites, tokens
@@ -727,6 +729,10 @@ def test_a_slice_2_job_site_and_its_node_folders_still_replay_and_grant_nothing(
         json={"url": "http://203.0.113.9:8079", "sequence": 1, "signature": "x"},
     )
     assert announced.status_code == 403
+    placed = root.post(
+        "/v1/runtimes", json={"node": "oldsite", "spec": {"name": "x", "modelPath": "/m.gguf"}}
+    )
+    assert placed.status_code == 409 and "retired" in placed.text
     state = machine.state
     assert applied.from_canonical(applied.to_canonical(state)) == state
     assert applied.to_canonical(state)["nodeHelpers"] == []
@@ -839,3 +845,154 @@ def test_an_offer_nobody_claimed_is_offered_again(
             {"status": "done", "response": {"jsonrpc": "2.0", "id": 3, "result": {}}},
         )
         assert pending.result(timeout=5).json()["status"] == "done"
+
+
+# --------------------------------------------------------------------------- the broker, directly
+
+
+def test_the_broker_keeps_reports_to_the_enrollment_that_made_them() -> None:
+    broker = sites.Broker()
+    old = {"site": "s-a", "enrolledAt": "2026-10-06T10:00:00+00:00"}
+    new = {"site": "s-a", "enrolledAt": "2026-10-06T11:00:00+00:00"}
+    asyncio.run(broker.poll(old, {"ready": True, "protocol": sites.PROTOCOL}))
+    assert broker.report(old) is not None and broker.last_contact(old) is not None
+    assert broker.report(new) is None and broker.last_contact(new) is None
+    assert broker.status(new)["online"] is False
+    assert broker.status(old)["online"] is True
+
+
+def test_a_site_claims_and_answers_only_its_own_operations() -> None:
+    async def go() -> None:
+        broker = sites.Broker()
+        job = sites.Job(
+            "op-1",
+            "s-a",
+            lambda: {"kind": "mcp"},
+            asyncio.get_running_loop().create_future(),
+            time.perf_counter() + 20,
+            state="offered",
+        )
+        broker.jobs[job.id] = job
+        with pytest.raises(HTTPException) as other:
+            broker.claim("s-b", "op-1")
+        assert other.value.status_code == 404 and job.state == "offered"
+        assert broker.claim("s-a", "op-1")["id"] == "op-1"
+        with pytest.raises(HTTPException):
+            broker.finish("s-b", "op-1", {"status": "done"})
+        assert not job.result.done()
+        broker.finish("s-a", "op-1", {"status": "done"})
+        assert job.result.done()
+
+    asyncio.run(go())
+
+
+def test_a_call_is_checked_against_the_enrollment_it_was_queued_for(root: TestClient) -> None:
+    from eugene_plexus_control.routes import sites as site_routes
+
+    a = ada_with_a_folder(root)
+    machine = root.app.state.machine
+    bound = sites.binding(machine.state.sites[a.site])
+    assert site_routes._same_site(machine, bound).id == a.site
+    with pytest.raises(HTTPException) as changed:
+        site_routes._same_site(machine, {**bound, "enrolledAt": "2000-01-01T00:00:00+00:00"})
+    assert changed.value.status_code == 409
+
+
+def test_a_site_needs_an_owner_who_is_on_the_install(root: TestClient) -> None:
+    with pytest.raises(applied.ApplyError, match="owner"):
+        root.app.state.machine.append(
+            applied.OP_ENROLL_SITE,
+            {
+                "id": sites.new_site_id(),
+                "label": "desk",
+                "owner": "nobody",
+                "tokenPublicKey": site_keys().public,
+                "enrolledAt": "2026-10-06T10:00:00+00:00",
+            },
+        )
+
+
+# --------------------------------------------------------------------------- joining, more
+
+
+def test_another_persons_name_does_not_confirm_the_join(root: TestClient) -> None:
+    app = workbench(root)
+    ada, _ = add_person(root, app, "ada")
+    add_person(root, app, "grace")
+    keys, token = site_keys(), invite(root, ada)["token"]
+    body = {
+        "token": token,
+        "label": "desk",
+        "tokenPublicKey": keys.public,
+        "owner": {"name": "grace", "password": PASSPHRASE},
+    }
+    assert root.post("/v1/sites/enroll", json=body).status_code == 401
+    body["owner"] = {"name": "ada", "password": PASSPHRASE}
+    assert root.post("/v1/sites/enroll", json=body).status_code == 201, "the invitation was kept"
+
+
+def test_a_locked_root_does_not_spend_the_invitation(root: TestClient) -> None:
+    app = workbench(root)
+    ada, _ = add_person(root, app, "ada")
+    keys, token = site_keys(), invite(root, ada)["token"]
+    body = {
+        "token": token,
+        "label": "desk",
+        "tokenPublicKey": keys.public,
+        "owner": {"name": "ada", "password": PASSPHRASE},
+    }
+    held = root.app.state.auth_state.signing_key
+    root.app.state.auth_state.signing_key = None
+    try:
+        assert root.post("/v1/sites/enroll", json=body).status_code == 503
+    finally:
+        root.app.state.auth_state.signing_key = held
+    assert root.post("/v1/sites/enroll", json=body).status_code == 201
+
+
+def test_a_person_may_hold_three_open_invitations_and_no_more(root: TestClient) -> None:
+    app = workbench(root)
+    _, ada_token = add_person(root, app, "ada")
+    codes = [
+        root.post("/oidc/job-sites/invite", auth=auth(app), json={"refreshToken": ada_token})
+        for _ in range(4)
+    ]
+    assert [c.status_code for c in codes] == [200, 200, 200, 429]
+
+
+def test_eugenes_owner_gets_production_mode_not_a_silent_nothing(root: TestClient) -> None:
+    """In production the refusal says so; it is not the same answer as having
+    no grant, because the owner can do something about it (switch to dev)."""
+    a = ada_with_a_folder(root)
+    operator = _tokens(root, a.app, name="operator")["refresh_token"]
+    refused = read(root, a, operator)
+    assert refused.status_code == 403
+    assert "production mode" in refused.text.lower()
+
+
+def test_a_change_of_mode_is_dated(root: TestClient) -> None:
+    app = workbench(root)
+    assert root.post("/oidc/install-mode", auth=auth(app)).json()["changedAt"] is None
+    assert root.patch("/v1/config", json={"installMode": "dev"}).status_code == 200
+    assert root.post("/oidc/install-mode", auth=auth(app)).json()["changedAt"]
+
+
+def test_deleting_the_owner_ends_a_call_queued_for_their_site(root: TestClient) -> None:
+    """Their site goes with them, and so does what was waiting for it: the
+    caller hears at once, rather than after the call's 20 s."""
+    c = root
+    a = ada_with_a_folder(c)
+    a.held.summary["folders"][0]["people"] = [{"subject": a.person["id"], "writable": True}]
+    bo, bo_token = add_person(c, a.app, "bo")
+    a.held.summary["folders"][0]["people"].append({"subject": bo["id"], "writable": False})
+    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+    with ThreadPoolExecutor() as pool:
+        started = time.perf_counter()
+        pending = pool.submit(read, c, a, bo_token)
+        for _ in range(100):
+            if c.app.state.site_broker.jobs:
+                break
+            time.sleep(0.01)
+        assert c.delete(f"/v1/people/{a.person['id']}").status_code == 204
+        ended = pending.result(timeout=10)
+    assert ended.status_code == 503 and time.perf_counter() - started < 10

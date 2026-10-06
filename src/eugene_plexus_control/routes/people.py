@@ -182,7 +182,15 @@ async def update_person(request: Request, person_id: str, body: PersonUpdateRequ
 async def delete_person(request: Request, person_id: str) -> Response:
     machine = _active(request)
     _person(machine, person_id)
+    owned = [s for s, record in machine.state.sites.items() if record.owner == person_id]
     machine.append(OP_DELETE_PERSON, {"id": person_id})
+    # Their sites went with them (J19): end what was queued for those sites
+    # now, as removing a site does, rather than leave it to time out.
+    from .. import sites
+
+    for site in owned:
+        sites.broker(request).forget(site)
+        request.app.state.site_contacts.pop(site, None)
     return Response(status_code=204)
 
 
