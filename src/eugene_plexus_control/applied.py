@@ -100,6 +100,10 @@ OP_DELETE_OIDC_CLIENT = "deleteOidcClient"
 OP_PUT_OIDC_KEY = "putOidcKey"
 OP_REVOKE_SIGN_IN = "revokeSignIn"
 OP_SET_OIDC_CLIENT_REDIRECTS = "setOidcClientRedirects"
+OP_ENROLL_SITE = "enrollSite"
+OP_REMOVE_SITE = "removeSite"
+OP_SET_SITE_HOST = "setSiteHost"
+OP_SET_SITE_DEV_GRANTS = "setSiteDevGrants"
 
 #: The owner's name on the sign-in page, which no person may take.
 OPERATOR_NAME = "operator"
@@ -133,6 +137,10 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_PUT_OIDC_KEY,
         OP_REVOKE_SIGN_IN,
         OP_SET_OIDC_CLIENT_REDIRECTS,
+        OP_ENROLL_SITE,
+        OP_REMOVE_SITE,
+        OP_SET_SITE_HOST,
+        OP_SET_SITE_DEV_GRANTS,
     }
 )
 
@@ -202,10 +210,12 @@ class NodeRecord:
     grants: tuple[str, ...] = ("node",)
     """What the node's key may issue. `gateway` comes from the join token
     that enrolled it, which the operator minted; never from the node.
-    A Job Site holds exactly `("files",)` (remote-nodes.md §3.2)."""
+    Exactly `("files",)` marks a Job Site joined as a node before slice
+    2b.1 (J19): **retired**. It still replays, so a later `revokeNode` of
+    it does too, but it is in no listing and no trust bundle."""
     owner: str | None = None
-    """A Job Site's owner: the person who confirmed its join at the
-    machine with their own password. None for every other node."""
+    """A retired files node's owner, kept so its entries replay. None for
+    every other node."""
     agentVersion: str | None = None
     os: str | None = None
     arch: str | None = None
@@ -213,6 +223,28 @@ class NodeRecord:
     enrolledAt: str | None = None
     """From the entry's payload, stamped once by the writer that
     appended it. Never `now()` at apply time."""
+
+
+@dataclass(frozen=True)
+class SiteRecord:
+    """A Job Site (J19): its own enrollment, held by its site host, never a
+    node. Every field comes from a log entry's payload."""
+
+    id: str
+    label: str
+    owner: str
+    """The person who confirmed its join at the machine (rule 1 of
+    remote-nodes.md §3.3). Only they decide who may use it."""
+    tokenPublicKey: str
+    """Base64 of the site's raw Ed25519 token key. Checked by this root
+    alone; never in the trust bundle nodes receive."""
+    enrolledAt: str
+    hostNode: str | None = None
+    """The node whose agent says it supervises this site (J32). Display
+    only: nothing is authorized by it."""
+    devGrants: tuple[dict[str, Any], ...] = ()
+    """Eugene's owner's own dev-mode grants here (J13b), `{folderId,
+    writable}`, sorted by folder."""
 
 
 @dataclass(frozen=True)
@@ -354,7 +386,8 @@ class AppliedState:
     """People who may sign in to apps (C2), by id, as `SnapshotPerson`:
     their Argon2id verifiers included, for the reason `passphraseVerifier`
     is replicated -- a promoted standby signs them in."""
-    node_helpers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    sites: dict[str, SiteRecord] = field(default_factory=dict)
+    """The Job Site registry (J19), by id."""
     oidc_clients: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Apps that sign in with Eugene, by `clientId`, as `SnapshotOidcClient`."""
     oidc_keys: tuple[dict[str, Any], ...] = ()
@@ -465,14 +498,16 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
 _NODE_GRANTS = frozenset({"node", "gateway", "files"})
 
 
-def is_job_site(record: NodeRecord | None) -> bool:
-    """A machine joined as a Job Site: files only, no address, no inference work."""
+def is_retired_site(record: NodeRecord | None) -> bool:
+    """A Job Site that joined as a node before slice 2b.1 (J19, J20). It
+    replays, and is in no listing and no trust bundle."""
     return record is not None and "files" in record.grants
 
 
 def _grants(raw: Any, index: int) -> tuple[str, ...]:
     """A node's grants, sorted so replay is byte-stable: always including
-    `node`, except a Job Site's, which are exactly `files`."""
+    `node`, except a retired Job Site's, which are exactly `files`. Nothing
+    writes `files` now; old logs still hold it."""
     if raw is None:
         return ("node",)
     if not isinstance(raw, list) or not all(isinstance(g, str) for g in raw):
@@ -821,6 +856,9 @@ def _person_record(raw: Any) -> dict[str, Any]:
         raise ApplyError("invalid person apps")
     if not isinstance(raw.get("disabled"), bool):
         raise ApplyError("invalid person disabled")
+    # Folder grants on nodes retired with the node folders (J20). Old
+    # entries still carry them; they are checked as they always were and
+    # then dropped, so they grant nothing and reach no snapshot.
     grants = raw.get("helperGrants", [])
     if not isinstance(grants, list) or len(grants) > 256:
         raise ApplyError("invalid helper grants")
@@ -839,7 +877,9 @@ def _person_record(raw: Any) -> dict[str, Any]:
         seen.add(grant["folderId"])
     _timestamp(raw, "createdAt", "person")
     _timestamp(raw, "passwordChangedAt", "person")
-    return dict(raw)
+    record = dict(raw)
+    record.pop("helperGrants", None)
+    return record
 
 
 def _apply_put_person(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
@@ -872,7 +912,13 @@ def _apply_delete_person(state: AppliedState, payload: dict[str, Any], index: in
     person_id = payload.get("id")
     if person_id not in state.people:
         raise ApplyError(f"entry {index}: unknown person")
-    return replace(state, people={k: v for k, v in state.people.items() if k != person_id})
+    # A site has one owner, and only they decide who may use it: their
+    # sites go with them.
+    return replace(
+        state,
+        people={k: v for k, v in state.people.items() if k != person_id},
+        sites={k: v for k, v in state.sites.items() if v.owner != person_id},
+    )
 
 
 def _oidc_client_record(raw: Any) -> dict[str, Any]:
@@ -966,54 +1012,126 @@ def _apply_revoke_sign_in(state: AppliedState, payload: dict[str, Any], index: i
     return replace(state, revoked_sign_ins=kept)
 
 
-def _helper_record(raw: Any) -> dict[str, Any]:
-    from ._generated.models import NodeHelper
-
-    try:
-        record = NodeHelper.model_validate(raw).model_dump(mode="json")
-    except (ValueError, TypeError) as exc:
-        raise ApplyError("invalid node helper configuration") from exc
-    for folder in record["folders"]:
-        # Only a slice 1 Job Site's folders carried who may use them, and
-        # they replay but are read by nothing: since slice 2 a site keeps
-        # them itself (J6b). An empty list is left out, so every other node's
-        # record is byte-identical to the one it was before Job Sites, and a
-        # standby on that build reads it.
-        if not folder.get("people"):
-            folder.pop("people", None)
-    # Eugene's owner's own dev-mode grants on a Job Site (J13b); absent on
-    # every other record, for the same reason.
-    if not record.get("devGrants"):
-        record.pop("devGrants", None)
-    granted = [g["folderId"] for g in record.get("devGrants") or []]
-    if len(granted) != len(set(granted)):
-        raise ApplyError("a folder is granted twice to Eugene's owner")
-    ids = [f["id"] for f in record["folders"]]
-    if len(ids) != len(set(ids)):
-        raise ApplyError("duplicate helper folder")
-    if any(f["ownerAccess"] == "write" and not f["writable"] for f in record["folders"]):
-        raise ApplyError("owner write access exceeds folder permission")
-    for folder in record["folders"]:
-        people = [p["person"] for p in folder.get("people", [])]
-        if len(people) != len(set(people)):
-            raise ApplyError("a person is named twice on one folder")
-        if any(p["writable"] and not folder["writable"] for p in folder.get("people", [])):
-            raise ApplyError("a person's write access exceeds folder permission")
-    return record
-
-
 def _apply_put_node_helper(
     state: AppliedState, payload: dict[str, Any], index: int
 ) -> AppliedState:
-    record = _helper_record(payload.get("helper"))
-    node = state.nodes.get(record["node"])
-    if (
-        node is None
-        or record["nodeKey"] != node.signingPublicKey
-        or record["enrolledAt"] != node.enrolledAt
-    ):
-        raise ApplyError("helper does not name this enrolled machine")
-    return replace(state, node_helpers={**state.node_helpers, record["node"]: record})
+    """Read and ignored: the operator-managed node folders retired (J20).
+    Old logs hold these entries, so they must still apply."""
+    if not isinstance(payload.get("helper"), dict):
+        raise ApplyError(f"entry {index}: a node helper entry holds an object")
+    return state
+
+
+SITE_ID_ALPHABET = frozenset("abcdefghijklmnopqrstuvwxyz234567")
+
+
+def valid_site_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 28
+        and value.startswith("s-")
+        and set(value[2:]) <= SITE_ID_ALPHABET
+    )
+
+
+def _site_id(payload: dict[str, Any], index: int) -> str:
+    value = payload.get("id")
+    if not valid_site_id(value):
+        raise ApplyError(f"entry {index}: invalid site id {value!r}")
+    return str(value)
+
+
+def _dev_grants(raw: Any, index: int) -> tuple[dict[str, Any], ...]:
+    if not isinstance(raw, list) or len(raw) > 64:
+        raise ApplyError(f"entry {index}: devGrants must be a list of at most 64")
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for grant in raw:
+        if (
+            not isinstance(grant, dict)
+            or set(grant) != {"folderId", "writable"}
+            or not isinstance(grant["folderId"], str)
+            or not grant["folderId"]
+            or len(grant["folderId"]) > 64
+            or type(grant["writable"]) is not bool
+            or grant["folderId"] in seen
+        ):
+            raise ApplyError(f"entry {index}: invalid dev grant")
+        seen.add(grant["folderId"])
+        out.append({"folderId": grant["folderId"], "writable": grant["writable"]})
+    return tuple(sorted(out, key=lambda g: g["folderId"]))
+
+
+def _apply_enroll_site(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    site = _site_id(payload, index)
+    if site in state.sites:
+        raise ApplyError(f"entry {index}: site {site} is enrolled already")
+    owner = _require_str(payload, "owner", index)
+    if owner not in state.people:
+        raise ApplyError(f"entry {index}: a site's owner must be a person on this install")
+    record = SiteRecord(
+        id=site,
+        label=_require_str(payload, "label", index),
+        owner=owner,
+        tokenPublicKey=_require_str(payload, "tokenPublicKey", index),
+        enrolledAt=_require_str(payload, "enrolledAt", index),
+    )
+    return replace(state, sites={**state.sites, site: record})
+
+
+def _apply_remove_site(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    site = _site_id(payload, index)
+    if site not in state.sites:
+        raise ApplyError(f"entry {index}: cannot remove unknown site {site}")
+    return replace(state, sites={k: v for k, v in state.sites.items() if k != site})
+
+
+def _apply_set_site_host(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    site = _site_id(payload, index)
+    record = state.sites.get(site)
+    if record is None:
+        raise ApplyError(f"entry {index}: unknown site {site}")
+    host = payload.get("hostNode")
+    if host is not None and (not isinstance(host, str) or not host):
+        raise ApplyError(f"entry {index}: hostNode must be a node name or null")
+    return replace(state, sites={**state.sites, site: replace(record, hostNode=host)})
+
+
+def _apply_set_site_dev_grants(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    site = _site_id(payload, index)
+    record = state.sites.get(site)
+    if record is None:
+        raise ApplyError(f"entry {index}: unknown site {site}")
+    grants = _dev_grants(payload.get("devGrants"), index)
+    return replace(state, sites={**state.sites, site: replace(record, devGrants=grants)})
+
+
+def _site_canonical(site: SiteRecord) -> dict[str, Any]:
+    return {
+        "id": site.id,
+        "label": site.label,
+        "owner": site.owner,
+        "tokenPublicKey": site.tokenPublicKey,
+        "enrolledAt": site.enrolledAt,
+        "hostNode": site.hostNode,
+        "devGrants": [dict(g) for g in site.devGrants],
+    }
+
+
+def _site_from_canonical(raw: Any) -> SiteRecord:
+    if not isinstance(raw, dict) or not valid_site_id(raw.get("id")):
+        raise ApplyError("invalid site in snapshot")
+    return SiteRecord(
+        id=str(raw["id"]),
+        label=str(raw["label"]),
+        owner=str(raw["owner"]),
+        tokenPublicKey=str(raw["tokenPublicKey"]),
+        enrolledAt=str(raw["enrolledAt"]),
+        hostNode=raw.get("hostNode"),
+        devGrants=_dev_grants(raw.get("devGrants") or [], 0),
+    )
 
 
 _Handler = Callable[["AppliedState", dict[str, Any], int], "AppliedState"]
@@ -1043,6 +1161,10 @@ _HANDLERS: dict[str, _Handler] = {
     OP_PUT_OIDC_KEY: _apply_put_oidc_key,
     OP_REVOKE_SIGN_IN: _apply_revoke_sign_in,
     OP_SET_OIDC_CLIENT_REDIRECTS: _apply_set_oidc_client_redirects,
+    OP_ENROLL_SITE: _apply_enroll_site,
+    OP_REMOVE_SITE: _apply_remove_site,
+    OP_SET_SITE_HOST: _apply_set_site_host,
+    OP_SET_SITE_DEV_GRANTS: _apply_set_site_dev_grants,
 }
 
 
@@ -1116,7 +1238,9 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
         "sealedRecoveryKey": identity.sealedRecoveryKey,
         "signingKeyId": identity.signingKeyId,
         "people": [state.people[key] for key in sorted(state.people)],
-        "nodeHelpers": [state.node_helpers[key] for key in sorted(state.node_helpers)],
+        "sites": [_site_canonical(state.sites[key]) for key in sorted(state.sites)],
+        # Declared by `Snapshot` for old snapshots, and always empty now (J20).
+        "nodeHelpers": [],
         "oidcClients": [state.oidc_clients[key] for key in sorted(state.oidc_clients)],
         "oidcKeys": [dict(k) for k in state.oidc_keys],
         "revokedSignIns": [
@@ -1197,9 +1321,7 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         client_keys=_key_records(raw.get("clientKeys", [])),
         revoked_sessions={str(r["jti"]): int(r["exp"]) for r in raw.get("revokedSessions") or []},
         people={(p := _person_record(item))["id"]: p for item in raw.get("people") or []},
-        node_helpers={
-            (h := _helper_record(item))["node"]: h for item in raw.get("nodeHelpers") or []
-        },
+        sites={(s := _site_from_canonical(item)).id: s for item in raw.get("sites") or []},
         oidc_clients={
             (c := _oidc_client_record(item))["clientId"]: c for item in raw.get("oidcClients") or []
         },

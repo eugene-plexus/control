@@ -17,46 +17,101 @@ from pydantic import (
 )
 
 
-class HelperGrant(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    folderId: str = Field(..., max_length=64, min_length=1)
-    writable: bool
-
-
-class OwnerAccess(StrEnum):
-    none = 'none'
-    read = 'read'
-    write = 'write'
-
-
-class SitePersonGrant(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    person: str = Field(..., max_length=64, min_length=1)
-    writable: bool
-
-
-class HelperFolderCreate(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    name: str = Field(
+class SiteId(RootModel[str]):
+    root: str = Field(
         ...,
-        description="Unique on the node, since it is the file server's `folder` argument (J6g); a name in use there is refused with 409. A folder registered before that rule, sharing a name with an earlier one, is offered as `Name (2)`.",
-        max_length=80,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
+
+
+class SiteOwnerProof(BaseModel):
+    """
+    The person a site invitation names, confirming the join at the machine
+    with their own password (remote-nodes.md §3.3, rule 1). Checked after
+    the join token, rate-limited as a sign-in is, and never stored: the root
+    records the site's owner from it, so ownership comes from presence plus
+    the person's own credential.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=256, min_length=1)
+    password: str = Field(..., max_length=1024, min_length=1)
+
+
+class SiteEnrollmentRequest(BaseModel):
+    """
+    What a site host sends to join (`POST /v1/sites/enroll`). It generated
+    its token key first and sends only the public half; no private key
+    leaves the machine (J23).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    token: str = Field(
+        ...,
+        description="The site invitation's join token.",
+        max_length=4096,
         min_length=1,
     )
-    path: str = Field(..., max_length=4096, min_length=1)
-    writable: bool | None = False
-    ownerAccess: OwnerAccess | None = 'none'
+    label: str = Field(
+        ...,
+        description="What people call the site, the machine's name by default. Not unique, not an identifier.",
+        max_length=63,
+        min_length=1,
+        pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$',
+    )
+    tokenPublicKey: str = Field(
+        ...,
+        description="Base64 of the site's raw Ed25519 token public key. Its tokens are checked against it, by the root alone; it is never in the trust bundle nodes receive.",
+        max_length=64,
+        min_length=40,
+    )
+    owner: SiteOwnerProof
+    hostVersion: str | None = Field(None, max_length=64)
+
+
+class SiteEnrollment(BaseModel):
+    """
+    The root's answer to a site's join. The site records its owner from it,
+    once (J6b); no later answer changes it.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
+    label: str = Field(
+        ...,
+        description="What people call the site, the machine's name by default. Not unique, not an identifier.",
+        max_length=63,
+        min_length=1,
+        pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$',
+    )
+    owner: str = Field(
+        ..., description="The owner's person id.", max_length=64, min_length=1
+    )
+    ownerName: str = Field(..., description='How the owner signs in', max_length=256)
+    controlPublicKey: str = Field(
+        ...,
+        description="Base64 of the root's raw Ed25519 identity key. A site that pinned a key at its join (J7a) checks it is this one.",
+    )
+    enrolledAt: AwareDatetime
 
 
 class SiteHostProtocol(StrEnum):
     """
-    What a machine's host speaks to the root, through its agent. The only value is MCP's 2026-07-28 revision.
+    What a site host speaks to the root. The only value is MCP's 2026-07-28 revision.
     """
 
     mcp_2026_07_28 = 'mcp-2026-07-28'
@@ -124,29 +179,31 @@ class SiteToolGrant(BaseModel):
     )
 
 
-class McpJsonRpc(StrEnum):
-    field_2_0 = '2.0'
+class SitePollAnswer(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    operation: str | None = Field(
+        ...,
+        description='The id of an operation waiting for this site to claim, or null when the long poll ended with none.',
+    )
 
 
-class HelperOperationStatus(StrEnum):
-    done = 'done'
-    failed = 'failed'
-    uncertain = 'uncertain'
+class InstallModeName(StrEnum):
+    """
+    The install's mode (J13, J18). In `dev`, Eugene's owner sees all tool information; in `production`, owners are restricted.
+    """
 
-
-class McpMethod(StrEnum):
-    server_discover = 'server/discover'
-    tools_list = 'tools/list'
-    tools_call = 'tools/call'
+    production = 'production'
+    dev = 'dev'
 
 
 class SiteGrantHint(BaseModel):
     """
-    One of the root's own folder grants, carried with a call in a list
-    (`grants`): on an ordinary node, all of the person's grants there, the
-    root's grant being final (J6d); on a job site, Eugene's owner's dev-mode
-    grants, which the site honours only if its owner opted in (J6e). The
-    host checks the folder a call names against them.
+    One of Eugene's owner's dev-mode folder grants on a site (J13b), carried
+    with a call in a list (`grants`). The site honours them only if its
+    owner opted in there (J6e) and Eugene is in dev mode. The host checks
+    the folder a call names against them.
 
     """
 
@@ -165,21 +222,164 @@ class SiteGrantHint(BaseModel):
     writable: bool
 
 
-class HelperOperationKind(StrEnum):
+class SiteOperationKind(StrEnum):
     """
-    `mcp`: one MCP request to one of the machine's servers. `manage`: one of the site host's management actions (`SiteManageAction`, site-host.yaml).
+    `mcp`: one MCP request to one of the site's servers. `manage`: one of the site host's management actions (`SiteManageAction`, site-host.yaml).
     """
 
     mcp = 'mcp'
     manage = 'manage'
 
 
-class InstallModeName(StrEnum):
-    production = 'production'
-    dev = 'dev'
+class McpJsonRpc(StrEnum):
+    field_2_0 = '2.0'
 
 
-class HelperDiscovery(BaseModel):
+class McpMethod(StrEnum):
+    server_discover = 'server/discover'
+    tools_list = 'tools/list'
+    tools_call = 'tools/call'
+
+
+class McpResponse(BaseModel):
+    """
+    The JSON-RPC response to an `McpRequest`, exactly as the site's server
+    produced it after the site's policy filtered it: `result` or `error`.
+
+    """
+
+    jsonrpc: McpJsonRpc
+    id: str | int | None = None
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+
+
+class SiteAnswerStatus(StrEnum):
+    """
+    `done`: the site answered (an MCP error or a tool's own failure is still
+    `done`, inside `response`). `failed`: the site refused or could not run
+    it, and `message` says why in the site's words; nothing ran. `uncertain`:
+    a tool call started and its end could not be established; it may have
+    acted.
+
+    """
+
+    done = 'done'
+    failed = 'failed'
+    uncertain = 'uncertain'
+
+
+class SiteDevGrant(BaseModel):
+    """
+    A folder Eugene's owner gave themselves on a site in dev mode (J13b). It
+    works only while the install is in dev mode, and only if the site's
+    owner lets Eugene's owner in there (J6e), which the site checks itself.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    folderId: str = Field(..., max_length=64, min_length=1)
+    writable: bool
+
+
+class SiteOwnerAccess(StrEnum):
+    none = 'none'
+    read = 'read'
+    write = 'write'
+
+
+class SiteDevFolder(BaseModel):
+    """
+    A folder on a site, as the site last reported it, with Eugene's owner's own dev-mode access to it.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str
+    name: str
+    path: str
+    writable: bool = Field(
+        ..., description='Whether the folder was registered for writing at all.'
+    )
+    ownerAccess: SiteOwnerAccess
+
+
+class InstallMode(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    mode: InstallModeName
+    changedAt: AwareDatetime | None = Field(
+        None, description='When the mode last changed; null when it never has.'
+    )
+
+
+class SiteInvitationRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    owner: str = Field(
+        ...,
+        description='The person id the site will belong to. They confirm at the machine.',
+        max_length=64,
+        min_length=1,
+    )
+    label: str | None = Field(
+        None,
+        description="What people call the site, the machine's name by default. Not unique, not an identifier.",
+        max_length=63,
+        min_length=1,
+        pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$',
+    )
+    ttlSeconds: int | None = Field(900, ge=30, le=86400)
+
+
+class SiteInvitation(BaseModel):
+    """
+    A site invitation. The token is shown once.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description='The handle to withdraw it by (`DELETE /v1/nodes/join-tokens/{id}`), not the token.',
+    )
+    token: str
+    expiresAt: AwareDatetime
+    owner: str
+    ownerName: str = Field(
+        ..., description='The sign-in name the machine will ask for.'
+    )
+    label: str | None = None
+    joinUrl: str | None = Field(
+        None, description='The address the machine joins through'
+    )
+    rootKey: str = Field(
+        ..., description="Base64 of the root's raw Ed25519 identity key"
+    )
+
+
+class HostedSites(BaseModel):
+    """
+    The sites a node's agent supervises, by id (J32). Display only.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    sites: list[SiteId] = Field(..., max_length=16)
+
+
+class JobSiteRequest(BaseModel):
+    """
+    A Workbench request on behalf of its signed-in person.
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -196,16 +396,6 @@ class SiteCancel(BaseModel):
     )
 
 
-class InstallMode(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    mode: InstallModeName
-    changedAt: AwareDatetime | None = Field(
-        None, description='When the mode last changed; null when it never has.'
-    )
-
-
 class SiteServerFolder(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -213,26 +403,21 @@ class SiteServerFolder(BaseModel):
     id: str = Field(..., max_length=64, min_length=1)
     name: str = Field(
         ...,
-        description="Unique on its machine; the `folder` argument's value.",
+        description="Unique on its site; the `folder` argument's value.",
         max_length=96,
         min_length=1,
     )
     writable: bool = Field(..., description='This person may change files in it.')
 
 
-class SiteAnswerStatus(StrEnum):
-    """
-    `done`: the site answered (an MCP error or a tool's own failure is still
-    `done`, inside `response`). `failed`: the site refused or could not run
-    it, and `message` says why in the site's words; nothing ran. `uncertain`:
-    a tool call started and its end could not be established; it may have
-    acted.
-
-    """
-
-    done = 'done'
-    failed = 'failed'
-    uncertain = 'uncertain'
+class SiteMcpAnswer(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    status: SiteAnswerStatus
+    message: str | None = Field(None, max_length=1024)
+    response: McpResponse | None = None
+    installMode: InstallModeName
 
 
 class JobSiteFolderPerson(BaseModel):
@@ -261,9 +446,9 @@ class JobSiteInviteRequest(BaseModel):
         extra='forbid',
     )
     refreshToken: str = Field(..., max_length=16384, min_length=1)
-    nodeName: str | None = Field(
+    label: str | None = Field(
         None,
-        description="The machine's name in the install. Its own host name when left out.",
+        description="What people call the site, the machine's name by default. Not unique, not an identifier.",
         max_length=63,
         min_length=1,
         pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$',
@@ -276,20 +461,10 @@ class JobSiteInvite(BaseModel):
     )
     token: str = Field(..., description='Shown once.')
     expiresAt: AwareDatetime
-    nodeName: str | None = None
-    nodesUrl: str = Field(
-        ..., description='The public node route the machine joins through.'
-    )
+    label: str | None = None
+    joinUrl: str = Field(..., description='The address the machine joins through.')
     rootKey: str = Field(..., description="The root's identity key the machine pins.")
     owner: str = Field(..., description='The sign-in name the machine will ask for.')
-
-
-class JobSiteEnable(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    refreshToken: str = Field(..., max_length=16384, min_length=1)
-    enabled: bool
 
 
 class JobSiteFolderCreate(BaseModel):
@@ -1770,7 +1945,6 @@ class NodeRole(StrEnum):
 
 class Grant(StrEnum):
     gateway = 'gateway'
-    files = 'files'
 
 
 class JoinTokenRequest(BaseModel):
@@ -1786,11 +1960,7 @@ class JoinTokenRequest(BaseModel):
     )
     grants: list[Grant] | None = Field(
         None,
-        description="Extra grants the node enrolled with this token receives in the\ntrust bundle. `gateway` lets it mint `sub: gateway` tokens to\nother machines, which the install's gateway needs in order to\nreach every node's drivers and agent. The wizard asks for it\non the machine that runs the gateway; `/nodes` does not.\n\n`files` makes the machine a **Job Site** in place of an\nordinary node, and needs `owner`. It cannot be combined with\n`gateway`.\n",
-    )
-    owner: str | None = Field(
-        None,
-        description="The person this Job Site invitation names (`files` only). The\njoin succeeds only when that person signs in at the machine\nwith their own password (`EnrollmentRequest.owner`), and they\nbecome the site's owner. Eugene's owner invites; the person\nowns.\n",
+        description="Extra grants the node enrolled with this token receives in the\ntrust bundle. `gateway` lets it mint `sub: gateway` tokens to\nother machines, which the install's gateway needs in order to\nreach every node's drivers and agent. The wizard asks for it\non the machine that runs the gateway; `/nodes` does not.\n",
     )
 
 
@@ -1808,63 +1978,15 @@ class JoinToken(BaseModel):
         None, description='The node name this token is bound to, when it is bound.'
     )
     grants: list[Grant] | None = None
-    owner: str | None = Field(
-        None, description='The person a Job Site invitation names.'
-    )
-    rootKey: str | None = Field(
-        None,
-        description="Base64 of this root's raw Ed25519 identity public key, for the\njoin command. A Job Site pins it **before** it sends anything\n(J7a): it checks the root's signed TLS key list\n(`GET /v1/trust/tls`) against it, and later every trust\nbundle.\n",
-    )
 
 
-class JoinTokenRecord(BaseModel):
+class JoinTokenKind(StrEnum):
     """
-    One outstanding join token, **without the token**.
-
-    The store keeps a hash and never the secret, so this is
-    everything that can honestly be said about a minted token after
-    the one moment it was shown: what it was for, when it dies, and
-    whether it has been spent.
-
+    What a join token enrolls. A site invitation (`POST /v1/sites/invitations`) is listed and withdrawn with the node tokens.
     """
 
-    id: str = Field(..., description='The handle to revoke it by.')
-    expiresAt: AwareDatetime
-    nodeName: str | None = Field(
-        None, description='The node name this token is bound to, when it is bound.'
-    )
-    grants: list[Grant] | None = Field(
-        None, description='What the node it enrolls will be granted, as minted.'
-    )
-    owner: str | None = Field(
-        None, description='The person a Job Site invitation names.'
-    )
-    used: bool = Field(
-        ...,
-        description='True once this token has enrolled a node. A spent token is\nkept until it expires so a replay answers 409 "already\nspent" rather than 401 "unknown" — so a listing shows it,\nand revoking it is allowed and pointless rather than\nrefused.\n',
-    )
-
-
-class JoinTokenList(BaseModel):
-    tokens: list[JoinTokenRecord]
-
-
-class SiteOwnerProof(BaseModel):
-    """
-    The person a Job Site invitation names, confirming the join at the
-    machine with their own password (`docs/design/remote-nodes.md`
-    §3.3, rule 1). Required with a `files` join token and refused with
-    any other. Checked after the token, rate-limited as a sign-in is,
-    and never stored: the root records the site's owner from it, so
-    ownership comes from presence plus the person's own credential.
-
-    """
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    name: str = Field(..., max_length=256, min_length=1)
-    password: str = Field(..., max_length=1024, min_length=1)
+    node = 'node'
+    site = 'site'
 
 
 class NodeAddressAnnouncement(BaseModel):
@@ -1924,11 +2046,7 @@ class Enrollment(BaseModel):
     )
     grants: list[TrustGrant] | None = Field(
         None,
-        description="What this node's key was granted. `files` tells the agent it is\na Job Site: it announces no address, polls for no run\noperations, and refuses runtimes and engines.\n",
-    )
-    owner: str | None = Field(
-        None,
-        description='On a Job Site, the person who confirmed this join at the machine\n(their id). The site pins it: its host takes management actions\nfrom this person alone, and refuses a different `siteOwner` in a\nlater poll (J6b, rule 2 of §3.3).\n',
+        description="What this node's key was granted: `node`, plus `gateway` when\nthe join token said so.\n",
     )
 
 
@@ -1946,6 +2064,16 @@ class StandbyStatus(BaseModel):
 
 class LogOp(StrEnum):
     """
+    **The four Job Site operations (slice 2b.1, 2026-10-06)** are
+    `enrollSite`, `removeSite`, `setSiteHost` (a node's display-only
+    claim to host a site, J32) and `setSiteDevGrants` (Eugene's owner's
+    own dev-mode grants on a site, J13b). A Job Site is its own
+    enrollment, never a node (J19). **`putNodeHelper` is read and
+    ignored**, because the operator-managed node folders retired (J20).
+    An `enrollNode` that granted `files` still applies, so a later
+    `revokeNode` of it replays, but the node it records is retired
+    (`Node.grants`).
+
     **The seven sign-in operations (C2, 2026-10-01)** replicate people,
     the apps that sign in, the provider's sealed RSA key and revoked
     sign-ins, so a promoted standby signs people in as the old root
@@ -2006,6 +2134,29 @@ class LogOp(StrEnum):
     putOidcKey = 'putOidcKey'
     revokeSignIn = 'revokeSignIn'
     setOidcClientRedirects = 'setOidcClientRedirects'
+    enrollSite = 'enrollSite'
+    removeSite = 'removeSite'
+    setSiteHost = 'setSiteHost'
+    setSiteDevGrants = 'setSiteDevGrants'
+
+
+class SnapshotPerson(BaseModel):
+    helperGrants: list[dict[str, Any]] | None = Field(
+        None,
+        deprecated=True,
+        description='Read from snapshots written before slice 2b.1, and ignored (J20).',
+    )
+    id: str
+    name: str
+    displayName: str | None = None
+    email: str | None = None
+    passwordVerifier: str = Field(
+        ..., description="Argon2id, the passphrase's parameters."
+    )
+    apps: list[str] | None = None
+    disabled: bool
+    createdAt: AwareDatetime
+    passwordChangedAt: AwareDatetime
 
 
 class SnapshotOidcClient(BaseModel):
@@ -2024,6 +2175,67 @@ class SnapshotOidcKey(BaseModel):
     sealedKey: str
     publicJwk: dict[str, Any]
     createdAt: AwareDatetime
+
+
+class Person(BaseModel):
+    """
+    Someone the operator lets sign in to apps (C2). Not an operator:
+    a person's sign-in opens their apps and nothing in the hub.
+
+    """
+
+    id: str = Field(..., description='Stable; the `sub` in their ID tokens.')
+    name: str = Field(
+        ..., description='What they sign in with. Unique, compared case-folded.'
+    )
+    displayName: str | None = None
+    email: str | None = Field(
+        None,
+        description='Optional, and unique compared case-folded. Given to an app that\nasks for the `email` scope, with `email_verified: false`: Eugene\nsends no mail and has proved nothing about it. Some apps (Open\nWebUI) identify people by it (C4).\n',
+    )
+    apps: list[str] | None = Field(
+        None,
+        description='The `clientId`s they may sign in to. Null is every app on the install.',
+    )
+    disabled: bool
+    createdAt: AwareDatetime
+    passwordChangedAt: AwareDatetime
+
+
+class PersonList(BaseModel):
+    people: list[Person]
+    operatorName: str | None = Field(
+        None,
+        description='The name the owner signs in with, once the install has people.',
+    )
+
+
+class PersonCreateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(
+        ..., max_length=64, min_length=1, pattern='^[^\\s@][^@]*[^\\s@]$|^[^\\s@]$'
+    )
+    displayName: str | None = Field(None, max_length=120)
+    email: str | None = Field(None, max_length=254, pattern='^[^@\\s]+@[^@\\s]+$')
+    password: str = Field(..., max_length=1024, min_length=12)
+    apps: list[str] | None = None
+
+
+class PersonUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    displayName: str | None = Field(None, max_length=120)
+    email: str | None = Field(
+        None,
+        description='A new address, or `null` to clear it.',
+        max_length=254,
+        pattern='^[^@\\s]+@[^@\\s]+$',
+    )
+    apps: list[str] | None = None
+    disabled: bool | None = None
 
 
 class PersonPasswordRequest(BaseModel):
@@ -2256,43 +2468,6 @@ class AuthInitializeRequest(BaseModel):
     )
 
 
-class HelperFolder(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    id: str = Field(..., max_length=64, min_length=1)
-    name: str = Field(..., max_length=80, min_length=1)
-    path: str = Field(..., max_length=4096, min_length=1)
-    identity: str = Field(..., max_length=256, min_length=1)
-    writable: bool
-    ownerAccess: OwnerAccess
-    people: list[SitePersonGrant] | None = Field(
-        None,
-        description="Deprecated, read and ignored. Slice 1 kept a Job Site's folders and who may use them here; since slice 2 the site keeps them itself and its own list is final (J6b). Kept so the replicated log replays.",
-        max_length=256,
-    )
-
-
-class NodeHelper(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    node: str = Field(..., max_length=256, min_length=1)
-    nodeKey: str = Field(..., max_length=256, min_length=1)
-    enrolledAt: str
-    enabled: bool
-    folders: list[HelperFolder] = Field(
-        ...,
-        description="An ordinary node's folders, registered by Eugene's owner. A Job Site's folders are the site's own (`HelperReport.site`); none are kept here for one.",
-        max_length=64,
-    )
-    devGrants: list[HelperGrant] | None = Field(
-        None,
-        description="On a Job Site only: the folders Eugene's owner gave themselves in dev mode (J13b). They work only while the install is in dev mode, and only if the site's owner lets Eugene's owner in there (J6e), which the site checks itself.",
-        max_length=64,
-    )
-
-
 class SiteAccess(BaseModel):
     """
     Who may use which tools of one local server. Eugene's file server is
@@ -2381,26 +2556,15 @@ class SiteServer(BaseModel):
     tools: list[SiteTool] = Field(..., max_length=64)
 
 
-class McpResponse(BaseModel):
-    """
-    The JSON-RPC response to an `McpRequest`, exactly as the site's server
-    produced it after the site's policy filtered it: `result` or `error`.
-
-    """
-
-    jsonrpc: McpJsonRpc
-    id: str | int | None = None
-    result: dict[str, Any] | None = None
-    error: dict[str, Any] | None = None
-
-
 class McpRequest(BaseModel):
     """
     One MCP request of the 2026-07-28 revision: `server/discover`,
     `tools/list` or `tools/call`. `params._meta` carries
-    `io.modelcontextprotocol/protocolVersion` (`2026-07-28`) and may carry the
-    client's info and capabilities. Nothing else crosses: no notifications, no
-    server-initiated requests, no other methods.
+    `io.modelcontextprotocol/protocolVersion` (`2026-07-28`) and
+    `io.modelcontextprotocol/clientCapabilities` (the revision's envelope: the
+    SDK answers a request without it with an error), and may carry the
+    client's info. Nothing else crosses: no notifications, no server-initiated
+    requests, no other methods.
 
     """
 
@@ -2412,15 +2576,72 @@ class McpRequest(BaseModel):
     params: dict[str, Any] | None = None
 
 
-class SiteServerGrant(BaseModel):
+class SiteResult(BaseModel):
     """
-    One server on one machine that the signed-in person may use. The file server (`files`) appears once per machine, with the folders the person may use there (J6g).
+    A site's answer to an operation it claimed (`POST /v1/sites/operations/{id}/result`).
     """
 
     model_config = ConfigDict(
         extra='forbid',
     )
-    node: str
+    status: SiteAnswerStatus
+    message: str | None = Field(None, max_length=1024)
+    result: dict[str, Any] | None = Field(
+        None, description="A management action's result."
+    )
+    response: McpResponse | None = Field(
+        None,
+        description="An MCP request's JSON-RPC response, as the site's server answered it after its policy filtered it.",
+    )
+
+
+class SiteFolderOwnerAccess(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    ownerAccess: SiteOwnerAccess
+
+
+class SiteDevView(BaseModel):
+    """
+    What dev mode adds to a site's entry in the console (J13, J33): its
+    folders and servers as it last reported them, and Eugene's owner's own
+    access there. Absent in production, where the console shows membership
+    only (J19).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    ownerInDevMode: bool | None = Field(
+        ...,
+        description="Whether the site's owner lets Eugene's owner in while Eugene is in dev mode (J6e). Null until the site has reported.",
+    )
+    folders: list[SiteDevFolder]
+    servers: list[SiteServer]
+
+
+class SiteServerGrant(BaseModel):
+    """
+    One server on one site that the signed-in person may use. The file server (`files`) appears once per site, with the folders the person may use there (J6g).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    site: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
+    label: str = Field(
+        ...,
+        description="What people call the site, the machine's name by default. Not unique, not an identifier.",
+        max_length=63,
+        min_length=1,
+        pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$',
+    )
     server: str = Field(
         ...,
         description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
@@ -2429,7 +2650,6 @@ class SiteServerGrant(BaseModel):
     )
     name: str = Field(..., description="The server's name.")
     kind: SiteServerKind
-    jobSite: bool
     available: bool
     reason: str | None = None
     folders: list[SiteServerFolder] = Field(
@@ -2444,7 +2664,11 @@ class SiteMcpCall(BaseModel):
         extra='forbid',
     )
     refreshToken: str = Field(..., max_length=16384, min_length=1)
-    node: str = Field(..., max_length=256, min_length=1)
+    site: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
     server: str = Field(
         ...,
         description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
@@ -2454,25 +2678,11 @@ class SiteMcpCall(BaseModel):
     request: McpRequest
     operationId: str | None = Field(
         None,
-        description='Lets `/oidc/sites/cancel` stop it before the machine claims it.',
+        description='Lets `/oidc/sites/cancel` stop it before the site claims it.',
         max_length=64,
         min_length=16,
         pattern='^[a-zA-Z0-9_-]+$',
     )
-
-
-class SiteMcpAnswer(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    status: SiteAnswerStatus
-    message: str | None = Field(None, max_length=1024)
-    response: McpResponse | None = None
-    jobSite: bool = Field(
-        ...,
-        description='Whether a Job Site answered. Workbench keeps it with the result, with `installMode` (J13a, J18).',
-    )
-    installMode: InstallModeName
 
 
 class JobSiteFolder(BaseModel):
@@ -2485,7 +2695,7 @@ class JobSiteFolder(BaseModel):
     )
     id: str
     name: str = Field(
-        ..., description='Unique on the machine; what Workbench and the model call it.'
+        ..., description='Unique on the site; what Workbench and the model call it.'
     )
     path: str
     writable: bool
@@ -2695,6 +2905,40 @@ class DirectoryEntry(BaseModel):
     )
 
 
+class JoinTokenRecord(BaseModel):
+    """
+    One outstanding join token, **without the token**.
+
+    The store keeps a hash and never the secret, so this is
+    everything that can honestly be said about a minted token after
+    the one moment it was shown: what it was for, when it dies, and
+    whether it has been spent.
+
+    """
+
+    id: str = Field(..., description='The handle to revoke it by.')
+    expiresAt: AwareDatetime
+    nodeName: str | None = Field(
+        None, description='The node name this token is bound to, when it is bound.'
+    )
+    grants: list[Grant] | None = Field(
+        None, description='What the node it enrolls will be granted, as minted.'
+    )
+    kind: JoinTokenKind | None = None
+    owner: str | None = Field(
+        None,
+        description="The person a site invitation names. Absent on a node's token.",
+    )
+    used: bool = Field(
+        ...,
+        description='True once this token has enrolled a node. A spent token is\nkept until it expires so a replay answers 409 "already\nspent" rather than 401 "unknown" — so a listing shows it,\nand revoking it is allowed and pointless rather than\nrefused.\n',
+    )
+
+
+class JoinTokenList(BaseModel):
+    tokens: list[JoinTokenRecord]
+
+
 class EnrollmentRequest(BaseModel):
     token: str = Field(
         ..., description="The join token, which is this request's only credential."
@@ -2714,9 +2958,8 @@ class EnrollmentRequest(BaseModel):
     )
     url: AnyUrl | None = Field(
         None,
-        description="Where other hosts reach this agent — its `advertiseUrl`,\nconfigured or derived (`agent.yaml`, `GET /v1/node`). Becomes\n`Node.url`. The agent sends it because the agent knows which\ninterface it used to reach this root; a root deriving it from\nthe request's source address would be right on a flat mesh\nnetwork and wrong behind anything else.\n\n**Refused for a Job Site**, which has no address: nothing is\never sent to it.\n",
+        description="Where other hosts reach this agent — its `advertiseUrl`,\nconfigured or derived (`agent.yaml`, `GET /v1/node`). Becomes\n`Node.url`. The agent sends it because the agent knows which\ninterface it used to reach this root; a root deriving it from\nthe request's source address would be right on a flat mesh\nnetwork and wrong behind anything else.\n",
     )
-    owner: SiteOwnerProof | None = None
     agentVersion: str | None = None
     os: Os | None = None
     arch: Arch | None = None
@@ -2775,99 +3018,31 @@ class LogEntry(BaseModel):
     )
 
 
-class SnapshotPerson(BaseModel):
-    helperGrants: list[HelperGrant] | None = Field(
-        None,
-        description='Explicit access to folders on enrolled nodes; absent means no access.',
-        max_length=256,
-    )
-    id: str
-    name: str
-    displayName: str | None = None
-    email: str | None = None
-    passwordVerifier: str = Field(
-        ..., description="Argon2id, the passphrase's parameters."
-    )
-    apps: list[str] | None = None
-    disabled: bool
-    createdAt: AwareDatetime
-    passwordChangedAt: AwareDatetime
-
-
-class Person(BaseModel):
+class SnapshotSite(BaseModel):
     """
-    Someone the operator lets sign in to apps (C2). Not an operator:
-    a person's sign-in opens their apps and nothing in the hub.
-
+    One Job Site in the registry (J19).
     """
 
-    helperGrants: list[HelperGrant] | None = Field(
-        None,
-        description='Explicit access to folders on enrolled nodes; absent means no access.',
-        max_length=256,
-    )
-    id: str = Field(..., description='Stable; the `sub` in their ID tokens.')
-    name: str = Field(
-        ..., description='What they sign in with. Unique, compared case-folded.'
-    )
-    displayName: str | None = None
-    email: str | None = Field(
-        None,
-        description='Optional, and unique compared case-folded. Given to an app that\nasks for the `email` scope, with `email_verified: false`: Eugene\nsends no mail and has proved nothing about it. Some apps (Open\nWebUI) identify people by it (C4).\n',
-    )
-    apps: list[str] | None = Field(
-        None,
-        description='The `clientId`s they may sign in to. Null is every app on the install.',
-    )
-    disabled: bool
-    createdAt: AwareDatetime
-    passwordChangedAt: AwareDatetime
-
-
-class PersonList(BaseModel):
-    people: list[Person]
-    operatorName: str | None = Field(
-        None,
-        description='The name the owner signs in with, once the install has people.',
-    )
-
-
-class PersonCreateRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
-    helperGrants: list[HelperGrant] | None = Field(
-        None,
-        description='Explicit access to folders on enrolled nodes; absent means no access.',
-        max_length=256,
+    id: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
     )
-    name: str = Field(
-        ..., max_length=64, min_length=1, pattern='^[^\\s@][^@]*[^\\s@]$|^[^\\s@]$'
+    label: str = Field(
+        ...,
+        description="What people call the site, the machine's name by default. Not unique, not an identifier.",
+        max_length=63,
+        min_length=1,
+        pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$',
     )
-    displayName: str | None = Field(None, max_length=120)
-    email: str | None = Field(None, max_length=254, pattern='^[^@\\s]+@[^@\\s]+$')
-    password: str = Field(..., max_length=1024, min_length=12)
-    apps: list[str] | None = None
-
-
-class PersonUpdateRequest(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    helperGrants: list[HelperGrant] | None = Field(
-        None,
-        description='Explicit access to folders on enrolled nodes; absent means no access.',
-        max_length=256,
-    )
-    displayName: str | None = Field(None, max_length=120)
-    email: str | None = Field(
-        None,
-        description='A new address, or `null` to clear it.',
-        max_length=254,
-        pattern='^[^@\\s]+@[^@\\s]+$',
-    )
-    apps: list[str] | None = None
-    disabled: bool | None = None
+    owner: str = Field(..., description="The owner's person id.")
+    tokenPublicKey: str
+    enrolledAt: AwareDatetime
+    hostNode: str | None = None
+    devGrants: list[SiteDevGrant] | None = Field(None, max_length=64)
 
 
 class ComponentPlacementList(BaseModel):
@@ -2916,46 +3091,41 @@ class SiteSummary(BaseModel):
     )
 
 
-class HelperResult(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    status: HelperOperationStatus
-    result: dict[str, Any] | None = Field(
-        None, description="A management action's result."
-    )
-    message: str | None = Field(None, max_length=1024)
-    response: McpResponse | None = Field(
-        None,
-        description="An MCP request's JSON-RPC response, as the machine's host answered it.",
-    )
-
-
-class HelperOperation(BaseModel):
+class SiteOperation(BaseModel):
     """
-    What a machine claims: one operation, bound to this machine's enrolment, to be done before `expiresAt`. The agent checks the binding and hands the rest to the machine's host, whose policy decides (J8).
+    What a site claims (`POST /v1/sites/operations/{id}/claim`): one
+    operation, bound to this site's enrollment, to be done before
+    `expiresAt`. The site host refuses one whose `site` or `enrolledAt` is
+    not its own, so an operation queued for an earlier enrollment never runs
+    on a later one; then its policy decides (J8).
+
     """
 
     model_config = ConfigDict(
         extra='forbid',
     )
     id: str = Field(..., max_length=128, min_length=1)
-    expiresAt: float
-    node: str
-    nodeKey: str
-    enrolledAt: str
+    expiresAt: float = Field(..., description='Unix seconds. At most 30 s ahead.')
+    site: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
+    enrolledAt: AwareDatetime
     subject: str = Field(
         ...,
-        description="Who asked, as the root established it (a person's id, or `operator`).",
+        description="Who asked, as the root established it (a person's id, or `operator` for Eugene's owner).",
+        max_length=64,
+        min_length=1,
     )
-    kind: HelperOperationKind
+    kind: SiteOperationKind
     server: SiteServerId | None = Field(
-        None, description="For `mcp`, the machine's server."
+        None, description="For `mcp`, the site's server."
     )
     request: McpRequest | None = Field(None, description='For `mcp`, the request.')
     grants: list[SiteGrantHint] | None = Field(
         None,
-        description="For `mcp` to the file server: on an ordinary node, all of the person's grants there, where the root's grant is final (J6d); on a Job Site, Eugene's owner's dev-mode grants (J6e). Empty otherwise. The host checks the folder a call names against them (J6g).",
+        description="For `mcp` to the file server from Eugene's owner, their dev-mode grants (J6e). Empty otherwise.",
         max_length=64,
     )
     action: str | None = Field(None, description='For `manage`, the action.')
@@ -2963,6 +3133,56 @@ class HelperOperation(BaseModel):
         None, description='For `manage`, its arguments.'
     )
     installMode: InstallModeName
+
+
+class Site(BaseModel):
+    """
+    One Job Site, as Eugene's owner sees it in the console (J19).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
+    label: str = Field(
+        ...,
+        description="What people call the site, the machine's name by default. Not unique, not an identifier.",
+        max_length=63,
+        min_length=1,
+        pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$',
+    )
+    owner: str = Field(..., description="The owner's person id.")
+    ownerName: str = Field(..., description='How the owner signs in.')
+    online: bool = Field(
+        ...,
+        description='The site polled within the last 25 s. A site has no address to probe, so this is its status.',
+    )
+    lastContactAt: AwareDatetime | None = None
+    ready: bool
+    reason: str | None = None
+    hostVersion: str | None = None
+    hostNode: str | None = Field(
+        None,
+        description='The node whose agent says it hosts this site (J32). For display and links only; nothing is authorized by it.',
+    )
+    enrolledAt: AwareDatetime
+    dev: SiteDevView | None = Field(None, description='In dev mode only (J33).')
+
+
+class SiteList(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    sites: list[Site]
+    installMode: InstallMode
+    joinUrl: str | None = Field(
+        None,
+        description='The address a machine joins through, when this root knows one (see `JobSiteList.canInvite`).',
+    )
 
 
 class SiteServerList(BaseModel):
@@ -2974,25 +3194,39 @@ class SiteServerList(BaseModel):
 
 
 class JobSite(BaseModel):
+    """
+    One of the signed-in person's own sites, as Workbench's Job sites page shows it.
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
-    node: str
-    enabled: bool
+    id: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
+    label: str = Field(
+        ...,
+        description="What people call the site, the machine's name by default. Not unique, not an identifier.",
+        max_length=63,
+        min_length=1,
+        pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$',
+    )
     online: bool
     ready: bool
-    supported: bool | None = None
     reason: str | None = None
     account: str | None = Field(
-        None, description='The OS account to give folder permission to.'
+        None, description="The OS account the site's tools run as."
     )
     lastContactAt: AwareDatetime | None = None
+    hostNode: str | None = Field(None, description='The node that hosts it (J32)')
     folders: list[JobSiteFolder] = Field(
         ...,
         description='The folders registered on it, which its one file server offers by name (J6g), and who may use each.',
     )
-    servers: list[JobSiteServer] | None = Field(
-        None, description='The local servers a machine administrator added at it.'
+    servers: list[JobSiteServer] = Field(
+        ..., description='The local servers a machine administrator added at it.'
     )
     ownerInDevMode: bool | None = Field(
         None,
@@ -3008,7 +3242,7 @@ class JobSiteList(BaseModel):
     installMode: InstallMode
     canInvite: bool = Field(
         ...,
-        description='Whether the owner has opened the public route for machines, so this person can add one.',
+        description="Whether this root knows the address a machine joins through: the\nentry point's nodes name, or the address Eugene's owner set\n(`siteJoinUrl` in the root's settings). It does not need the public\nroute: a machine on the root's own network joins through its LAN\naddress (J31).\n",
     )
 
 
@@ -3059,19 +3293,12 @@ class Node(BaseModel):
     )
     grants: list[TrustGrant] | None = Field(
         None,
-        description="What this node's key may issue, as the trust bundle lists it:\n`node`, plus `gateway` when the join token that enrolled it\nsaid so. **A Job Site holds `files` instead of `node`**\n(`docs/design/remote-nodes.md` §3.2): it has no address, is\nsent no inference work, and its key opens only the helper\nroutes and the trust bundle. Given by the join token, never\nclaimed by the node.\n",
+        description="What this node's key may issue, as the trust bundle lists it:\n`node`, plus `gateway` when the join token that enrolled it\nsaid so. Given by the join token, never claimed by the node.\nA Job Site is not a node: it has its own registry and key\n(`/v1/sites`, J19). A node enrolled with `files` before that\n(slices 1 and 2) still replays, as a **retired** node: it is\nin no listing and no trust bundle, and nothing it signs is\naccepted.\n",
     )
     owner: str | None = Field(
         None,
-        description="A Job Site's owner: the id of the person who confirmed the\njoin at the machine with their own password. Only that person\ngrants the site's folders to other people. `null` for every\nother node.\n",
-    )
-    ownerName: str | None = Field(
-        None,
-        description="The owner's sign-in name, for display. `null` when `owner` is.",
-    )
-    lastContactAt: AwareDatetime | None = Field(
-        None,
-        description="When this node last reached this root with its own token (the\nfile helper's poll). It is the status of a Job Site, which has\nno address to probe: *last contact N s ago*, never *down*.\nObservation, not applied state, so never replicated; `null`\nuntil it has called.\n",
+        deprecated=True,
+        description='Written only for a node enrolled with `files` before slice\n2b.1, and kept so its log and snapshots still replay. `null`\nfor every other node.\n',
     )
     trustBundleVersion: int | None = Field(
         None,
@@ -3376,7 +3603,15 @@ class Snapshot(BaseModel):
         None,
         description='The people who may sign in to apps, as `putPerson`,\n`setPersonPassword` and `deletePerson` left them, with their\nArgon2id verifiers: as `passphraseVerifier` is here, and for the\nsame reason (a promoted standby signs people in).\n',
     )
-    nodeHelpers: list[NodeHelper] | None = None
+    sites: list[SnapshotSite] | None = Field(
+        None,
+        description='The Job Site registry (J19), as `enrollSite`, `removeSite`, `setSiteHost` and `setSiteDevGrants` left it.',
+    )
+    nodeHelpers: list[dict[str, Any]] | None = Field(
+        None,
+        deprecated=True,
+        description='Read from snapshots written before slice 2b.1, and ignored. The operator-managed node folders retired (J20).',
+    )
     oidcClients: list[SnapshotOidcClient] | None = None
     oidcKeys: list[SnapshotOidcKey] | None = Field(
         None,
@@ -3388,23 +3623,25 @@ class Snapshot(BaseModel):
     )
 
 
-class HelperReport(BaseModel):
+class SiteReport(BaseModel):
+    """
+    What a site host reports in each poll (`POST /v1/sites/poll`). The root
+    keeps it as a cache for listings; the site checks every call against
+    its own copy again (rule 2 of remote-nodes.md §3.3).
+
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
-    supported: bool
+    protocol: SiteHostProtocol
+    hostVersion: str | None = Field(None, max_length=64)
     ready: bool
     reason: str | None = Field(None, max_length=1024)
-    account: str | None = Field(None, max_length=256)
-    protocol: SiteHostProtocol | None = Field(
-        None,
-        description="The protocol this machine's host speaks. Absent from an agent older than slice 2, whose helper takes only the four bespoke tools; the root then says the machine needs an update, rather than sending it MCP.",
+    account: str | None = Field(
+        None, description="The OS account the site's tools run as.", max_length=256
     )
-    hostVersion: str | None = Field(None, max_length=64)
-    site: SiteSummary | None = Field(
-        None,
-        description="A Job Site's own folders, servers and list of who may use what (J6b).",
-    )
+    site: SiteSummary | None = None
 
 
 class NodeList(BaseModel):

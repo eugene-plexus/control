@@ -59,16 +59,14 @@ class Settings(BaseSettings):
     """Its explicit HTTPS entry-point origin; local calls stay on agent_url."""
     nodes_origin: str | None = None
     """The entry point's nodes name, `https://host[:port]`, when it has one:
-    where machines outside the network join and poll (remote-nodes.md §3.1).
-    Supplied by the supervising agent. Job Site invitations name it, and the
-    TLS keys it presents are what this root signs (`root_tls`)."""
+    where Job Sites join and poll through (job-sites-own-enrollment.md §2.3).
+    Supplied by the supervising agent. Site invitations name it ahead of
+    `siteJoinUrl`, and the TLS keys it presents are what this root signs
+    (`root_tls`)."""
     nodes_probe: str | None = None
     """`host:port` where this root reads the key its nodes name presents,
     when Eugene's own proxy terminates TLS: that proxy on loopback. Unset
     behind an outside proxy, and the public name is dialled instead."""
-    nodes_public: bool = False
-    """Whether the nodes name answers any network for the node paths
-    (`public_nodes`). Job Site invitations from Workbench need it."""
 
     safe_mode: bool = False
     """Skip the persisted config at startup and run on built-in

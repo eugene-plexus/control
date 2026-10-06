@@ -237,6 +237,24 @@ FIELDS: list[ConfigField] = [
         enumLabels=["Production", "Dev (the owner sees all tool information)"],
     ),
     ConfigField(
+        key="siteJoinUrl",
+        label="Address machines join through",
+        description=(
+            "Where a machine on this network reaches this root when it joins as "
+            "a job site and polls from then on -- for example "
+            "http://192.168.1.5:8083. Workbench puts it in the join command "
+            "a person runs on their machine. The entry point's name for "
+            "machines, when it has one, is used instead."
+        ),
+        category="security",
+        valueType=ConfigValueType.url,
+        default=None,
+        unsetMeans=(
+            "The entry point's name for machines, when it has one. With "
+            "neither, people cannot add job sites from Workbench."
+        ),
+    ),
+    ConfigField(
         key="oidcIssuer",
         label="Sign-in address for apps",
         description=(

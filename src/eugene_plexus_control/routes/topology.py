@@ -229,8 +229,9 @@ async def create_runtime(request: Request, body: RuntimePlacementSpec) -> Runtim
     if tokens.GRANT_FILES in record.grants:
         raise problem(
             status.HTTP_409_CONFLICT,
-            "A job site runs nothing",
-            f"{node_name!r} is a job site: it serves files to its owner and runs no models "
+            "A retired job site runs nothing",
+            f"{node_name!r} joined as a job site before job sites had their own enrollment: "
+            "it is retired, and runs no models "
             "(remote-nodes.md §3.2). Choose another node.",
         )
     if not record.url:

@@ -95,7 +95,8 @@ class _Record:
     """Extra trust-bundle grants for the node this token enrolls. The
     operator chose them when minting; the node never asks."""
     owner: str | None = None
-    """The person a Job Site invitation names (`files` only)."""
+    """The person a site invitation names; None on a node's token. A site
+    invitation's `node_name` is its label, which binds nothing."""
 
 
 class JoinTokenStore:
@@ -155,7 +156,7 @@ class JoinTokenStore:
             self._sweep_locked()
             return sum(1 for r in self._records.values() if r.owner == owner and not r.used)
 
-    def peek(self, token: str, *, node_name: str) -> TokenRecord:
+    def peek(self, token: str, *, node_name: str | None) -> TokenRecord:
         """What `consume` would spend, without spending it. Raises as it would.
 
         For a Job Site invitation the person's password is checked between
@@ -170,7 +171,11 @@ class JoinTokenStore:
                 raise JoinTokenError("join token is unknown or has expired")
             if record.used:
                 raise JoinTokenConsumed("this join token has already enrolled a node")
-            if record.node_name is not None and record.node_name != node_name:
+            if (
+                node_name is not None
+                and record.node_name is not None
+                and record.node_name != node_name
+            ):
                 raise JoinTokenError(
                     f"this join token is bound to node {record.node_name!r} and cannot "
                     f"enroll {node_name!r}"
@@ -225,7 +230,7 @@ class JoinTokenStore:
                     return True
         return False
 
-    def consume(self, token: str, *, node_name: str) -> tuple[str, ...]:
+    def consume(self, token: str, *, node_name: str | None) -> tuple[str, ...]:
         """Spend a token for one node name, returning its grants. Raises on any problem.
 
         Marks the token used *before* the caller does anything with the
@@ -245,7 +250,11 @@ class JoinTokenStore:
             if record.expires_at <= now:
                 del self._records[token_hash]
                 raise JoinTokenError("join token has expired; mint another")
-            if record.node_name is not None and record.node_name != node_name:
+            if (
+                node_name is not None
+                and record.node_name is not None
+                and record.node_name != node_name
+            ):
                 raise JoinTokenError(
                     f"this join token is bound to node {record.node_name!r} and cannot "
                     f"enroll {node_name!r}"

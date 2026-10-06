@@ -46,6 +46,7 @@ from eugene_plexus_control.applied import (
     OP_DELETE_PERSON,
     OP_DELETE_RUNTIME,
     OP_ENROLL_NODE,
+    OP_ENROLL_SITE,
     OP_PATCH_CONFIG,
     OP_PROMOTE,
     OP_PUT_CLIENT_ADMISSION,
@@ -56,6 +57,7 @@ from eugene_plexus_control.applied import (
     OP_PUT_OIDC_KEY,
     OP_PUT_PERSON,
     OP_PUT_RUNTIME,
+    OP_REMOVE_SITE,
     OP_REVOKE_CLIENT_KEY,
     OP_REVOKE_NODE,
     OP_REVOKE_SESSION,
@@ -64,6 +66,8 @@ from eugene_plexus_control.applied import (
     OP_SET_CLIENT_KEY_LIMITS,
     OP_SET_OIDC_CLIENT_REDIRECTS,
     OP_SET_PERSON_PASSWORD,
+    OP_SET_SITE_DEV_GRANTS,
+    OP_SET_SITE_HOST,
     OP_UPDATE_NODE,
     AppliedState,
     ApplyError,
@@ -110,6 +114,10 @@ EXERCISED_OPS = {
     OP_PUT_OIDC_KEY,
     OP_REVOKE_SIGN_IN,
     OP_SET_OIDC_CLIENT_REDIRECTS,
+    OP_ENROLL_SITE,
+    OP_REMOVE_SITE,
+    OP_SET_SITE_HOST,
+    OP_SET_SITE_DEV_GRANTS,
 }
 
 
@@ -410,6 +418,34 @@ def _write_history(machine: StateMachine) -> bytes:
         {"id": "p-ada", "passwordVerifier": verifier, "passwordChangedAt": when},
     )
     machine.append(OP_DELETE_OIDC_CLIENT, {"clientId": "app-two"})
+    # Job Sites (slice 2b.1): Ada's and Bob's. Bob's goes with him.
+    for site, owner in (
+        ("s-" + "a" * 26, "p-ada"),
+        ("s-" + "b" * 26, "p-bob"),
+        ("s-" + "c" * 26, "p-ada"),
+    ):
+        machine.append(
+            OP_ENROLL_SITE,
+            {
+                "id": site,
+                "label": "desk",
+                "owner": owner,
+                "tokenPublicKey": placeholder(f"site-{site}"),
+                "enrolledAt": when,
+            },
+        )
+    machine.append(OP_SET_SITE_HOST, {"id": "s-" + "a" * 26, "hostNode": "gpu-büro"})
+    machine.append(
+        OP_SET_SITE_DEV_GRANTS,
+        {
+            "id": "s-" + "a" * 26,
+            "devGrants": [
+                {"folderId": "f2", "writable": True},
+                {"folderId": "f1", "writable": False},
+            ],
+        },
+    )
+    machine.append(OP_REMOVE_SITE, {"id": "s-" + "c" * 26})
     machine.append(OP_DELETE_PERSON, {"id": "p-bob"})
     machine.append(
         OP_PUT_OIDC_KEY,
@@ -773,6 +809,7 @@ def _genesis(machine: StateMachine) -> dict[str, Any]:
         "config": {},
         "clientKeys": [],
         "people": [],
+        "sites": [],
         "oidcClients": [],
         "oidcKeys": [],
         "revokedSignIns": [],

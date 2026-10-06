@@ -37,7 +37,7 @@ from ..dependencies import (
     require_operator,
     require_replica,
     verify_with_view,
-    via_public_nodes,
+    via_public_sites,
 )
 from ..state_machine import AlreadyActive, StateMachine
 
@@ -359,7 +359,7 @@ async def get_trust_bundle(request: Request) -> SignedTrustBundle:
     key, so a sealed root still answers its members.
     """
     authorization = request.headers.get("authorization")
-    if authorization or via_public_nodes(request):
+    if authorization or via_public_sites(request):
         scheme, _, bearer = (authorization or "").partition(" ")
         if scheme.lower() != "bearer" or not bearer.strip():
             raise problem(

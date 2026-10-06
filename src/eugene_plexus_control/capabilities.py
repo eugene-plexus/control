@@ -35,13 +35,13 @@ grants (remote-nodes.md §3.3)."""
 INSTALL_MODE = "install-mode"
 """Switch the install between production and dev mode (J13, J18)."""
 
-NODE_FILES = "node-files"
-"""Administer ordinary nodes' file support from the console: turn it on,
-register folders, and give people folders there, where the root's grant is
-final (J6d). On a Job Site it reaches nothing but, in dev mode, the owner's
-own grant (J13b). It grants no file access by itself (J15)."""
+DEV_ACCESS = "dev-access"
+"""In dev mode only, give yourself a Job Site's folders (J13b, J33). The
+grant works only if the site's owner let Eugene's owner in there (J6e), and
+stops working the moment the install is in production. It replaced
+`node-files` when the operator-managed node folders retired (J20)."""
 
-ADMINISTRATIVE = frozenset({MEMBERSHIP, INSTALL_MODE, NODE_FILES})
+ADMINISTRATIVE = frozenset({MEMBERSHIP, INSTALL_MODE, DEV_ACCESS})
 
 
 def held_by(claims: tokens.Claims) -> frozenset[str]:

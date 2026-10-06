@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 
-from .. import node_helpers, oidc, security
+from .. import oidc, security
 from .._generated.models import (
     OidcClient,
     OidcClientCreated,
@@ -140,9 +140,6 @@ async def create_person(request: Request, body: PersonCreateRequest) -> Person:
         "name": name,
         "passwordVerifier": security.hash_passphrase(body.password),
         "apps": _check_apps(machine, body.apps),
-        "helperGrants": node_helpers.check_grants(
-            machine.state, [g.model_dump(mode="json") for g in body.helperGrants or []]
-        ),
         "disabled": False,
         "createdAt": when,
         "passwordChangedAt": when,
@@ -175,10 +172,6 @@ async def update_person(request: Request, person_id: str, body: PersonUpdateRequ
             record.pop("email", None)
     if "apps" in changes:
         record["apps"] = _check_apps(machine, changes["apps"])
-    if "helperGrants" in changes:
-        record["helperGrants"] = node_helpers.check_grants(
-            machine.state, changes["helperGrants"] or []
-        )
     if "disabled" in changes and changes["disabled"] is not None:
         record["disabled"] = bool(changes["disabled"])
     machine.append(OP_PUT_PERSON, {"person": record})

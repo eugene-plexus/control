@@ -122,7 +122,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.join_tokens = JoinTokenStore()
     app.state.node_probes = {}
-    app.state.node_contacts = {}
+    app.state.site_contacts = {}
     app.state.root_tls = RootTls(
         Path(settings.state_dir), settings.nodes_origin, settings.nodes_probe
     )
@@ -423,9 +423,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(oidc_routes.router)
     app.include_router(people_routes.router)
     app.include_router(people_routes.app_clients)
-    from .routes import node_helpers
+    from .routes import sites as site_routes
 
-    app.include_router(node_helpers.admin)
-    app.include_router(node_helpers.router)
+    app.include_router(site_routes.router)
 
     return app

@@ -55,30 +55,17 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 READ_SERVICE_SUBS = frozenset({tokens.SUB_AGENT, tokens.SUB_GATEWAY})
 
 ENTRY_HEADER = "X-Eugene-Plexus-Entry"
+PUBLIC_SITES = "public-sites"
+"""Set by the container's entry point on a request that arrived through its
+public route for Job Sites (`public_sites`, J31), and stripped by it from
+everything else. It can only narrow what a request may do: a caller who adds
+it by hand on the LAN gets the public route's rules, never more."""
 PUBLIC_NODES = "public-nodes"
-"""Set by the container's entry point on a request that arrived through the
-public node route (`public_nodes`, J3), and stripped by it from everything
-else. It can only narrow what a request may do: a caller who adds it by hand
-on the LAN gets the public route's rules, never more."""
+"""What an entry point older than slice 2b.1 sets on the same route."""
 
 
-def via_public_nodes(request: Request) -> bool:
-    return request.headers.get(ENTRY_HEADER, "").strip().lower() == PUBLIC_NODES
-
-
-def is_job_site(request: Request, node: str | None) -> bool:
-    record = request.app.state.machine.state.nodes.get(node) if node else None
-    return record is not None and tokens.GRANT_FILES in record.grants
-
-
-def _refuse_job_site(request: Request, claims: tokens.Claims) -> None:
-    if claims.is_service and is_job_site(request, claims.issuer_node):
-        raise problem(
-            status.HTTP_401_UNAUTHORIZED,
-            "Invalid token",
-            f"{claims.issuer_node} is a job site: its token opens only the file helper's "
-            "routes and the trust bundle here.",
-        )
+def via_public_sites(request: Request) -> bool:
+    return request.headers.get(ENTRY_HEADER, "").strip().lower() in (PUBLIC_SITES, PUBLIC_NODES)
 
 
 def problem(status_code: int, title: str, detail: str) -> HTTPException:
@@ -126,19 +113,15 @@ def verify_bearer(
     token: str,
     *,
     classes: Collection[str],
-    sites: bool = False,
 ) -> tokens.Claims:
     """Verify one bearer addressed to this root, or raise the 401 that says why.
 
-    A Job Site's service token is refused unless the route says `sites=True`.
-    """
+    A Job Site's token never verifies here: its key is in no trust bundle,
+    and only the site routes check it (`site_tokens`)."""
     auth: AuthState = request.app.state.auth_state
     if auth.signing_key is None:
         raise _locked_or_uninitialized(request)
-    claims = verify_with_view(request, token, classes=classes)
-    if not sites:
-        _refuse_job_site(request, claims)
-    return claims
+    return verify_with_view(request, token, classes=classes)
 
 
 def verify_with_view(request: Request, token: str, *, classes: Collection[str]) -> tokens.Claims:
@@ -235,23 +218,11 @@ def require_node_actor(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> tokens.Claims:
     """A member node speaking for itself: `sub: agent`, signed by its own key."""
-    return _actor(request, creds, sites=False)
+    return _actor(request, creds)
 
 
-def require_member_actor(
-    request: Request,
-    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> tokens.Claims:
-    """`require_node_actor`, or a Job Site speaking for itself (the file helper)."""
-    return _actor(request, creds, sites=True)
-
-
-def _actor(
-    request: Request, creds: HTTPAuthorizationCredentials | None, *, sites: bool
-) -> tokens.Claims:
-    claims = verify_bearer(
-        request, _bearer(request, creds), classes=(tokens.TYP_SERVICE,), sites=sites
-    )
+def _actor(request: Request, creds: HTTPAuthorizationCredentials | None) -> tokens.Claims:
+    claims = verify_bearer(request, _bearer(request, creds), classes=(tokens.TYP_SERVICE,))
     if claims.sub != tokens.SUB_AGENT or claims.issuer_node is None:
         raise problem(
             status.HTTP_401_UNAUTHORIZED,

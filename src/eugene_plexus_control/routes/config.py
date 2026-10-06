@@ -146,7 +146,7 @@ def _check_mode_change(
 ) -> None:
     """Switching the install mode is the `install-mode` capability (J15), and
     is dated in the same entry so every person can be told (J18)."""
-    from .. import capabilities, node_helpers
+    from .. import capabilities, sites
     from ..dependencies import verify_bearer
 
     _, _, token = (request.headers.get("authorization") or "").partition(" ")
@@ -157,7 +157,7 @@ def _check_mode_change(
             "Not permitted",
             "Switching the install mode needs the 'install-mode' capability.",
         )
-    if accepted["installMode"] != node_helpers.install_mode(machine.state):
+    if accepted["installMode"] != sites.install_mode(machine.state):
         accepted[config_module.MODE_CHANGED_AT] = datetime.now(UTC).isoformat()
         log.warning("install mode switched to %s; every person is told", accepted["installMode"])
 
