@@ -25,12 +25,14 @@ import json
 import logging
 from datetime import UTC, datetime
 from typing import Annotated, Any
+from urllib.parse import quote
 
+import httpx
 import jwt
 from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials
 
-from .. import capabilities, oidc, site_tokens
+from .. import capabilities, oidc, security, site_tokens
 from .. import sites as helpers
 from .._generated.models import (
     HostedSites,
@@ -46,7 +48,10 @@ from .._generated.models import (
     SiteEnrollmentRequest,
     SiteFolderOwnerAccess,
     SiteInvitationRequest,
+    SiteLinkRemove,
     SiteMcpCall,
+    SitePersonCheck,
+    SitePersonCheckRequest,
     SiteReport,
     SiteResult,
 )
@@ -56,6 +61,7 @@ from ..applied import (
     OP_SET_SITE_DEV_GRANTS,
     OP_SET_SITE_HOST,
     SiteRecord,
+    normalize_url,
 )
 from ..dependencies import (
     _bearer,
@@ -75,7 +81,7 @@ from .nodes import (
     _not_active,
     _record_join_failure,
 )
-from .oidc import _client_auth
+from .oidc import _DUMMY_VERIFIER, _client_auth
 from .people import _active
 
 
@@ -263,6 +269,68 @@ async def leave(request: Request, site: SiteActor) -> None:
     """Leaving needs no one's permission (remote-nodes.md §3.3)."""
     _active(request)
     _remove(request, site.id)
+
+
+LINK_CHECK_SITE_BUCKET = "site-link-site:"
+
+
+@router.post("/v1/sites/links/check")
+async def check_person(
+    request: Request, body: SitePersonCheckRequest, site: SiteActor
+) -> SitePersonCheck:
+    """J36: a site checks a person's Eugene sign-in, typed at its machine.
+
+    Nothing is recorded: the link lives on the machine. Counted as a
+    sign-in is, per site and per name (the name's bucket is the sign-in
+    page's own, so this cannot be used to guess faster than that page
+    allows). A wrong name and a wrong password are one answer."""
+    machine = _active(request)
+    auth = request.app.state.auth_state
+    if auth.signing_key is None:
+        raise problem(503, "Eugene is locked", "Unlock Eugene before linking people.")
+    name = body.name.strip()
+    buckets = [LINK_CHECK_SITE_BUCKET + site.id, f"oidc-name:{name.casefold()}"]
+    for bucket in buckets:
+        if auth.is_login_rate_limited(
+            bucket, window_seconds=oidc.SIGN_IN_WINDOW_SECONDS, max_in_window=oidc.SIGN_IN_FAILURES
+        ):
+            raise problem(
+                429,
+                "Too many failed checks",
+                f"Wait {oidc.SIGN_IN_WINDOW_SECONDS} seconds and try again.",
+            )
+    if name.casefold() == oidc.OPERATOR_NAME:
+        raise problem(
+            403,
+            "Not a person",
+            "Eugene's owner signs in with the passphrase and is not a person who links an "
+            "account on a machine. Use a person the owner added.",
+        )
+    person = next(
+        (p for p in machine.state.people.values() if p["name"].casefold() == name.casefold()),
+        None,
+    )
+    # The verifier is checked whether or not the name exists, so the time an
+    # answer takes does not say which one was wrong.
+    verifier = person["passwordVerifier"] if person else _DUMMY_VERIFIER
+    if not security.verify_passphrase(body.password, verifier) or person is None:
+        for bucket in buckets:
+            auth.record_login_failure(
+                bucket,
+                window_seconds=oidc.SIGN_IN_WINDOW_SECONDS,
+                max_in_window=oidc.SIGN_IN_FAILURES,
+            )
+        log.warning("site %s: a person's link check did not match", site.id)
+        raise problem(401, "Sign-in does not match", "That name and password do not match.")
+    for bucket in buckets:
+        auth.clear_login_failures(bucket)
+    if person.get("disabled"):
+        raise problem(
+            403,
+            "Signing in is turned off",
+            f"{person['name']} cannot sign in on this install, so cannot link an account.",
+        )
+    return SitePersonCheck(subject=str(person["id"]), name=str(person["name"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -471,6 +539,8 @@ async def servers(request: Request, body: JobSiteRequest) -> dict[str, Any]:
         available, reason = delivery.availability(bound)
         summary = delivery.summary(bound)
         common = {"site": site, "label": record.label, "available": available, "reason": reason}
+        if subject != helpers.OPERATOR:
+            common.update(helpers.link_fields(summary, subject, record.owner))
         if subject == helpers.OPERATOR:
             if not (summary or {}).get("ownerInDevMode"):
                 continue
@@ -601,6 +671,71 @@ async def cancel(request: Request, body: SiteCancel) -> None:
     helpers.broker(request).cancel(_operation_id(body.refreshToken, body.operationId))
 
 
+def _agent_words(payload: Any) -> str:
+    """The sentence an agent's refusal carries, from FastAPI's `detail`."""
+    detail = payload.get("detail") if isinstance(payload, dict) else payload
+    if isinstance(detail, dict):
+        detail = detail.get("detail") or detail.get("title")
+    return str(detail) if detail else "The agent gave no reason."
+
+
+@router.post("/oidc/sites/link/remove", status_code=204)
+async def remove_link(request: Request, body: SiteLinkRemove) -> None:
+    """§3.2: a person removes their own link to an OS account on a site's
+    machine, or the site's owner removes anyone's. The link lives on the
+    machine and only its starter writes it, so the root asks the agent of the
+    node that hosts the site. Removing a link only takes access away."""
+    subject = _app_subject(request, body.refreshToken)
+    machine = _active(request)
+    site = str(getattr(body.site, "root", body.site))
+    record = machine.state.sites.get(site)
+    owns = record is not None and record.owner == subject
+    summary = helpers.broker(request).summary(helpers.binding(record)) if record else None
+    # One answer for "no such site" and "not one of yours to know".
+    if record is None or not (owns or helpers.may_use_site(summary, subject)):
+        raise problem(404, "No such job site", "You have no such job site.")
+    target = body.person or subject
+    if target != subject and not owns:
+        raise problem(
+            403,
+            "Not yours to remove",
+            "A person removes their own link, and a site's owner may remove anyone's.",
+        )
+    node = machine.state.nodes.get(record.hostNode) if record.hostNode else None
+    if node is None:
+        raise problem(409, "No node hosts this site", "No node hosts this site now.")
+    url = normalize_url(node.url)
+    if not url:
+        raise problem(
+            503, "The machine's agent did not answer", f"Node {node.name!r} has no address."
+        )
+    auth = request.app.state.auth_state
+    from .nodes import service_token_for
+
+    try:
+        code, payload = await request.app.state.nodes_client.delete(
+            url,
+            "/v1/site/links/" + quote(target, safe=""),
+            service_token_for(auth, node.name),
+        )
+    except httpx.HTTPError as exc:
+        log.info("node %s did not answer a link removal: %s", node.name, exc)
+        raise problem(
+            503,
+            "The machine's agent did not answer",
+            f"The agent on {node.name!r} did not answer. Try again in a moment.",
+        ) from exc
+    if code in (200, 204):
+        return
+    if code == 409:
+        raise problem(409, "Removed at the machine only", _agent_words(payload))
+    raise problem(
+        503,
+        "The machine's agent did not take it",
+        f"The agent on {node.name!r} answered {code}: {_agent_words(payload)}",
+    )
+
+
 @router.post("/oidc/install-mode")
 async def install_mode(request: Request) -> dict[str, Any]:
     """The mode, for an app to show every person it serves (J18). Any enrolled
@@ -700,6 +835,7 @@ def _site_view(request: Request, record: SiteRecord) -> dict[str, Any]:
             if server["kind"] == "local"
         ],
         "ownerInDevMode": summary.get("ownerInDevMode") if summary else None,
+        **{k: summary[k] for k in ("links", "linkPage", "sharing") if summary.get(k) is not None},
     }
 
 

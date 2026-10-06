@@ -258,6 +258,18 @@ class NodesClient:
         except ValueError:
             return None
 
+    async def delete(self, url: str, path: str, token: str | None) -> tuple[int, Any]:
+        """DELETE on one node. The status and body come back as the agent
+        gave them, because its own words are what the caller relays."""
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        response = await self._client.delete(
+            f"{self._transport_url(url)}{path}", headers=headers, timeout=self._timeout
+        )
+        try:
+            return response.status_code, response.json()
+        except ValueError:
+            return response.status_code, {"detail": response.text}
+
     async def create_runtime(
         self, url: str, token: str | None, spec: dict[str, Any]
     ) -> tuple[int, Any]:

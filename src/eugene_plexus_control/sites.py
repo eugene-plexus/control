@@ -140,6 +140,39 @@ def site_local_servers_for(summary: dict[str, Any] | None, subject: str) -> list
     ]
 
 
+def link_fields(summary: dict[str, Any] | None, subject: str, owner: str) -> dict[str, Any]:
+    """What one person is told about their own OS account on a site's machine
+    (J27, §3.2): whether they linked it, which account their calls run as
+    (their own once linked; until then the owner's, if the owner linked one),
+    and where to link when they have not. From the site's last report, so a
+    cache like the rest of the summary."""
+    reported = (summary or {}).get("links")
+    if reported is None:
+        # A site that predates linking says nothing about it; neither do we.
+        return {}
+    links = reported
+    mine = next((entry for entry in links if entry.get("subject") == subject), None)
+    if mine is not None:
+        return {"linked": True, "account": mine.get("accountName"), "linkPage": None}
+    theirs = next((entry for entry in links if entry.get("subject") == owner), None)
+    return {
+        "linked": False,
+        "account": theirs.get("accountName") if theirs else None,
+        "linkPage": (summary or {}).get("linkPage"),
+    }
+
+
+def may_use_site(summary: dict[str, Any] | None, subject: str) -> bool:
+    """Whether `subject` holds anything on a site, or is linked there, as it
+    last reported: the test for being told a site exists at all."""
+    held = (
+        bool(site_folders_for(summary, subject))
+        or any(entry.get("subject") == subject for entry in (summary or {}).get("access") or [])
+        or any(entry.get("subject") == subject for entry in (summary or {}).get("links") or [])
+    )
+    return held
+
+
 def envelope(state: Any, bound: dict[str, str], subject: str, **fields: Any) -> dict[str, Any]:
     """What a site claims (`SiteOperation`), less the id and deadline the
     broker adds at the claim."""

@@ -106,6 +106,17 @@ def _oauth_error(status: int, error: str, description: str) -> JSONResponse:
     )
 
 
+def _token_client(request: Request, form: Any) -> dict[str, Any] | None:
+    """Who is at `/oidc/token`: the built-in public client by `client_id` in the
+    form with no secret of any kind, else `client_secret_basic`."""
+    if form.get("client_id") == oidc.SITE_LINK_CLIENT:
+        scheme = (request.headers.get("authorization") or "").partition(" ")[0].lower()
+        if scheme == "basic" or form.get("client_secret") is not None:
+            return None
+        return oidc.find_client(request.app.state.machine.state, oidc.SITE_LINK_CLIENT)
+    return _client_auth(request)
+
+
 def _client_auth(request: Request) -> dict[str, Any] | None:
     """`client_secret_basic` (RFC 6749 §2.3.1): the client, or None."""
     header = request.headers.get("authorization") or ""
@@ -208,7 +219,7 @@ def _hint(state: Any) -> str | None:
 async def authorize(request: Request) -> Response:
     q = request.query_params
     state = request.app.state.machine.state
-    client = state.oidc_clients.get(q.get("client_id") or "")
+    client = oidc.find_client(state, q.get("client_id") or "")
     redirect_uri = q.get("redirect_uri") or ""
     # An unknown app or an unregistered redirect is shown here and never
     # followed: redirecting would make this an open redirector (RFC 9700 §4.11).
@@ -219,7 +230,7 @@ async def authorize(request: Request) -> Response:
             app_name=None,
             error="This app is not registered with Eugene. Ask the owner to add it.",
         )
-    if redirect_uri not in client["redirectUris"]:
+    if not oidc.redirect_allowed(client, redirect_uri):
         return _page(
             400,
             title="Wrong return address",
@@ -286,7 +297,7 @@ async def sign_in(request: Request) -> Response:
             app_name=None,
             error="Go back to the app and start again.",
         )
-    client = state.oidc_clients.get(pending.client_id)
+    client = oidc.find_client(state, pending.client_id)
     if client is None:
         provider.close_request(ident)
         return _page(
@@ -359,7 +370,21 @@ async def sign_in(request: Request) -> Response:
         auth.clear_login_failures(bucket)
     if person is not None and person.get("disabled"):
         return again(403, "Signing in is turned off for you. Ask the owner.")
-    if person is not None and not oidc.may_use(person, client["clientId"]):
+    if client.get("builtin") and subject is oidc.OWNER:
+        # J37: the link page is for people. Eugene's owner owns no site's links.
+        return _page(
+            403,
+            pending.redirect_uri,
+            title=f"Not for {client['name']}",
+            app_name=client["name"],
+            error=f"You may not use {client['name']}. It links people, and Eugene's owner "
+            "is not a person on a machine. Sign in as a person the owner added.",
+        )
+    if (
+        person is not None
+        and not client.get("builtin")
+        and not oidc.may_use(person, client["clientId"])
+    ):
         return _page(
             403,
             pending.redirect_uri,
@@ -433,14 +458,19 @@ _DUMMY_VERIFIER = security.hash_passphrase(secrets.token_urlsafe(24))
 
 @router.post("/oidc/token", operation_id="oidcToken")
 async def token(request: Request) -> JSONResponse:
-    client = _client_auth(request)
+    form = await request.form()
+    client = _token_client(request, form)
     if client is None:
         return _oauth_error(401, "invalid_client", "Client authentication failed.")
-    form = await request.form()
     machine = request.app.state.machine
     auth = request.app.state.auth_state
     provider = _provider(request)
     grant = form.get("grant_type")
+    builtin = bool(client.get("builtin"))
+    if builtin and grant != "authorization_code":
+        return _oauth_error(
+            400, "unsupported_grant_type", "This app may only trade a code for tokens."
+        )
     try:
         if grant == "authorization_code":
             issued = provider.take_code(str(form.get("code") or ""))
@@ -462,6 +492,7 @@ async def token(request: Request) -> JSONResponse:
                 auth_at=issued.auth_at,
                 sid=secrets.token_urlsafe(16),
                 nonce=issued.nonce,
+                with_refresh=not builtin,
             )
             return JSONResponse(answer, headers=_NO_STORE)
         if grant == "refresh_token":

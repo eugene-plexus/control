@@ -17,6 +17,57 @@ from pydantic import (
 )
 
 
+class SitePersonCheckRequest(BaseModel):
+    """
+    A person's Eugene sign-in, typed at the machine to link them there (J36).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(
+        ..., description='How the person signs in.', max_length=256, min_length=1
+    )
+    password: str = Field(..., max_length=1024, min_length=1)
+
+
+class SitePersonCheck(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(
+        ..., description="The person's id.", max_length=64, min_length=1
+    )
+    name: str = Field(..., max_length=256)
+
+
+class SitePersonLink(BaseModel):
+    """
+    One person linked to an OS account on a site's machine, as the site reports it.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(
+        ..., description="The person's id.", max_length=64, min_length=1
+    )
+    accountName: str = Field(
+        ...,
+        description='The OS account, for display, e.g. `AMISH_STATION\\jessie` or `jessie`.',
+        max_length=256,
+        min_length=1,
+    )
+    available: bool = Field(
+        ..., description='Their worker is connected, so their calls can run now.'
+    )
+    reason: str | None = Field(
+        None,
+        description='Why not, when it is not, e.g. that they are not signed in on a Windows machine (J25).',
+        max_length=1024,
+    )
+
+
 class SiteId(RootModel[str]):
     root: str = Field(
         ...,
@@ -2468,6 +2519,30 @@ class AuthInitializeRequest(BaseModel):
     )
 
 
+class SiteLinkRemove(BaseModel):
+    """
+    Remove a link between a person and an OS account on a site's machine.
+    A person removes their own; the site's owner may name anyone's. Removing
+    a link only takes access away, so the root may ask for it (§3.2).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    site: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
+    person: str | None = Field(
+        None,
+        description="Whose link. Absent means the signed-in person's own.",
+        max_length=64,
+    )
+
+
 class SiteAccess(BaseModel):
     """
     Who may use which tools of one local server. Eugene's file server is
@@ -2656,6 +2731,18 @@ class SiteServerGrant(BaseModel):
         ...,
         description="For the file server, the folders this person may use, each by the name its tools' `folder` argument takes. Empty for a local server.",
         max_length=64,
+    )
+    linked: bool | None = Field(
+        None,
+        description="This person has linked their own OS account on that machine, so their\ncalls there run as it (J27). Otherwise they run as the site's owner,\nconfined to the folder. Absent from an older root.\n",
+    )
+    account: str | None = Field(
+        None,
+        description="The OS account this person's calls run as there, for display, once the site has said.",
+    )
+    linkPage: str | None = Field(
+        None,
+        description='Where to link, on that machine, when they have not and the site offers a page (§3.2).',
     )
 
 
@@ -3089,6 +3176,20 @@ class SiteSummary(BaseModel):
         description="Who may use the local servers' tools. Folders carry their own people.",
         max_length=2048,
     )
+    links: list[SitePersonLink] | None = Field(
+        None,
+        description="The people linked to an OS account on this machine (§2.2, J27), and\nwhether each one's worker is connected now. A linked person's calls\nrun as their own account; anyone else's run in the owner's worker,\nas the owner, confined to the folder (J27).\n",
+        max_length=256,
+    )
+    linkPage: str | None = Field(
+        None,
+        description="Where a person links their account, on the machine itself: the\nagent's loopback link page on a Windows service install. Null where\nlinking is the elevated one-liner (a Linux system install, J36) or\nwhere only the installing person is served (a per-user install, J38).\n",
+        max_length=256,
+    )
+    sharing: bool | None = Field(
+        None,
+        description='Whether this site can serve anyone but its owner. False on macOS,\nwhich has no folder boundary yet (§2.6). Absent means true.\n',
+    )
 
 
 class SiteOperation(BaseModel):
@@ -3217,7 +3318,20 @@ class JobSite(BaseModel):
     ready: bool
     reason: str | None = None
     account: str | None = Field(
-        None, description="The OS account the site's tools run as."
+        None,
+        description="The kind of OS account the site host itself runs in. Tools run in each person's worker (`links`).",
+    )
+    links: list[SitePersonLink] | None = Field(
+        None,
+        description="The people linked to an OS account on that machine, and whether each one's calls can run now (§3.2).",
+    )
+    linkPage: str | None = Field(
+        None,
+        description='Where a person links their account on that machine, when it offers a page (a Windows service install).',
+    )
+    sharing: bool | None = Field(
+        None,
+        description='Whether the site can serve anyone but its owner (false on macOS). Absent means true.',
     )
     lastContactAt: AwareDatetime | None = None
     hostNode: str | None = Field(None, description='The node that hosts it (J32)')
@@ -3639,7 +3753,9 @@ class SiteReport(BaseModel):
     ready: bool
     reason: str | None = Field(None, max_length=1024)
     account: str | None = Field(
-        None, description="The OS account the site's tools run as.", max_length=256
+        None,
+        description="The kind of OS account the site host itself runs in. Since 2b.2 the\nsite's tools run in each person's worker, as `SiteSummary.links`\nsays, and never in this account.\n",
+        max_length=256,
     )
     site: SiteSummary | None = None
 

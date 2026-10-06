@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import html
 import json
+import re
 import secrets
 import threading
 import time
@@ -170,6 +171,41 @@ def subject_of(person: dict[str, Any]) -> Subject:
         role="member",
         email=person.get("email"),
     )
+
+
+#: The one built-in client (J37): the agent's link page on a site's machine.
+#: Public, with no secret and no stored record, so it is in no client list and
+#: cannot be edited or removed; every person may use it, Eugene's owner may not.
+SITE_LINK_CLIENT = "eugene-site-link"
+SITE_LINK_NAME = "Eugene on this machine"
+_SITE_LINK_REDIRECT = re.compile(r"http://127[.]0[.]0[.]1:([1-9][0-9]{0,4})/link/callback")
+
+
+def is_site_link_redirect(uri: str) -> bool:
+    """RFC 8252 section 7.3: the literal loopback address, any port from 1 to
+    65535, and exactly the link page's callback path. No `localhost`, no query,
+    no fragment, no userinfo: the pattern must match the whole string."""
+    match = _SITE_LINK_REDIRECT.fullmatch(uri)
+    return match is not None and int(match.group(1)) <= 65535
+
+
+def find_client(state: Any, client_id: str) -> dict[str, Any] | None:
+    """A registered app, or the built-in site-link client."""
+    if client_id == SITE_LINK_CLIENT:
+        return {
+            "clientId": SITE_LINK_CLIENT,
+            "name": SITE_LINK_NAME,
+            "redirectUris": [],
+            "builtin": True,
+        }
+    found: dict[str, Any] | None = state.oidc_clients.get(client_id)
+    return found
+
+
+def redirect_allowed(client: dict[str, Any], uri: str) -> bool:
+    if client.get("builtin"):
+        return is_site_link_redirect(uri)
+    return uri in client["redirectUris"]
 
 
 def may_use(person: dict[str, Any], client_id: str) -> bool:
@@ -338,6 +374,7 @@ def token_response(
     sid: str,
     nonce: str | None,
     refresh_token: str | None = None,
+    with_refresh: bool = True,
 ) -> dict[str, Any]:
     """ID and access tokens for one sign-in, and a refresh token unless one
     is being reused (refresh tokens are not rotated; D6)."""
@@ -367,7 +404,7 @@ def token_response(
         "id_token": provider.mint(machine, auth, id_claims, TYP_ID),
         "scope": scope,
     }
-    if refresh_token is None:
+    if refresh_token is None and with_refresh:
         refresh = {
             **base,
             "exp": issued + REFRESH_TOKEN_TTL_SECONDS,
@@ -378,7 +415,8 @@ def token_response(
             "eugene_auth_at": auth_at,
         }
         refresh_token = provider.mint(machine, auth, refresh, TYP_REFRESH)
-    answer["refresh_token"] = refresh_token
+    if refresh_token is not None:
+        answer["refresh_token"] = refresh_token
     return answer
 
 
