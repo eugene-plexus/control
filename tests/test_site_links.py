@@ -345,6 +345,9 @@ def test_a_site_cannot_use_the_check_to_guess_faster_than_a_sign_in(root: TestCl
     assert joined.status_code == 201, joined.text
     second = other.bearer(joined.json()["id"])
     assert _check(root, second, "cy", PASSPHRASE).status_code == 200
+    # The name's limit is the sign-in page's own, and no site's: a second site
+    # cannot try the name the first has just been held on.
+    assert _check(root, second, "bo", PASSPHRASE).status_code == 429
 
 
 def test_only_an_enrolled_sites_token_may_check(root: TestClient) -> None:
