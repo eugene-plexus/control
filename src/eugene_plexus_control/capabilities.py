@@ -12,8 +12,8 @@ capability and never data access. Nothing assigns capabilities yet; when
 something does, it changes `held_by` and no route.
 
 Data access is not in this list on purpose. Using a Job Site's folders is the
-site owner's grant (`node_helpers.grants_for`), and no administrative
-capability reaches it.
+site owner's grant, which the site keeps and enforces itself (J8), and no
+administrative capability reaches it.
 """
 
 from __future__ import annotations
@@ -35,7 +35,13 @@ grants (remote-nodes.md §3.3)."""
 INSTALL_MODE = "install-mode"
 """Switch the install between production and dev mode (J13, J18)."""
 
-ADMINISTRATIVE = frozenset({MEMBERSHIP, INSTALL_MODE})
+NODE_FILES = "node-files"
+"""Administer ordinary nodes' file support from the console: turn it on,
+register folders, and give people folders there, where the root's grant is
+final (J6d). On a Job Site it reaches nothing but, in dev mode, the owner's
+own grant (J13b). It grants no file access by itself (J15)."""
+
+ADMINISTRATIVE = frozenset({MEMBERSHIP, INSTALL_MODE, NODE_FILES})
 
 
 def held_by(claims: tokens.Claims) -> frozenset[str]:

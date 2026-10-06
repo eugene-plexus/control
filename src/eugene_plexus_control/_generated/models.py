@@ -43,20 +43,89 @@ class HelperFolderCreate(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
-    name: str = Field(..., max_length=80, min_length=1)
+    name: str = Field(
+        ...,
+        description="Unique on the node, since it is the file server's `folder` argument (J6g); a name in use there is refused with 409. A folder registered before that rule, sharing a name with an earlier one, is offered as `Name (2)`.",
+        max_length=80,
+        min_length=1,
+    )
     path: str = Field(..., max_length=4096, min_length=1)
     writable: bool | None = False
     ownerAccess: OwnerAccess | None = 'none'
 
 
-class HelperReport(BaseModel):
+class SiteHostProtocol(StrEnum):
+    """
+    What a machine's host speaks to the root, through its agent. The only value is MCP's 2026-07-28 revision.
+    """
+
+    mcp_2026_07_28 = 'mcp-2026-07-28'
+
+
+class SiteFolderPerson(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
-    supported: bool
-    ready: bool
-    reason: str | None = Field(None, max_length=1024)
-    account: str | None = Field(None, max_length=256)
+    subject: str = Field(
+        ...,
+        description="A person's id. Never `operator`; Eugene's owner reaches a site only through `ownerInDevMode`.",
+        max_length=64,
+        min_length=1,
+    )
+    writable: bool = Field(
+        ...,
+        description='The person may change files in it: a standing pre-approval for\n`write_text` (J6b). Otherwise they may list and read.\n',
+    )
+
+
+class SiteServerId(RootModel[str]):
+    root: str = Field(
+        ...,
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
+        max_length=40,
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
+    )
+
+
+class SiteServerKind(StrEnum):
+    """
+    `files`: Eugene's own file server, one per machine, its tools taking a `folder` argument (J6g). `local`: a server a machine administrator added at the machine.
+    """
+
+    files = 'files'
+    local = 'local'
+
+
+class SiteTool(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=128, min_length=1)
+    title: str | None = Field(None, max_length=256)
+    description: str | None = Field(None, max_length=2048)
+    readOnly: bool = Field(
+        ...,
+        description='The server marks the tool as changing nothing (`readOnlyHint`).',
+    )
+    destructive: bool = Field(
+        ...,
+        description="Whether the site treats the tool as able to change or delete\nsomething. True unless the server marks it read-only, or marks it\n`destructiveHint: false`. MCP's own default, so an unmarked tool is\ndestructive. A destructive tool runs only under a standing\npre-approval (J6b).\n",
+    )
+
+
+class SiteToolGrant(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=128, min_length=1)
+    standing: bool | None = Field(
+        False,
+        description="A standing pre-approval: the person may use this destructive tool\nwithout the site's owner approving each call. Required for a\ndestructive tool, which is otherwise refused: approving each call at\nthe machine waits for the held channel (J6b).\n",
+    )
+
+
+class McpJsonRpc(StrEnum):
+    field_2_0 = '2.0'
 
 
 class HelperOperationStatus(StrEnum):
@@ -65,23 +134,49 @@ class HelperOperationStatus(StrEnum):
     uncertain = 'uncertain'
 
 
-class Tool(StrEnum):
-    list_directory = 'list_directory'
-    read_text = 'read_text'
-    write_text = 'write_text'
+class McpMethod(StrEnum):
+    server_discover = 'server/discover'
+    tools_list = 'tools/list'
+    tools_call = 'tools/call'
 
 
-class HelperCall(BaseModel):
+class SiteGrantHint(BaseModel):
+    """
+    One of the root's own folder grants, carried with a call in a list
+    (`grants`): on an ordinary node, all of the person's grants there, the
+    root's grant being final (J6d); on a job site, Eugene's owner's dev-mode
+    grants, which the site honours only if its owner opted in (J6e). The
+    host checks the folder a call names against them.
+
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
-    operationId: str | None = Field(
-        None, max_length=64, min_length=16, pattern='^[a-zA-Z0-9_-]+$'
-    )
-    refreshToken: str = Field(..., max_length=16384, min_length=1)
     folderId: str = Field(..., max_length=64, min_length=1)
-    tool: Tool
-    arguments: dict[str, Any]
+    name: str = Field(
+        ...,
+        description="The folder's name on this machine, as the `folder` argument takes it. The root makes it unique; a folder that shares a name with an earlier one reads `Name (2)`.",
+        max_length=96,
+        min_length=1,
+    )
+    path: str = Field(..., max_length=4096, min_length=1)
+    identity: str = Field(..., max_length=256, min_length=1)
+    writable: bool
+
+
+class HelperOperationKind(StrEnum):
+    """
+    `mcp`: one MCP request to one of the machine's servers. `manage`: one of the site host's management actions (`SiteManageAction`, site-host.yaml).
+    """
+
+    mcp = 'mcp'
+    manage = 'manage'
+
+
+class InstallModeName(StrEnum):
+    production = 'production'
+    dev = 'dev'
 
 
 class HelperDiscovery(BaseModel):
@@ -91,7 +186,7 @@ class HelperDiscovery(BaseModel):
     refreshToken: str = Field(..., max_length=16384, min_length=1)
 
 
-class HelperCancel(BaseModel):
+class SiteCancel(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -101,9 +196,43 @@ class HelperCancel(BaseModel):
     )
 
 
-class InstallModeName(StrEnum):
-    production = 'production'
-    dev = 'dev'
+class InstallMode(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    mode: InstallModeName
+    changedAt: AwareDatetime | None = Field(
+        None, description='When the mode last changed; null when it never has.'
+    )
+
+
+class SiteServerFolder(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(
+        ...,
+        description="Unique on its machine; the `folder` argument's value.",
+        max_length=96,
+        min_length=1,
+    )
+    writable: bool = Field(..., description='This person may change files in it.')
+
+
+class SiteAnswerStatus(StrEnum):
+    """
+    `done`: the site answered (an MCP error or a tool's own failure is still
+    `done`, inside `response`). `failed`: the site refused or could not run
+    it, and `message` says why in the site's words; nothing ran. `uncertain`:
+    a tool call started and its end could not be established; it may have
+    acted.
+
+    """
+
+    done = 'done'
+    failed = 'failed'
+    uncertain = 'uncertain'
 
 
 class JobSiteFolderPerson(BaseModel):
@@ -112,7 +241,19 @@ class JobSiteFolderPerson(BaseModel):
     )
     person: str
     name: str = Field(..., description='How the person signs in.')
-    writable: bool
+    writable: bool = Field(
+        ...,
+        description="May change files in it, without asking the site's owner each time (a standing pre-approval).",
+    )
+
+
+class JobSiteServerPerson(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    person: str
+    name: str = Field(..., description='How the person signs in.')
+    tools: list[SiteToolGrant]
 
 
 class JobSiteInviteRequest(BaseModel):
@@ -168,7 +309,54 @@ class JobSitePersonGrant(BaseModel):
     name: str = Field(
         ..., description='How the person signs in.', max_length=256, min_length=1
     )
-    writable: bool
+    writable: bool = Field(
+        ...,
+        description="May change files in the folder without asking each time. Cannot exceed the folder's own `writable`.",
+    )
+
+
+class JobSitePersonTools(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(
+        ..., description='How the person signs in.', max_length=256, min_length=1
+    )
+    tools: list[SiteToolGrant] = Field(..., max_length=64)
+
+
+class JobSiteServerEnable(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    enabled: bool
+
+
+class JobSiteSettings(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    ownerInDevMode: bool
+
+
+class JobSiteAuditRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    limit: int | None = Field(50, ge=1, le=200)
+
+
+class SiteAuditDecision(StrEnum):
+    allowed = 'allowed'
+    refused = 'refused'
+
+
+class SiteAuditKind(StrEnum):
+    mcp = 'mcp'
+    manage = 'manage'
 
 
 class SignedRootTls(BaseModel):
@@ -1738,6 +1926,10 @@ class Enrollment(BaseModel):
         None,
         description="What this node's key was granted. `files` tells the agent it is\na Job Site: it announces no address, polls for no run\noperations, and refuses runtimes and engines.\n",
     )
+    owner: str | None = Field(
+        None,
+        description='On a Job Site, the person who confirmed this join at the machine\n(their id). The site pins it: its host takes management actions\nfrom this person alone, and refuses a different `siteOwner` in a\nlater poll (J6b, rule 2 of §3.3).\n',
+    )
 
 
 class StandbyStatus(BaseModel):
@@ -2076,7 +2268,7 @@ class HelperFolder(BaseModel):
     ownerAccess: OwnerAccess
     people: list[SitePersonGrant] | None = Field(
         None,
-        description="On a Job Site only: who may use this folder, set by the site's owner and nobody else (J11). Empty on every other node, whose grants are each person's helperGrants. On a Job Site, `ownerAccess` (Eugene's owner's own access) may be set only in dev mode, and works only while the install is in dev mode (J13b).",
+        description="Deprecated, read and ignored. Slice 1 kept a Job Site's folders and who may use them here; since slice 2 the site keeps them itself and its own list is final (J6b). Kept so the replicated log replays.",
         max_length=256,
     )
 
@@ -2089,37 +2281,227 @@ class NodeHelper(BaseModel):
     nodeKey: str = Field(..., max_length=256, min_length=1)
     enrolledAt: str
     enabled: bool
-    folders: list[HelperFolder] = Field(..., max_length=64)
+    folders: list[HelperFolder] = Field(
+        ...,
+        description="An ordinary node's folders, registered by Eugene's owner. A Job Site's folders are the site's own (`HelperReport.site`); none are kept here for one.",
+        max_length=64,
+    )
+    devGrants: list[HelperGrant] | None = Field(
+        None,
+        description="On a Job Site only: the folders Eugene's owner gave themselves in dev mode (J13b). They work only while the install is in dev mode, and only if the site's owner lets Eugene's owner in there (J6e), which the site checks itself.",
+        max_length=64,
+    )
 
 
-class HelperResult(BaseModel):
+class SiteAccess(BaseModel):
+    """
+    Who may use which tools of one local server. Eugene's file server is
+    granted per folder instead (`SiteFolder.people`, J6g).
+
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
-    status: HelperOperationStatus
+    subject: str = Field(
+        ...,
+        description="A person's id. Never `operator`; Eugene's owner reaches a site only through `ownerInDevMode`.",
+        max_length=64,
+        min_length=1,
+    )
+    server: str = Field(
+        ...,
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
+        max_length=40,
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
+    )
+    tools: list[SiteToolGrant] = Field(..., max_length=64)
+
+
+class SiteFolder(BaseModel):
+    """
+    A folder registered on the machine. Eugene's file server offers it to
+    the people on its list, by its name, as its tools' `folder` argument
+    (J6g).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^[a-f0-9]{32}$')
+    name: str = Field(
+        ...,
+        description='Unique on the machine, and the value of the `folder` argument. A\nfolder that shares a name with one registered before it is shown,\nand taken, as `Name (2)`, `Name (3)` and so on.\n',
+        max_length=96,
+        min_length=1,
+    )
+    path: str = Field(..., max_length=4096, min_length=1)
+    identity: str = Field(
+        ...,
+        description="The folder's identity on its file system, as the site recorded it. A dev-mode grant names it (`SiteGrantHint`).",
+        max_length=256,
+        min_length=1,
+    )
+    writable: bool = Field(
+        ...,
+        description="Whether anyone may change files in it at all. A person's `writable` cannot exceed it.",
+    )
+    people: list[SiteFolderPerson] = Field(
+        ...,
+        description="Who may use it, the site's owner included (J11). Nobody is on it until the owner says so.",
+        max_length=256,
+    )
+
+
+class SiteServer(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
+        max_length=40,
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
+    )
+    name: str = Field(..., max_length=80, min_length=1)
+    kind: SiteServerKind
+    system: bool = Field(
+        ...,
+        description="Marked as able to alter the machine's operating system. It cannot be\nenabled without an administrator's consent recorded at the machine\n(J9).\n",
+    )
+    enabled: bool = Field(
+        ...,
+        description="Whether it is on. Eugene's file server is on while a folder is registered; a local server is on once the site's owner turns it on.",
+    )
+    available: bool = Field(..., description='Whether it can run now.')
+    reason: str | None = Field(
+        None, description='Why it cannot run, in plain words.', max_length=1024
+    )
+    tools: list[SiteTool] = Field(..., max_length=64)
+
+
+class McpResponse(BaseModel):
+    """
+    The JSON-RPC response to an `McpRequest`, exactly as the site's server
+    produced it after the site's policy filtered it: `result` or `error`.
+
+    """
+
+    jsonrpc: McpJsonRpc
+    id: str | int | None = None
     result: dict[str, Any] | None = None
-    message: str | None = Field(None, max_length=1024)
+    error: dict[str, Any] | None = None
 
 
-class InstallMode(BaseModel):
+class McpRequest(BaseModel):
+    """
+    One MCP request of the 2026-07-28 revision: `server/discover`,
+    `tools/list` or `tools/call`. `params._meta` carries
+    `io.modelcontextprotocol/protocolVersion` (`2026-07-28`) and may carry the
+    client's info and capabilities. Nothing else crosses: no notifications, no
+    server-initiated requests, no other methods.
+
+    """
+
+    jsonrpc: McpJsonRpc
+    id: str | int = Field(
+        ..., description='A JSON-RPC id. The site answers with the same one.'
+    )
+    method: McpMethod
+    params: dict[str, Any] | None = None
+
+
+class SiteServerGrant(BaseModel):
+    """
+    One server on one machine that the signed-in person may use. The file server (`files`) appears once per machine, with the folders the person may use there (J6g).
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
-    mode: InstallModeName
-    changedAt: AwareDatetime | None = Field(
-        None, description='When the mode last changed; null when it never has.'
+    node: str
+    server: str = Field(
+        ...,
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
+        max_length=40,
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
     )
+    name: str = Field(..., description="The server's name.")
+    kind: SiteServerKind
+    jobSite: bool
+    available: bool
+    reason: str | None = None
+    folders: list[SiteServerFolder] = Field(
+        ...,
+        description="For the file server, the folders this person may use, each by the name its tools' `folder` argument takes. Empty for a local server.",
+        max_length=64,
+    )
+
+
+class SiteMcpCall(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    node: str = Field(..., max_length=256, min_length=1)
+    server: str = Field(
+        ...,
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
+        max_length=40,
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
+    )
+    request: McpRequest
+    operationId: str | None = Field(
+        None,
+        description='Lets `/oidc/sites/cancel` stop it before the machine claims it.',
+        max_length=64,
+        min_length=16,
+        pattern='^[a-zA-Z0-9_-]+$',
+    )
+
+
+class SiteMcpAnswer(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    status: SiteAnswerStatus
+    message: str | None = Field(None, max_length=1024)
+    response: McpResponse | None = None
+    jobSite: bool = Field(
+        ...,
+        description='Whether a Job Site answered. Workbench keeps it with the result, with `installMode` (J13a, J18).',
+    )
+    installMode: InstallModeName
 
 
 class JobSiteFolder(BaseModel):
+    """
+    A folder on the site, as the site reports it, and who may use it (J6g).
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
     id: str
-    name: str
+    name: str = Field(
+        ..., description='Unique on the machine; what Workbench and the model call it.'
+    )
     path: str
     writable: bool
     people: list[JobSiteFolderPerson]
+
+
+class JobSiteServer(BaseModel):
+    """
+    A local server on the site, as the site reports it, and who may use which of its tools.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    server: SiteServer
+    people: list[JobSiteServerPerson]
 
 
 class JobSitePeopleRequest(BaseModel):
@@ -2128,6 +2510,42 @@ class JobSitePeopleRequest(BaseModel):
     )
     refreshToken: str = Field(..., max_length=16384, min_length=1)
     people: list[JobSitePersonGrant] = Field(..., max_length=256)
+
+
+class JobSiteAccessRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    people: list[JobSitePersonTools] = Field(..., max_length=256)
+
+
+class SiteAuditEntry(BaseModel):
+    """
+    One line of the site's own audit log, kept on the machine and read by
+    its owner (J8). It records who asked for what and what the site decided,
+    never a file's contents or a tool's result.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    at: AwareDatetime
+    subject: str = Field(..., max_length=64)
+    kind: SiteAuditKind
+    server: str | None = Field(None, max_length=40)
+    method: str | None = Field(None, max_length=64)
+    tool: str | None = Field(None, max_length=128)
+    action: str | None = Field(None, max_length=64)
+    arguments: str | None = Field(
+        None,
+        description="The call's arguments as JSON, cut at 1,024 characters, with a write's text left out.",
+        max_length=1024,
+    )
+    decision: SiteAuditDecision
+    outcome: SiteAnswerStatus | None = None
+    reason: str | None = Field(None, max_length=1024)
 
 
 class RootTls(BaseModel):
@@ -2468,6 +2886,93 @@ class RuntimePlacementList(BaseModel):
     )
 
 
+class SiteSummary(BaseModel):
+    """
+    What a job site holds, as the site itself reports it in each poll. The
+    root keeps it as a cache: it answers Workbench's listings from it, and
+    the site checks every call against its own copy again (rule 2 of §3.3).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    owner: str = Field(
+        ...,
+        description='The person the site pinned as its owner at its join.',
+        max_length=64,
+        min_length=1,
+    )
+    ownerInDevMode: bool = Field(
+        ...,
+        description="The site's owner lets Eugene's owner in while Eugene is in dev mode (J6e).",
+    )
+    folders: list[SiteFolder] = Field(..., max_length=64)
+    servers: list[SiteServer] = Field(..., max_length=96)
+    access: list[SiteAccess] = Field(
+        ...,
+        description="Who may use the local servers' tools. Folders carry their own people.",
+        max_length=2048,
+    )
+
+
+class HelperResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    status: HelperOperationStatus
+    result: dict[str, Any] | None = Field(
+        None, description="A management action's result."
+    )
+    message: str | None = Field(None, max_length=1024)
+    response: McpResponse | None = Field(
+        None,
+        description="An MCP request's JSON-RPC response, as the machine's host answered it.",
+    )
+
+
+class HelperOperation(BaseModel):
+    """
+    What a machine claims: one operation, bound to this machine's enrolment, to be done before `expiresAt`. The agent checks the binding and hands the rest to the machine's host, whose policy decides (J8).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=128, min_length=1)
+    expiresAt: float
+    node: str
+    nodeKey: str
+    enrolledAt: str
+    subject: str = Field(
+        ...,
+        description="Who asked, as the root established it (a person's id, or `operator`).",
+    )
+    kind: HelperOperationKind
+    server: SiteServerId | None = Field(
+        None, description="For `mcp`, the machine's server."
+    )
+    request: McpRequest | None = Field(None, description='For `mcp`, the request.')
+    grants: list[SiteGrantHint] | None = Field(
+        None,
+        description="For `mcp` to the file server: on an ordinary node, all of the person's grants there, where the root's grant is final (J6d); on a Job Site, Eugene's owner's dev-mode grants (J6e). Empty otherwise. The host checks the folder a call names against them (J6g).",
+        max_length=64,
+    )
+    action: str | None = Field(None, description='For `manage`, the action.')
+    arguments: dict[str, Any] | None = Field(
+        None, description='For `manage`, its arguments.'
+    )
+    installMode: InstallModeName
+
+
+class SiteServerList(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    servers: list[SiteServerGrant]
+    installMode: InstallMode
+
+
 class JobSite(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -2482,7 +2987,17 @@ class JobSite(BaseModel):
         None, description='The OS account to give folder permission to.'
     )
     lastContactAt: AwareDatetime | None = None
-    folders: list[JobSiteFolder]
+    folders: list[JobSiteFolder] = Field(
+        ...,
+        description='The folders registered on it, which its one file server offers by name (J6g), and who may use each.',
+    )
+    servers: list[JobSiteServer] | None = Field(
+        None, description='The local servers a machine administrator added at it.'
+    )
+    ownerInDevMode: bool | None = Field(
+        None,
+        description="Whether the site lets Eugene's owner in while Eugene is in dev mode (J6e). Null until the site has reported.",
+    )
 
 
 class JobSiteList(BaseModel):
@@ -2495,6 +3010,13 @@ class JobSiteList(BaseModel):
         ...,
         description='Whether the owner has opened the public route for machines, so this person can add one.',
     )
+
+
+class JobSiteAudit(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    entries: list[SiteAuditEntry]
 
 
 class Node(BaseModel):
@@ -2863,6 +3385,25 @@ class Snapshot(BaseModel):
     revokedSignIns: list[RevokedSession] | None = Field(
         None,
         description='Sign-ins revoked at `/oidc/revoke` and not yet expired, by their `jti`.',
+    )
+
+
+class HelperReport(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    supported: bool
+    ready: bool
+    reason: str | None = Field(None, max_length=1024)
+    account: str | None = Field(None, max_length=256)
+    protocol: SiteHostProtocol | None = Field(
+        None,
+        description="The protocol this machine's host speaks. Absent from an agent older than slice 2, whose helper takes only the four bespoke tools; the root then says the machine needs an update, rather than sending it MCP.",
+    )
+    hostVersion: str | None = Field(None, max_length=64)
+    site: SiteSummary | None = Field(
+        None,
+        description="A Job Site's own folders, servers and list of who may use what (J6b).",
     )
 
 

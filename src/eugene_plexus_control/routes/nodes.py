@@ -670,6 +670,9 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         controlPublicKey=identity.controlPublicKey or "",
         recoveryPublicKey=recovery_public,
         grants=[TrustGrant(g) for g in machine.state.nodes[body.name].grants],
+        # A Job Site pins the person who confirmed it here: its host takes
+        # management actions from them alone (J6b, rule 2 of §3.3).
+        owner=machine.state.nodes[body.name].owner,
     )
 
 

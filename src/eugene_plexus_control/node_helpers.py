@@ -1,9 +1,15 @@
-"""Bounded, ephemeral delivery of approved file operations to enrolled nodes.
+"""Bounded, ephemeral delivery of operations to machines' site hosts.
 
-Configuration is replicated; jobs and their contents never are. Delivery is
-at most once: an offered job must be claimed, authorization is checked again,
-and a claimed job is never put back in the queue. Losing a write's answer is
-uncertain, not permission to run it again.
+Each operation is an envelope (`HelperOperation`): one MCP request of the
+2026-07-28 revision to one of the machine's servers, or one of its host's
+management actions (Job Sites J6, `remote-nodes.md` §3.4). The machine's
+host decides whether it runs, and on a job site its policy is final (J8).
+
+Configuration is replicated; jobs, their contents and a site's own report
+never are. Delivery is at most once: an offered job must be claimed,
+authorization is checked again, and a claimed job is never put back in the
+queue. Losing a tool call's answer is uncertain, not permission to run it
+again.
 """
 
 from __future__ import annotations
@@ -79,42 +85,144 @@ def is_site(state: Any, node: str) -> bool:
     return record is not None and "files" in record.grants
 
 
-def grants_for(state: Any, subject: str) -> list[dict[str, Any]]:
-    """Every folder `subject` may use, and whether to write.
+OPERATOR = "operator"
+FILES = "files"
+PROTOCOL = "mcp-2026-07-28"
 
-    Eugene's owner (`operator`) has the folders they gave themselves
-    (`ownerAccess`), on a Job Site **only while the install is in dev mode**
-    (J13b): switching to production ends them at once, because this is
-    checked at every use. A person has their `helperGrants` on ordinary
-    nodes, which Eugene's owner writes, and on a Job Site exactly what its
-    owner wrote on the folder (`people`), which nobody else can.
-    """
-    dev = install_mode(state) == DEV
-    members = [n for n in state.nodes if state.nodes[n].signingPublicKey]
-    if subject == "operator":
-        return [
-            {"folderId": folder["id"], "writable": folder["ownerAccess"] == "write"}
-            for node in members
-            if dev or not is_site(state, node)
-            for folder in configuration(state, node)["folders"]
-            if folder["ownerAccess"] != "none"
+
+def unique_names(names: list[str]) -> list[str]:
+    """Each folder's name as the file server's `folder` argument takes it: a
+    name already taken on the machine, ignoring case, by a folder registered
+    before it reads `Name (2)`, `Name (3)`... (J6g). The site host applies the
+    same rule to what it is given."""
+    taken: set[str] = set()
+    out: list[str] = []
+    for name in names:
+        candidate, n = name, 1
+        while candidate.casefold() in taken:
+            n += 1
+            candidate = f"{name} ({n})"
+        taken.add(candidate.casefold())
+        out.append(candidate)
+    return out
+
+
+def folder_names(config: dict[str, Any]) -> dict[str, str]:
+    folders = config["folders"]
+    names = unique_names([f["name"] for f in folders])
+    return {f["id"]: name for f, name in zip(folders, names, strict=True)}
+
+
+def node_grants(state: Any, subject: str, node: str) -> list[dict[str, Any]]:
+    """`subject`'s grants on ordinary node `node`, as the host takes them
+    (`SiteGrantHint`): the root's grant is final there (J6d).
+
+    Eugene's owner has the folders they gave themselves (`ownerAccess`); a
+    person, their `helperGrants`, which Eugene's owner writes. A job site's
+    folders are its own and are never here."""
+    if is_site(state, node):
+        return []
+    config = configuration(state, node)
+    names = folder_names(config)
+    if subject == OPERATOR:
+        chosen = [
+            (f, f["ownerAccess"] == "write")
+            for f in config["folders"]
+            if f["ownerAccess"] != "none"
         ]
-    site_folders = {
-        folder["id"]: folder
-        for node in members
-        if is_site(state, node)
-        for folder in configuration(state, node)["folders"]
-    }
-    granted = [
-        g
-        for g in state.people.get(subject, {}).get("helperGrants") or []
-        if g["folderId"] not in site_folders
+    else:
+        held = {
+            g["folderId"]: bool(g["writable"])
+            for g in state.people.get(subject, {}).get("helperGrants") or []
+        }
+        chosen = [(f, held[f["id"]]) for f in config["folders"] if f["id"] in held]
+    return [
+        {
+            "folderId": f["id"],
+            "name": names[f["id"]],
+            "path": f["path"],
+            "identity": f["identity"],
+            "writable": bool(writable and f["writable"]),
+        }
+        for f, writable in chosen
     ]
-    for folder in site_folders.values():
-        for entry in folder.get("people") or []:
-            if entry["person"] == subject:
-                granted.append({"folderId": folder["id"], "writable": bool(entry["writable"])})
-    return granted
+
+
+def dev_grants(state: Any, node: str, summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Eugene's owner's own grants on job site `node`, named as the site last
+    reported its folders, and **only while the install is in dev mode**
+    (J13b): switching to production ends them at once, because this is
+    checked at every use. The site honours them only if its owner let
+    Eugene's owner in there (J6e), which it checks itself."""
+    if install_mode(state) != DEV or summary is None or not is_site(state, node):
+        return []
+    folders = {f["id"]: f for f in summary.get("folders") or []}
+    out: list[dict[str, Any]] = []
+    for grant in configuration(state, node).get("devGrants") or []:
+        folder = folders.get(grant["folderId"])
+        if folder is not None:
+            out.append(
+                {
+                    "folderId": folder["id"],
+                    "name": folder["name"],
+                    "path": folder["path"],
+                    "identity": folder["identity"],
+                    "writable": bool(grant["writable"] and folder["writable"]),
+                }
+            )
+    return out
+
+
+def site_folders_for(summary: dict[str, Any] | None, subject: str) -> list[dict[str, Any]]:
+    """The folders on a job site's own list for `subject`, as it last
+    reported them. A cache: the site checks every call against its own copy
+    again (rule 2 of §3.3)."""
+    out = []
+    for folder in (summary or {}).get("folders") or []:
+        person = next((p for p in folder.get("people") or [] if p["subject"] == subject), None)
+        if person is not None:
+            out.append(
+                {
+                    "id": folder["id"],
+                    "name": folder["name"],
+                    "writable": bool(person["writable"] and folder["writable"]),
+                }
+            )
+    return out
+
+
+def site_local_servers_for(summary: dict[str, Any] | None, subject: str) -> list[dict[str, Any]]:
+    """The local servers on a job site that `subject` has tools on, as it
+    last reported them."""
+    granted = {
+        entry["server"]
+        for entry in (summary or {}).get("access") or []
+        if entry["subject"] == subject and entry.get("tools")
+    }
+    return [
+        server
+        for server in (summary or {}).get("servers") or []
+        if server["kind"] == "local" and server["id"] in granted and server.get("enabled")
+    ]
+
+
+def envelope(state: Any, config: dict[str, Any], subject: str, **fields: Any) -> dict[str, Any]:
+    """What a machine claims (`HelperOperation`), less the id and deadline
+    the broker adds at the claim."""
+    return {
+        "node": config["node"],
+        "nodeKey": config["nodeKey"],
+        "enrolledAt": config["enrolledAt"],
+        "subject": subject,
+        "installMode": install_mode(state),
+        "kind": "mcp",
+        "server": None,
+        "request": None,
+        "grants": [],
+        "action": None,
+        "arguments": None,
+        **fields,
+    }
 
 
 def check_grants(state: Any, values: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -153,6 +261,17 @@ class Broker:
         self.reports: dict[str, tuple[float, str, str, dict[str, Any]]] = {}
         self.changed = asyncio.Event()
         self.used: dict[str, float] = {}
+
+    def report(self, node: str) -> dict[str, Any] | None:
+        """What the machine last reported, however long ago; None if never."""
+        seen = self.reports.get(node)
+        return seen[3] if seen is not None else None
+
+    def summary(self, node: str) -> dict[str, Any] | None:
+        """A job site's own folders, servers and list, as it last reported them."""
+        report = self.report(node)
+        site = report.get("site") if report else None
+        return site if isinstance(site, dict) else None
 
     def status(self, config: dict[str, Any]) -> dict[str, Any]:
         seen = self.reports.get(config["node"])

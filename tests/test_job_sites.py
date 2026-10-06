@@ -28,7 +28,12 @@ from eugene_plexus_control.settings import Settings
 from .conftest import PASSPHRASE, NodeKeys, login, mint_join_token, node_keys
 from .test_oidc import CALLBACK, _tokens
 
-REPORT = {"supported": True, "ready": True, "account": "isolated-file-helper"}
+REPORT = {
+    "supported": True,
+    "ready": True,
+    "account": "isolated-file-helper",
+    "protocol": "mcp-2026-07-28",
+}
 PUBLIC = {"X-Eugene-Plexus-Entry": "public-nodes"}
 NODES_ORIGIN = "https://nodes.example.test:8443"
 
@@ -90,40 +95,96 @@ def join_site(
     return keys, c.post("/v1/nodes/enroll", json=body, headers=PUBLIC)
 
 
-def deliver(c: TestClient, keys: NodeKeys) -> tuple[str, dict[str, Any]]:
+def deliver(
+    c: TestClient, keys: NodeKeys, report: dict[str, Any] | None = None
+) -> tuple[str, dict[str, Any]]:
     for _ in range(100):
-        answer = c.post("/v1/node-helpers/poll", headers=agent(keys), json=REPORT)
+        answer = c.post("/v1/node-helpers/poll", headers=agent(keys), json=report or REPORT)
         assert answer.status_code == 200, answer.text
         ident = answer.json()["operation"]
         if ident:
             claim = c.post(f"/v1/node-helpers/operations/{ident}/claim", headers=agent(keys))
             assert claim.status_code == 200, claim.text
             return ident, claim.json()
-    pytest.fail("no file operation was delivered")
+    pytest.fail("no operation was delivered")
+
+
+def answer(c: TestClient, keys: NodeKeys, ident: str, value: dict[str, Any]) -> None:
+    done = c.post(f"/v1/node-helpers/operations/{ident}/result", headers=agent(keys), json=value)
+    assert done.status_code == 204, done.text
+
+
+class Site:
+    """What a job site holds and reports (`SiteSummary`): the site's own list,
+    which the root keeps only as a cache (rule 2 of §3.3)."""
+
+    def __init__(self, owner: str) -> None:
+        self.summary: dict[str, Any] = {
+            "owner": owner,
+            "ownerInDevMode": False,
+            "folders": [],
+            "servers": [],
+            "access": [],
+        }
+
+    def report(self) -> dict[str, Any]:
+        return {**REPORT, "site": self.summary}
+
+    def folder(self, **values: Any) -> dict[str, Any]:
+        folder = {"people": [], **values}
+        self.summary["folders"].append(folder)
+        return folder
+
+
+def manage_through(
+    c: TestClient, keys: NodeKeys, site: Site, post: Any, result: Any, *, action: str
+) -> tuple[dict[str, Any], Any]:
+    """Run one relayed management action: the site claims it, and answers
+    `result(command)` (a function, so it can see what was asked)."""
+    with ThreadPoolExecutor() as pool:
+        pending = pool.submit(post)
+        ident, command = deliver(c, keys, site.report())
+        assert command["kind"] == "manage" and command["action"] == action, command
+        answer(c, keys, ident, result(command))
+        response = pending.result(timeout=5)
+    c.post("/v1/node-helpers/poll", headers=agent(keys), json=site.report())
+    return command, response
 
 
 def site_with_folder(
     c: TestClient,
-) -> tuple[NodeKeys, dict[str, Any], dict[str, Any], str, dict[str, Any]]:
-    """Ada's job site `desk`, its helper on, one writable folder nobody may use yet."""
+) -> tuple[NodeKeys, dict[str, Any], dict[str, Any], str, dict[str, Any], Site]:
+    """Ada's job site `desk`, its file support on, one writable folder nobody
+    may use yet."""
     app = workbench(c)
     ada, ada_token = add_person(c, app, "ada")
     keys, joined = join_site(c, ada)
     assert joined.status_code == 201, joined.text
+    assert joined.json()["owner"] == ada["id"]  # the site pins it (J6b)
     enabled = c.post(
         "/oidc/job-sites/desk/enabled",
         auth=auth(app),
         json={"refreshToken": ada_token, "enabled": True},
     )
     assert enabled.status_code == 200, enabled.text
-    polled = c.post("/v1/node-helpers/poll", headers=agent(keys), json=REPORT)
+    site = Site(ada["id"])
+    polled = c.post("/v1/node-helpers/poll", headers=agent(keys), json=site.report())
     assert polled.status_code == 200
-    # The site is told its owner, the one person whose commands register
-    # its folders; its own relay checks it again.
     assert polled.json()["siteOwner"] == ada["id"]
-    with ThreadPoolExecutor() as pool:
-        pending = pool.submit(
-            c.post,
+
+    def added(command: dict[str, Any]) -> dict[str, Any]:
+        assert command["subject"] == ada["id"]
+        assert command["arguments"] == {"name": "Notes", "path": "C:\\Notes", "writable": True}
+        folder = site.folder(
+            id="a" * 32, name="Notes", path="C:\\Notes", identity="vol:file", writable=True
+        )
+        return {"status": "done", "result": folder}
+
+    _command, folder = manage_through(
+        c,
+        keys,
+        site,
+        lambda: c.post(
             "/oidc/job-sites/desk/folders",
             auth=auth(app),
             json={
@@ -132,45 +193,67 @@ def site_with_folder(
                 "path": "C:\\Notes",
                 "writable": True,
             },
-        )
-        ident, command = deliver(c, keys)
-        assert command["tool"] == "inspect" and command["subject"] == ada["id"]
-        done = c.post(
-            f"/v1/node-helpers/operations/{ident}/result",
-            headers=agent(keys),
-            json={"status": "done", "result": {"path": "C:\\Notes", "identity": "vol:file"}},
-        )
-        assert done.status_code == 204
-        folder = pending.result(timeout=5)
+        ),
+        added,
+        action="folder.add",
+    )
     assert folder.status_code == 201, folder.text
-    return keys, app, ada, ada_token, folder.json()
+    assert folder.json() == {
+        "id": "a" * 32,
+        "name": "Notes",
+        "path": "C:\\Notes",
+        "writable": True,
+        "people": [],
+    }
+    return keys, app, ada, ada_token, folder.json(), site
+
+
+def rpc(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": method,
+        "params": {
+            **(params or {}),
+            "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"},
+        },
+    }
 
 
 def read(c: TestClient, app: dict[str, Any], token: str, folder: dict[str, Any]) -> Any:
     return c.post(
-        "/oidc/node-helpers/execute",
+        "/oidc/sites/mcp",
         auth=auth(app),
         json={
             "refreshToken": token,
-            "folderId": folder["id"],
-            "tool": "read_text",
-            "arguments": {"path": "a.txt"},
+            "node": "desk",
+            "server": "files",
+            "request": rpc(
+                "tools/call",
+                {"name": "read_text", "arguments": {"folder": folder["name"], "path": "a.txt"}},
+            ),
         },
     )
 
 
 def read_through(
-    c: TestClient, keys: NodeKeys, app: dict[str, Any], token: str, folder: dict[str, Any]
-) -> Any:
+    c: TestClient,
+    keys: NodeKeys,
+    app: dict[str, Any],
+    token: str,
+    folder: dict[str, Any],
+    site: Site,
+) -> tuple[dict[str, Any], Any]:
     with ThreadPoolExecutor() as pool:
         pending = pool.submit(read, c, app, token, folder)
-        ident, _ = deliver(c, keys)
-        c.post(
-            f"/v1/node-helpers/operations/{ident}/result",
-            headers=agent(keys),
-            json={"status": "done", "result": {"text": "SITE-CONTENT"}},
+        ident, command = deliver(c, keys, site.report())
+        answer(
+            c,
+            keys,
+            ident,
+            {"status": "done", "response": {"jsonrpc": "2.0", "id": 3, "result": {"t": "SITE"}}},
         )
-        return pending.result(timeout=5)
+        return command, pending.result(timeout=5)
 
 
 # --------------------------------------------------------------------------- joining
@@ -291,7 +374,7 @@ def test_nothing_runs_on_a_job_site(root: TestClient) -> None:
 
 def test_only_the_site_owner_grants_and_the_grantee_reads(root: TestClient) -> None:
     c = root
-    keys, app, _, ada_token, folder = site_with_folder(c)
+    keys, app, _, ada_token, folder, site = site_with_folder(c)
     bo, bo_token = add_person(c, app, "bo")
     assert read(c, app, bo_token, folder).status_code == 403
     assert read(c, app, ada_token, folder).status_code == 403  # not even its owner, yet
@@ -310,15 +393,41 @@ def test_only_the_site_owner_grants_and_the_grantee_reads(root: TestClient) -> N
         json={"refreshToken": bo_token, "people": [{"name": "bo", "writable": False}]},
     )
     assert bo_grants.status_code == 404
-    granted = c.post(
-        f"/oidc/job-sites/desk/folders/{folder['id']}/people",
-        auth=auth(app),
-        json={"refreshToken": ada_token, "people": [{"name": "BO", "writable": False}]},
+    assert not c.app.state.node_helper_broker.jobs
+
+    def granted(command: dict[str, Any]) -> dict[str, Any]:
+        assert command["subject"] == site.summary["owner"]
+        assert command["arguments"] == {
+            "id": folder["id"],
+            "people": [{"subject": bo["id"], "writable": False}],
+        }
+        site.summary["folders"][0]["people"] = command["arguments"]["people"]
+        return {"status": "done", "result": site.summary["folders"][0]}
+
+    _, given = manage_through(
+        c,
+        keys,
+        site,
+        lambda: c.post(
+            f"/oidc/job-sites/desk/folders/{folder['id']}/people",
+            auth=auth(app),
+            json={"refreshToken": ada_token, "people": [{"name": "BO", "writable": False}]},
+        ),
+        granted,
+        action="folder.people",
     )
-    assert granted.status_code == 200, granted.text
-    answer = read_through(c, keys, app, bo_token, folder)
-    assert answer.status_code == 200, answer.text
-    assert answer.json()["jobSite"] is True and answer.json()["installMode"] == "production"
+    assert given.status_code == 200, given.text
+    assert given.json()["people"] == [{"person": bo["id"], "name": "bo", "writable": False}]
+    listed = c.post("/oidc/sites/servers", auth=auth(app), json={"refreshToken": bo_token})
+    assert listed.json()["servers"][0]["folders"] == [
+        {"id": folder["id"], "name": "Notes", "writable": False}
+    ]
+    command, answered = read_through(c, keys, app, bo_token, folder, site)
+    # The site's own list decides: nothing of the root's grants rides along.
+    assert command["kind"] == "mcp" and command["grants"] == []
+    assert command["subject"] == bo["id"]
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["jobSite"] is True and answered.json()["installMode"] == "production"
     mine = c.post("/oidc/job-sites", auth=auth(app), json={"refreshToken": ada_token}).json()
     assert mine["sites"][0]["folders"][0]["people"] == [
         {"person": bo["id"], "name": "bo", "writable": False}
@@ -329,9 +438,112 @@ def test_only_the_site_owner_grants_and_the_grantee_reads(root: TestClient) -> N
     )
 
 
+def test_the_sites_refusal_comes_back_in_its_own_words(root: TestClient) -> None:
+    c = root
+    keys, app, _, ada_token, folder, site = site_with_folder(c)
+    _, refused = manage_through(
+        c,
+        keys,
+        site,
+        lambda: c.post(
+            f"/oidc/job-sites/desk/folders/{folder['id']}/people",
+            auth=auth(app),
+            json={"refreshToken": ada_token, "people": [{"name": "ada", "writable": True}]},
+        ),
+        lambda _: {"status": "failed", "message": "Only this machine's owner changes it."},
+        action="folder.people",
+    )
+    assert refused.status_code == 422 and "Only this machine's owner" in refused.text
+    missing = c.post(
+        f"/oidc/job-sites/desk/folders/{folder['id']}/people",
+        auth=auth(app),
+        json={"refreshToken": ada_token, "people": [{"name": "nobody", "writable": False}]},
+    )
+    assert missing.status_code == 404 and not c.app.state.node_helper_broker.jobs
+
+
+def test_an_edit_to_the_roots_state_grants_nothing_on_a_site(root: TestClient) -> None:
+    """Rule 2 of §3.3: slice 1 kept a site's people on the root's record. A
+    record saying bo may use the folder opens nothing; the site's list does."""
+    c = root
+    _keys, app, _, _, folder, _site = site_with_folder(c)
+    bo, bo_token = add_person(c, app, "bo")
+    machine = c.app.state.machine
+    config = node_helpers.configuration(machine.state, "desk")
+    forged = {
+        "id": folder["id"],
+        "name": "Notes",
+        "path": "C:\\Notes",
+        "identity": "vol:file",
+        "writable": True,
+        "ownerAccess": "none",
+        "people": [{"person": bo["id"], "writable": True}],
+    }
+    machine.append(node_helpers_op(), {"helper": {**config, "folders": [forged]}})
+    listed = c.post("/oidc/sites/servers", auth=auth(app), json={"refreshToken": bo_token})
+    assert listed.json()["servers"] == []
+    assert read(c, app, bo_token, folder).status_code == 403
+    assert not c.app.state.node_helper_broker.jobs
+
+
+def node_helpers_op() -> str:
+    from eugene_plexus_control.applied import OP_PUT_NODE_HELPER
+
+    return OP_PUT_NODE_HELPER
+
+
+def test_the_owner_reads_the_sites_audit_log_and_its_settings(root: TestClient) -> None:
+    c = root
+    keys, app, _, ada_token, _, site = site_with_folder(c)
+    _, bo_token = add_person(c, app, "bo")
+    entry = {"at": "2026-10-05T12:00:00Z", "subject": "x", "kind": "mcp", "decision": "refused"}
+    _, log = manage_through(
+        c,
+        keys,
+        site,
+        lambda: c.post(
+            "/oidc/job-sites/desk/audit",
+            auth=auth(app),
+            json={"refreshToken": ada_token, "limit": 5},
+        ),
+        lambda command: (
+            {"status": "done", "result": {"entries": [entry]}}
+            if command["arguments"] == {"limit": 5}
+            else {"status": "failed", "message": "wrong limit"}
+        ),
+        action="audit.read",
+    )
+    assert log.status_code == 200 and log.json() == {"entries": [entry]}
+    for token in (bo_token, _tokens(c, app, name="operator")["refresh_token"]):
+        assert (
+            c.post(
+                "/oidc/job-sites/desk/audit", auth=auth(app), json={"refreshToken": token}
+            ).status_code
+            == 404
+        )
+
+    def opted(command: dict[str, Any]) -> dict[str, Any]:
+        site.summary["ownerInDevMode"] = command["arguments"]["ownerInDevMode"]
+        return {"status": "done", "result": {"ownerInDevMode": True}}
+
+    _, settings = manage_through(
+        c,
+        keys,
+        site,
+        lambda: c.post(
+            "/oidc/job-sites/desk/settings",
+            auth=auth(app),
+            json={"refreshToken": ada_token, "ownerInDevMode": True},
+        ),
+        opted,
+        action="settings.set",
+    )
+    assert settings.status_code == 200 and settings.json()["ownerInDevMode"] is True
+
+
 def test_production_hides_a_site_from_eugenes_owner_and_dev_mode_shows_it(root: TestClient) -> None:
     c = root
-    keys, app, _, _, folder = site_with_folder(c)
+    keys, app, _, _, folder, site = site_with_folder(c)
     owner_token = _tokens(c, app, name="operator")["refresh_token"]  # the passphrase, in Workbench
     listed = next(h for h in c.get("/v1/node-helpers").json()["helpers"] if h["node"] == "desk")
     assert listed["hidden"] is True and listed["folders"] == [] and "enabled" not in listed
@@ -351,8 +563,27 @@ def test_production_hides_a_site_from_eugenes_owner_and_dev_mode_shows_it(root: 
         ).status_code
         == 200
     )
-    answer = read_through(c, keys, app, owner_token, folder)
-    assert answer.status_code == 200 and answer.json()["installMode"] == "dev"
+    # Dev mode alone opens nothing: the site's owner has not let them in.
+    assert (
+        c.post("/oidc/sites/servers", auth=auth(app), json={"refreshToken": owner_token}).json()[
+            "servers"
+        ]
+        == []
+    )
+    site.summary["ownerInDevMode"] = True
+    c.post("/v1/node-helpers/poll", headers=agent(keys), json=site.report())
+    command, answered = read_through(c, keys, app, owner_token, folder, site)
+    assert command["subject"] == "operator" and command["installMode"] == "dev"
+    assert command["grants"] == [
+        {
+            "folderId": folder["id"],
+            "name": "Notes",
+            "path": "C:\\Notes",
+            "identity": "vol:file",
+            "writable": False,
+        }
+    ]
+    assert answered.status_code == 200 and answered.json()["installMode"] == "dev"
     # Eugene's owner still cannot give another person the site's folder.
     assert c.put("/v1/node-helpers/desk", json={"enabled": False}).status_code == 403
 
@@ -491,3 +722,96 @@ def test_spki_pin_is_the_sha256_of_the_public_key_info() -> None:
     )
     expected = base64.urlsafe_b64encode(hashlib.sha256(spki).digest()).rstrip(b"=").decode()
     assert root_tls.spki_pin(der) == (expected, int(cert.not_valid_after_utc.timestamp()))
+
+
+def test_a_local_servers_access_is_relayed_by_name_and_listed_by_the_site(
+    root: TestClient,
+) -> None:
+    c = root
+    keys, app, _, ada_token, _, site = site_with_folder(c)
+    bo, bo_token = add_person(c, app, "bo")
+    server = {
+        "id": "notes-tool",
+        "name": "Notes tool",
+        "kind": "local",
+        "system": False,
+        "enabled": True,
+        "available": True,
+        "reason": None,
+        "tools": [{"name": "search", "readOnly": True, "destructive": False}],
+    }
+    site.summary["servers"].append(server)
+
+    def granted(command: dict[str, Any]) -> dict[str, Any]:
+        assert command["arguments"] == {
+            "server": "notes-tool",
+            "people": [{"subject": bo["id"], "tools": [{"name": "search", "standing": False}]}],
+        }
+        people = command["arguments"]["people"]
+        site.summary["access"] = [{"server": "notes-tool", **p} for p in people]
+        return {"status": "done", "result": {"server": server, "people": people}}
+
+    _, given = manage_through(
+        c,
+        keys,
+        site,
+        lambda: c.post(
+            "/oidc/job-sites/desk/servers/notes-tool/access",
+            auth=auth(app),
+            json={
+                "refreshToken": ada_token,
+                "people": [{"name": "bo", "tools": [{"name": "search"}]}],
+            },
+        ),
+        granted,
+        action="access.set",
+    )
+    assert given.status_code == 200, given.text
+    assert given.json()["people"] == [
+        {"person": bo["id"], "name": "bo", "tools": [{"name": "search", "standing": False}]}
+    ]
+    listed = c.post("/oidc/sites/servers", auth=auth(app), json={"refreshToken": bo_token})
+    local = [s for s in listed.json()["servers"] if s["kind"] == "local"]
+    assert local == [
+        {
+            "node": "desk",
+            "jobSite": True,
+            "available": True,
+            "reason": None,
+            "server": "notes-tool",
+            "name": "Notes tool",
+            "kind": "local",
+            "folders": [],
+        }
+    ]
+    mine = c.post("/oidc/job-sites", auth=auth(app), json={"refreshToken": ada_token}).json()
+    assert mine["sites"][0]["servers"][0]["server"]["id"] == "notes-tool"
+
+
+def test_a_site_that_speaks_no_mcp_is_told_to_update(root: TestClient) -> None:
+    c = root
+    keys, app, _, ada_token, folder, _ = site_with_folder(c)
+    old = {k: v for k, v in REPORT.items() if k != "protocol"}
+    assert c.post("/v1/node-helpers/poll", headers=agent(keys), json=old).status_code == 200
+    refused = c.post(
+        f"/oidc/job-sites/desk/folders/{folder['id']}/people",
+        auth=auth(app),
+        json={"refreshToken": ada_token, "people": []},
+    )
+    assert refused.status_code == 503 and "Update Eugene" in refused.text
+    assert not c.app.state.node_helper_broker.jobs
+
+
+def test_the_consoles_file_routes_need_the_node_files_capability(root: TestClient) -> None:
+    from eugene_plexus_control import capabilities
+
+    c = root
+    assert capabilities.NODE_FILES in capabilities.ADMINISTRATIVE
+    assert c.get("/v1/node-helpers").status_code == 200
+    original = capabilities.held_by
+    try:
+        capabilities.held_by = lambda claims: original(claims) - {capabilities.NODE_FILES}  # type: ignore[assignment]
+        refused = c.get("/v1/node-helpers")
+        assert refused.status_code == 403 and "node-files" in refused.text
+    finally:
+        capabilities.held_by = original  # type: ignore[assignment]

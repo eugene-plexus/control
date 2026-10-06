@@ -974,11 +974,20 @@ def _helper_record(raw: Any) -> dict[str, Any]:
     except (ValueError, TypeError) as exc:
         raise ApplyError("invalid node helper configuration") from exc
     for folder in record["folders"]:
-        # Only a Job Site's folders carry who may use them. An empty list is
-        # left out, so every other node's record is byte-identical to the
-        # one it was before Job Sites, and a standby on that build reads it.
+        # Only a slice 1 Job Site's folders carried who may use them, and
+        # they replay but are read by nothing: since slice 2 a site keeps
+        # them itself (J6b). An empty list is left out, so every other node's
+        # record is byte-identical to the one it was before Job Sites, and a
+        # standby on that build reads it.
         if not folder.get("people"):
             folder.pop("people", None)
+    # Eugene's owner's own dev-mode grants on a Job Site (J13b); absent on
+    # every other record, for the same reason.
+    if not record.get("devGrants"):
+        record.pop("devGrants", None)
+    granted = [g["folderId"] for g in record.get("devGrants") or []]
+    if len(granted) != len(set(granted)):
+        raise ApplyError("a folder is granted twice to Eugene's owner")
     ids = [f["id"] for f in record["folders"]]
     if len(ids) != len(set(ids)):
         raise ApplyError("duplicate helper folder")
