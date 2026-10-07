@@ -403,3 +403,13 @@ def test_a_dev_grant_names_a_workspace_by_id_and_carries_no_path(root: TestClien
         c.patch(f"/v1/sites/{a.site}/folders/{MINE}", json={"ownerAccess": "read"}).status_code
         == 404
     )
+
+
+def test_without_a_link_ones_own_workspaces_are_not_listed(root: TestClient) -> None:
+    """Only a person's own worker opens their workspaces: with no link on the
+    machine, the root lists only what the owner shared."""
+    c = root
+    a, bo, bo_token = people_site(c)
+    a.held.summary["links"] = [e for e in a.held.summary["links"] if e["subject"] != bo["id"]]
+    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+    assert [(f["name"], f["mine"]) for f in files_folders(c, a, bo_token)] == [("Notes", False)]
