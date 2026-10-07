@@ -26,7 +26,7 @@ import jwt
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from .. import oidc, peer, security, tokens
+from .. import oidc, peer, permissions, security, tokens
 from ..applied import OP_REVOKE_SIGN_IN, OP_SET_PERSON_PASSWORD, OPERATOR_NAME
 from ..dependencies import verify_bearer
 
@@ -379,6 +379,21 @@ async def sign_in(request: Request) -> Response:
             app_name=client["name"],
             error=f"You may not use {client['name']}. It links people, and Eugene's owner "
             "is not a person on a machine. Sign in as a person the owner added.",
+        )
+    if (
+        person is not None
+        and client.get("builtin")
+        and not permissions.has(
+            request.app.state.machine.state, str(person["id"]), permissions.USE_JOB_SITES
+        )
+    ):
+        # J77: linking at a machine takes `use-job-sites`.
+        return _page(
+            403,
+            pending.redirect_uri,
+            title=f"Not for {client['name']}",
+            app_name=client["name"],
+            error=permissions.refusal(permissions.USE_JOB_SITES),
         )
     if (
         person is not None

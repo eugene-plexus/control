@@ -818,6 +818,10 @@ def _timestamp(raw: dict[str, Any], key: str, what: str, *, optional: bool = Fal
         raise ApplyError(f"invalid {what} {key}") from exc
 
 
+#: `PersonPermission` (J77): what a person may do with job sites.
+PERSON_PERMISSIONS = frozenset({"add-job-sites", "use-job-sites"})
+
+
 def _person_record(raw: Any) -> dict[str, Any]:
     """One `SnapshotPerson`, checked as a client-key record is: exactly the
     fields the schema has, so nothing else can ride into the log."""
@@ -830,6 +834,7 @@ def _person_record(raw: Any) -> dict[str, Any]:
         "email",
         "passwordVerifier",
         "apps",
+        "permissions",
         "helperGrants",
         "disabled",
         "createdAt",
@@ -854,6 +859,14 @@ def _person_record(raw: Any) -> dict[str, Any]:
         not isinstance(apps, list) or any(not isinstance(a, str) or not a for a in apps)
     ):
         raise ApplyError("invalid person apps")
+    permissions = raw.get("permissions")
+    if permissions is not None and (
+        not isinstance(permissions, list)
+        or len(permissions) > 16
+        or len(set(permissions)) != len(permissions)
+        or any(p not in PERSON_PERMISSIONS for p in permissions)
+    ):
+        raise ApplyError("invalid person permissions")
     if not isinstance(raw.get("disabled"), bool):
         raise ApplyError("invalid person disabled")
     # Folder grants on nodes retired with the node folders (J20). Old

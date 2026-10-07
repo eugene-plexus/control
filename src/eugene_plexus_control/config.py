@@ -237,6 +237,33 @@ FIELDS: list[ConfigField] = [
         enumLabels=["Production", "Dev (the owner sees all tool information)"],
     ),
     ConfigField(
+        key="peopleMayAddJobSites",
+        label="People may add job sites",
+        description=(
+            "Whether a person may add a machine of their own as a job site, from "
+            "Workbench, unless their own permissions on the People page say "
+            "otherwise. Turning it off changes everyone left on the default; a "
+            "person given their own permissions keeps them."
+        ),
+        category="security",
+        valueType=ConfigValueType.boolean,
+        default=True,
+    ),
+    ConfigField(
+        key="peopleMayUseJobSites",
+        label="People may use job sites as themselves",
+        description=(
+            "Whether a person may link their own account on a job site's machine "
+            "and keep workspaces of their own there, unless their own permissions "
+            "on the People page say otherwise. A folder a site's owner shares "
+            "with them works either way. Turning it off leaves links inert, not "
+            "removed."
+        ),
+        category="security",
+        valueType=ConfigValueType.boolean,
+        default=True,
+    ),
+    ConfigField(
         key="siteJoinUrl",
         label="Address machines join through",
         description=(

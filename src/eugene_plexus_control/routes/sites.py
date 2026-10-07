@@ -33,7 +33,7 @@ from fastapi import APIRouter, Depends, Path, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
 
-from .. import capabilities, oidc, security, site_tokens
+from .. import capabilities, oidc, permissions, security, site_tokens
 from .. import sites as helpers
 from .._generated.models import (
     HostedSites,
@@ -46,8 +46,11 @@ from .._generated.models import (
     JobSitePasskeyPair,
     JobSitePeopleRequest,
     JobSiteRequest,
+    JobSiteRulesRequest,
     JobSiteServerEnable,
     JobSiteSettings,
+    JobSiteWorkspaceCreate,
+    JobSiteWorkspacePeopleRequest,
     SiteCancel,
     SiteEnrollmentRequest,
     SiteFolderOwnerAccess,
@@ -334,12 +337,28 @@ async def check_person(
             "Signing in is turned off",
             f"{person['name']} cannot sign in on this install, so cannot link an account.",
         )
+    if not permissions.has(machine.state, str(person["id"]), permissions.USE_JOB_SITES):
+        raise problem(
+            403, "Not allowed to use job sites", permissions.refusal(permissions.USE_JOB_SITES)
+        )
     return SitePersonCheck(subject=str(person["id"]), name=str(person["name"]))
 
 
 # --------------------------------------------------------------------------- #
 # The console: membership (J19), and dev mode's view (J33)
 # --------------------------------------------------------------------------- #
+
+
+def _owner_folders(summary: dict[str, Any] | None, owner: str) -> list[dict[str, Any]]:
+    """The site owner's workspaces as folders (`id`, `name`, `writable`, and
+    `path` from a site before 2b.3b only, J76)."""
+    if helpers.has_workspaces(summary):
+        return [
+            {"id": w["id"], "name": name, "path": None, "writable": w["writable"]}
+            for name, w, _, mine in helpers.workspace_view(summary, owner)
+            if mine
+        ]
+    return list((summary or {}).get("folders") or [])
 
 
 def _dev_view(request: Request, record: SiteRecord) -> dict[str, Any]:
@@ -351,7 +370,7 @@ def _dev_view(request: Request, record: SiteRecord) -> dict[str, Any]:
             {
                 "id": folder["id"],
                 "name": folder["name"],
-                "path": folder["path"],
+                "path": folder.get("path"),
                 "writable": folder["writable"],
                 "ownerAccess": (
                     "none"
@@ -359,7 +378,7 @@ def _dev_view(request: Request, record: SiteRecord) -> dict[str, Any]:
                     else ("write" if owned[folder["id"]]["writable"] else "read")
                 ),
             }
-            for folder in (summary or {}).get("folders") or []
+            for folder in _owner_folders(summary, record.owner)
         ],
         "servers": list((summary or {}).get("servers") or []),
     }
@@ -466,7 +485,14 @@ async def set_owner_access(
         )
     record = machine.state.sites.get(site)
     summary = helpers.broker(request).summary(helpers.binding(record)) if record else None
-    folder = next((f for f in (summary or {}).get("folders") or [] if f["id"] == folder_id), None)
+    folder = next(
+        (
+            f
+            for f in _owner_folders(summary, record.owner if record else "")
+            if f["id"] == folder_id
+        ),
+        None,
+    )
     if record is None or folder is None:
         raise problem(404, "No such folder", "That site has not reported that folder.")
     access = str(body.ownerAccess.value)
@@ -553,7 +579,11 @@ async def servers(request: Request, body: JobSiteRequest) -> dict[str, Any]:
                 for g in helpers.dev_grants(state, record, summary)
             ]
         else:
-            folders = helpers.site_folders_for(summary, subject)
+            folders = helpers.site_folders_for(
+                summary,
+                subject,
+                own=permissions.has(state, subject, permissions.USE_JOB_SITES),
+            )
         if folders:
             listed.append(
                 {
@@ -634,19 +664,40 @@ async def mcp(request: Request, body: SiteMcpCall) -> dict[str, Any]:
             if server != helpers.FILES or not grants:
                 raise problem(403, "Not granted", "You have nothing on that site.")
             return subject, grants
+        uses = permissions.has(machine.state, subject, permissions.USE_JOB_SITES)
         listed = (
-            bool(helpers.site_folders_for(summary, subject))
+            bool(helpers.site_folders_for(summary, subject, own=uses))
             if server == helpers.FILES
             else any(s["id"] == server for s in helpers.site_local_servers_for(summary, subject))
         )
         if not listed:
             raise problem(403, "Not granted", "You have nothing on that site.")
+        if server == helpers.FILES and not uses and names_own_workspace(summary, subject):
+            # J77: a person's own workspaces take `use-job-sites`; what the
+            # owner shared with them does not.
+            raise problem(
+                403, "Not allowed to use job sites", permissions.refusal(permissions.USE_JOB_SITES)
+            )
         return subject, []
+
+    def names_own_workspace(summary: dict[str, Any] | None, subject: str) -> bool:
+        params = request_body.get("params") or {}
+        arguments = params.get("arguments") if isinstance(params, dict) else None
+        named = arguments.get("folder") if isinstance(arguments, dict) else None
+        return any(
+            mine and name == named for name, _, _, mine in helpers.workspace_view(summary, subject)
+        )
 
     def check() -> dict[str, Any]:
         subject, grants = authorized()
         return helpers.envelope(
-            machine.state, bound, subject, server=server, request=request_body, grants=grants
+            machine.state,
+            bound,
+            subject,
+            server=server,
+            request=request_body,
+            grants=grants,
+            asked=bool(body.asked),
         )
 
     operation_id = _operation_id(body.refreshToken, body.operationId) if body.operationId else None
@@ -767,6 +818,41 @@ def _own_site(request: Request, token: str, site: str) -> tuple[StateMachine, st
     return machine, subject, record
 
 
+def _my_site(request: Request, token: str, site: str) -> tuple[StateMachine, str, SiteRecord, str]:
+    """The signed-in person and a site they own (`owner`) or that its last
+    report links them to (`linked`, 2b.3b), or 404, one answer for every
+    other case. For the routes that act on a person's own items only."""
+    subject = _app_subject(request, token)
+    machine = _active(request)
+    record = machine.state.sites.get(site)
+    if record is not None and record.owner == subject:
+        return machine, subject, record, "owner"
+    summary = helpers.broker(request).summary(helpers.binding(record)) if record else None
+    if record is None or subject == helpers.OPERATOR or helpers.linked(summary, subject) is None:
+        raise problem(404, "No such job site", "You have no such job site.")
+    return machine, subject, record, "linked"
+
+
+def _keeps_people(request: Request, record: SiteRecord) -> None:
+    """A site older than 2b.3b keeps no one's workspaces but its owner's
+    folders: say so here rather than queue an action it would refuse."""
+    summary = helpers.broker(request).summary(helpers.binding(record)) or {}
+    if not (summary.get("signing") or {}).get("people"):
+        raise problem(
+            503,
+            "The site needs an update",
+            f"{record.label} does not keep each person's workspaces yet. Update Eugene on it "
+            "first.",
+        )
+
+
+def _may_use_job_sites(request: Request, subject: str) -> None:
+    if not permissions.has(request.app.state.machine.state, subject, permissions.USE_JOB_SITES):
+        raise problem(
+            403, "Not allowed to use job sites", permissions.refusal(permissions.USE_JOB_SITES)
+        )
+
+
 def _person_id(state: Any, name: str) -> str:
     by_name = {p["name"].casefold(): p for p in state.people.values()}
     person = by_name.get(name.strip().casefold())
@@ -813,6 +899,112 @@ def _server_view(
     }
 
 
+def _shared_view(state: Any, people: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "person": p["subject"],
+            "name": helpers.person_name(state, p["subject"]),
+            "read": p["read"],
+            "change": p["change"],
+        }
+        for p in people
+    ]
+
+
+def _workspace_view(state: Any, workspace: dict[str, Any], name: str) -> dict[str, Any]:
+    """`JobSiteWorkspace`: by id and name, never path (J76)."""
+    return {
+        "id": workspace["id"],
+        "name": name,
+        "writable": workspace["writable"],
+        "rules": workspace["rules"],
+        "people": _shared_view(state, workspace.get("people") or []),
+    }
+
+
+def _workspace_detail(state: Any, detail: dict[str, Any]) -> dict[str, Any]:
+    """`JobSiteWorkspaceDetail`, read live from the site; kept nowhere here."""
+    return {
+        "id": detail["id"],
+        "name": detail["name"],
+        "path": detail["path"],
+        "writable": detail["writable"],
+        "rules": detail["rules"],
+        "deny": list(detail.get("deny") or []),
+        "people": _shared_view(state, detail.get("people") or []),
+    }
+
+
+def _own_workspaces(state: Any, summary: dict[str, Any], subject: str) -> list[dict[str, Any]]:
+    return [
+        _workspace_view(state, w, name)
+        for name, w, _, mine in helpers.workspace_view(summary, subject)
+        if mine
+    ]
+
+
+def _owner_folder_views(state: Any, summary: dict[str, Any], owner: str) -> list[dict[str, Any]]:
+    """The owner's workspaces as `JobSiteFolder`s, for a Workbench from before
+    2b.3b; from an older site, its folders as it reported them."""
+    if not helpers.has_workspaces(summary):
+        return [_folder_view(state, f) for f in summary.get("folders") or []]
+    return [
+        {
+            "id": w["id"],
+            "name": name,
+            "path": None,
+            "writable": w["writable"],
+            "people": [
+                {
+                    "person": p["subject"],
+                    "name": helpers.person_name(state, p["subject"]),
+                    "writable": p["change"] != "deny",
+                }
+                for p in w.get("people") or []
+            ],
+        }
+        for name, w, _, mine in helpers.workspace_view(summary, owner)
+        if mine
+    ]
+
+
+def _linked_view(request: Request, record: SiteRecord, subject: str) -> dict[str, Any]:
+    """A site a person is linked to and does not own (2b.3b): only their own
+    -- their workspaces, their link, their keys' state."""
+    state = request.app.state.machine.state
+    delivery = helpers.broker(request)
+    bound = helpers.binding(record)
+    status_ = delivery.status(bound)
+    summary = delivery.summary(bound) or {}
+    mine = helpers.linked(summary, subject) or {}
+    signing = summary.get("signing")
+    view: dict[str, Any] = {
+        "id": record.id,
+        "label": record.label,
+        "role": "linked",
+        "workspaces": _own_workspaces(state, summary, subject),
+        "online": bool(status_.get("online")),
+        "ready": bool(status_.get("ready")),
+        "reason": status_.get("reason"),
+        "lastContactAt": _contact(request, record.id),
+        "hostNode": record.hostNode,
+        "folders": [],
+        "servers": [],
+        "links": [mine] if mine else [],
+    }
+    if summary.get("linkPage") is not None:
+        view["linkPage"] = summary["linkPage"]
+    if isinstance(signing, dict):
+        # Their own keys' state, not the owner's (SiteSigning.held is the
+        # owner's count).
+        view["signing"] = {
+            **signing,
+            "state": mine.get("signing") or "unsigned",
+            "held": int(mine.get("held") or 0),
+        }
+    return view
+
+
 def _site_view(request: Request, record: SiteRecord) -> dict[str, Any]:
     state = request.app.state.machine.state
     delivery = helpers.broker(request)
@@ -823,13 +1015,15 @@ def _site_view(request: Request, record: SiteRecord) -> dict[str, Any]:
     return {
         "id": record.id,
         "label": record.label,
+        "role": "owner",
+        "workspaces": _own_workspaces(state, summary, record.owner),
         "online": bool(status_.get("online")),
         "ready": bool(status_.get("ready")),
         "reason": status_.get("reason"),
         "account": status_.get("account"),
         "lastContactAt": _contact(request, record.id),
         "hostNode": record.hostNode,
-        "folders": [_folder_view(state, f) for f in summary.get("folders") or []],
+        "folders": _owner_folder_views(state, summary, record.owner),
         "servers": [
             _server_view(
                 state,
@@ -877,17 +1071,28 @@ async def _manage(
     action: str,
     arguments: dict[str, Any],
     names: dict[str, str] | None = None,
+    *,
+    mine: bool = False,
 ) -> dict[str, Any]:
-    """One management action, relayed to the site, which takes it from the
-    owner it recorded at its join and nobody else (J6b). Its refusal comes
-    back as 422 in the site's own words. A change the site holds for its
-    owner's key raises `HeldAtTheMachine` (J14a). `names` says how this root
-    names the people the arguments name, for the site to show (J54)."""
-    machine, subject, record = _own_site(request, token, site)
+    """One management action, relayed to the site, which decides who may
+    take it (J6b, J67). Its refusal comes back as 422 in the site's own
+    words. A change the site holds for its person's key raises
+    `HeldAtTheMachine` (J14a, J68). `names` says how this root names the
+    people the arguments name, for the site to show (J54). `mine`: an action
+    on the person's own items, open to a linked person (2b.3b); otherwise the
+    site's owner's alone."""
+
+    def who() -> tuple[StateMachine, str, SiteRecord]:
+        if mine:
+            found = _my_site(request, token, site)
+            return found[0], found[1], found[2]
+        return _own_site(request, token, site)
+
+    machine, subject, record = who()
     bound = helpers.binding(record)
 
     def check() -> dict[str, Any]:
-        _own_site(request, token, site)
+        who()
         _same_site(machine, bound)
         return helpers.envelope(
             machine.state,
@@ -918,20 +1123,29 @@ async def _manage(
 async def my_sites(request: Request, body: JobSiteRequest) -> dict[str, Any]:
     subject = _app_subject(request, body.refreshToken)
     state = request.app.state.machine.state
+    delivery = helpers.broker(request)
+    views: list[dict[str, Any]] = []
+    for site in sorted(state.sites):
+        record = state.sites[site]
+        if record.owner == subject:
+            views.append(_site_view(request, record))
+        elif subject != helpers.OPERATOR and helpers.linked(
+            delivery.summary(helpers.binding(record)), subject
+        ):
+            views.append(_linked_view(request, record, subject))
     return {
-        "sites": [
-            _site_view(request, state.sites[site])
-            for site in sorted(state.sites)
-            if state.sites[site].owner == subject
-        ],
+        "sites": views,
         "installMode": helpers.mode_view(state),
-        "canInvite": subject != helpers.OPERATOR and _join_url(request) is not None,
+        "canInvite": subject != helpers.OPERATOR
+        and _join_url(request) is not None
+        and permissions.has(state, subject, permissions.ADD_JOB_SITES),
     }
 
 
 @router.post("/oidc/job-sites/invite")
 async def invite(request: Request, body: JobSiteInviteRequest) -> dict[str, Any]:
-    """J9: any signed-in person may add a Job Site for a machine of their own."""
+    """J9: a signed-in person with `add-job-sites` (J77) may add a Job Site for
+    a machine of their own."""
     subject = _app_subject(request, body.refreshToken)
     machine = _active(request)
     if subject == helpers.OPERATOR:
@@ -941,6 +1155,10 @@ async def invite(request: Request, body: JobSiteInviteRequest) -> dict[str, Any]
             "Eugene's owner signs in with the passphrase, which owns no job sites. Add "
             "yourself as a person on Eugene's People page, sign in to Workbench as them, "
             "and add the machine from there.",
+        )
+    if not permissions.has(machine.state, subject, permissions.ADD_JOB_SITES):
+        raise problem(
+            403, "Not allowed to add job sites", permissions.refusal(permissions.ADD_JOB_SITES)
         )
     join_url = _join_url(request)
     if join_url is None:
@@ -1071,11 +1289,123 @@ async def site_settings(request: Request, site: str, body: JobSiteSettings) -> d
 
 @router.post("/oidc/job-sites/{site}/audit")
 async def site_audit(request: Request, site: str, body: JobSiteAuditRequest) -> dict[str, Any]:
-    """The site's own audit log, read from the machine for its owner alone."""
+    """The site's own audit log, read from the machine: each person the lines
+    that belong to them, the site's owner the rest (J80). A site older than
+    2b.3b answers its owner alone."""
+    _, _, record, role = _my_site(request, body.refreshToken, site)
+    if role == "linked":
+        _keeps_people(request, record)
     value = await _manage(
-        request, body.refreshToken, site, "audit.read", {"limit": body.limit or 50}
+        request, body.refreshToken, site, "audit.read", {"limit": body.limit or 50}, mine=True
     )
     return {"entries": value.get("entries") or []}
+
+
+# --- each person's own workspaces (2b.3b, J67-J70, J76) --------------------------------
+
+WorkspaceId = Annotated[str, Path(pattern=r"^[a-f0-9]{32}$")]
+
+
+def _workspace_site(request: Request, token: str, site: str, *, use: bool = True) -> None:
+    """The person's own site or one they are linked to, one that keeps each
+    person's workspaces, and (`use`) the person may use job sites (J77)."""
+    _, subject, record, _ = _my_site(request, token, site)
+    if use:
+        _may_use_job_sites(request, subject)
+    _keeps_people(request, record)
+
+
+@router.post("/oidc/job-sites/{site}/workspaces", status_code=201)
+async def site_add_workspace(
+    request: Request, site: str, body: JobSiteWorkspaceCreate
+) -> dict[str, Any]:
+    """A workspace of the person's own: their own worker opens it, as their own
+    account. The site holds it for their own key (J68) and keeps its path;
+    this root learns its id and name (J76)."""
+    _workspace_site(request, body.refreshToken, site)
+    name, path = body.name.strip(), body.path.strip()
+    if not name or not path or any(ord(c) < 32 for c in name + path):
+        raise problem(
+            422,
+            "Invalid workspace",
+            "Use a nonempty workspace name and folder path without control characters.",
+        )
+    arguments: dict[str, Any] = {"name": name, "path": path, "writable": body.writable is not False}
+    if body.rules is not None:
+        arguments["rules"] = body.rules.model_dump(mode="json")
+    if body.deny:
+        arguments["deny"] = [pattern.root for pattern in body.deny]
+    detail = await _manage(request, body.refreshToken, site, "workspace.add", arguments, mine=True)
+    return _workspace_detail(request.app.state.machine.state, detail)
+
+
+@router.post("/oidc/job-sites/{site}/workspaces/list")
+async def site_list_workspaces(request: Request, site: str, body: JobSiteRequest) -> dict[str, Any]:
+    """The person's own workspaces with their paths and rules, read live from
+    the site and kept nowhere here (J76)."""
+    _workspace_site(request, body.refreshToken, site)
+    value = await _manage(request, body.refreshToken, site, "workspace.list", {}, mine=True)
+    state = request.app.state.machine.state
+    return {"workspaces": [_workspace_detail(state, d) for d in value.get("workspaces") or []]}
+
+
+@router.post("/oidc/job-sites/{site}/workspaces/{workspace_id}/remove", status_code=204)
+async def site_remove_workspace(
+    request: Request, site: str, workspace_id: WorkspaceId, body: JobSiteRequest
+) -> None:
+    """Only takes access away (J51), so it needs no `use-job-sites`: a person
+    whose permission was taken away may still clear what they had."""
+    _workspace_site(request, body.refreshToken, site, use=False)
+    await _manage(
+        request, body.refreshToken, site, "workspace.remove", {"id": workspace_id}, mine=True
+    )
+
+
+@router.post("/oidc/job-sites/{site}/workspaces/{workspace_id}/rules")
+async def site_workspace_rules(
+    request: Request, site: str, workspace_id: WorkspaceId, body: JobSiteRulesRequest
+) -> dict[str, Any]:
+    """The person's own rules in one of their workspaces (J70). Looser is held
+    for their own key; tighter applies at once (J51)."""
+    _workspace_site(request, body.refreshToken, site)
+    detail = await _manage(
+        request,
+        body.refreshToken,
+        site,
+        "rules.set",
+        {
+            "id": workspace_id,
+            "rules": body.rules.model_dump(mode="json"),
+            "deny": [pattern.root for pattern in body.deny],
+        },
+        mine=True,
+    )
+    return _workspace_detail(request.app.state.machine.state, detail)
+
+
+@router.post("/oidc/job-sites/{site}/workspaces/{workspace_id}/people")
+async def site_share_workspace(
+    request: Request, site: str, workspace_id: WorkspaceId, body: JobSiteWorkspacePeopleRequest
+) -> dict[str, Any]:
+    """The site's owner shares one of their own workspaces (J69), naming
+    people by how they sign in, each with their rules there (J70)."""
+    _, _, record = _own_site(request, body.refreshToken, site)
+    _keeps_people(request, record)
+    state = request.app.state.machine.state
+    named = {entry.name: _person_id(state, entry.name) for entry in body.people}
+    people = [
+        {"subject": named[entry.name], "read": entry.read.value, "change": entry.change.value}
+        for entry in body.people
+    ]
+    detail = await _manage(
+        request,
+        body.refreshToken,
+        site,
+        "workspace.people",
+        {"id": workspace_id, "people": people},
+        _names(state, named.values()),
+    )
+    return _workspace_detail(request.app.state.machine.state, detail)
 
 
 # --- passkeys from Workbench (J14a.3) ----------------------------------------------------
@@ -1085,9 +1415,12 @@ PasskeyId = Annotated[str, Path(pattern=r"^[a-f0-9]{32}$")]
 
 
 def _takes_passkeys(request: Request, token: str, site: str) -> None:
-    """A site older than J14a.3 does not know these actions: say so here
-    rather than queue one it would refuse as unreadable."""
-    _, _, record = _own_site(request, token, site)
+    """A site older than J14a.3 does not know these actions, and one older
+    than 2b.3b takes them from its owner alone: say so here rather than queue
+    one it would refuse."""
+    _, _, record, role = _my_site(request, token, site)
+    if role == "linked":
+        _keeps_people(request, record)
     summary = helpers.broker(request).summary(helpers.binding(record)) or {}
     if not (summary.get("signing") or {}).get("passkeys"):
         raise problem(
@@ -1111,6 +1444,7 @@ async def site_pair_passkey(
         site,
         "passkey.pair",
         body.model_dump(mode="json", exclude={"refreshToken"}),
+        mine=True,
     )
 
 
@@ -1121,7 +1455,7 @@ async def site_remove_passkey(
     """A lost phone (J60): removing a passkey only takes a key away, so the
     owner may do it from Workbench. What it approved stays."""
     _takes_passkeys(request, body.refreshToken, site)
-    await _manage(request, body.refreshToken, site, "passkey.remove", {"id": ident})
+    await _manage(request, body.refreshToken, site, "passkey.remove", {"id": ident}, mine=True)
 
 
 @router.post("/oidc/job-sites/{site}/held")
@@ -1130,7 +1464,12 @@ async def site_held(request: Request, site: str, body: JobSiteHeldListRequest) -
     envelopes to sign when `key` is one of their passkeys."""
     _takes_passkeys(request, body.refreshToken, site)
     return await _manage(
-        request, body.refreshToken, site, "held.list", {"key": body.key} if body.key else {}
+        request,
+        body.refreshToken,
+        site,
+        "held.list",
+        {"key": body.key} if body.key else {},
+        mine=True,
     )
 
 
@@ -1142,9 +1481,11 @@ async def site_approve_held(
     assertion against the passkey it pinned, then applies the change."""
     _takes_passkeys(request, body.refreshToken, site)
     arguments = {"id": ident, **body.model_dump(mode="json", exclude={"refreshToken"})}
-    await _manage(request, body.refreshToken, site, "held.approve", arguments)
-    _, _, record = _own_site(request, body.refreshToken, site)
-    return _site_view(request, record)
+    await _manage(request, body.refreshToken, site, "held.approve", arguments, mine=True)
+    _, subject, record, role = _my_site(request, body.refreshToken, site)
+    return (
+        _site_view(request, record) if role == "owner" else _linked_view(request, record, subject)
+    )
 
 
 @router.post("/oidc/job-sites/{site}/held/{ident}/reject", status_code=204)
@@ -1153,7 +1494,7 @@ async def site_reject_held(
 ) -> None:
     """Turning a held change down only keeps access from being given."""
     _takes_passkeys(request, body.refreshToken, site)
-    await _manage(request, body.refreshToken, site, "held.reject", {"id": ident})
+    await _manage(request, body.refreshToken, site, "held.reject", {"id": ident}, mine=True)
 
 
 @router.post("/oidc/job-sites/{site}/leave", status_code=204)

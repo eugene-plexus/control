@@ -80,6 +80,58 @@ def person_name(state: Any, person: str) -> str:
     return str(state.people.get(person, {}).get("name") or "someone who has left")
 
 
+def unique_names(names: list[str]) -> list[str]:
+    """Each name as a site's `folder` argument takes it: a name already
+    taken, ignoring case, by one before it reads `Name (2)`, `Name (3)`...
+    The site names a person's view the same way (`SiteWorkspace.name`)."""
+    taken: set[str] = set()
+    out: list[str] = []
+    for name in names:
+        candidate, n = name, 1
+        while candidate.casefold() in taken:
+            n += 1
+            candidate = f"{name} ({n})"
+        taken.add(candidate.casefold())
+        out.append(candidate)
+    return out
+
+
+def has_workspaces(summary: dict[str, Any] | None) -> bool:
+    """A site since 2b.3b reports workspaces, by id and name, never path
+    (J76); an older one reports folders, with their paths."""
+    return summary is not None and isinstance(summary.get("workspaces"), list)
+
+
+def workspace_view(
+    summary: dict[str, Any] | None, subject: str
+) -> list[tuple[str, dict[str, Any], dict[str, str], bool]]:
+    """Every workspace in `subject`'s view of a site, in its order: their own,
+    then those the site's owner shared with them. Each with its name there,
+    their rules in it, and whether it is their own."""
+    workspaces = (summary or {}).get("workspaces") or []
+    owner = (summary or {}).get("owner")
+    rows: list[tuple[dict[str, Any], dict[str, str], bool]] = [
+        (w, w["rules"], True) for w in workspaces if w["holder"] == subject
+    ]
+    for workspace in workspaces:
+        if workspace["holder"] != owner or workspace["holder"] == subject:
+            continue
+        for person in workspace.get("people") or []:
+            if person["subject"] == subject:
+                rows.append(
+                    (workspace, {"read": person["read"], "change": person["change"]}, False)
+                )
+    names = unique_names([w["name"] for w, _, _ in rows])
+    return [(name, w, rules, mine) for name, (w, rules, mine) in zip(names, rows, strict=True)]
+
+
+def linked(summary: dict[str, Any] | None, subject: str) -> dict[str, Any] | None:
+    """`subject`'s link on a site's machine, as it last reported."""
+    return next(
+        (e for e in (summary or {}).get("links") or [] if e.get("subject") == subject), None
+    )
+
+
 def dev_grants(
     state: Any, record: SiteRecord, summary: dict[str, Any] | None
 ) -> list[dict[str, Any]]:
@@ -87,11 +139,26 @@ def dev_grants(
     reported its folders, and **only while the install is in dev mode**
     (J13b): switching to production ends them at once, because this is
     checked at every use. The site honours them only if its owner let
-    Eugene's owner in there (J6e), which it checks itself."""
+    Eugene's owner in there (J6e), which it checks itself. Since 2b.3b a
+    grant names one of the site owner's workspaces by id alone (J76)."""
     if install_mode(state) != DEV or summary is None:
         return []
-    folders = {f["id"]: f for f in summary.get("folders") or []}
     out: list[dict[str, Any]] = []
+    if has_workspaces(summary):
+        owners = {w["id"]: (name, w) for name, w, _, _ in workspace_view(summary, record.owner)}
+        for grant in record.devGrants:
+            found = owners.get(grant["folderId"])
+            if found is not None:
+                name, workspace = found
+                out.append(
+                    {
+                        "folderId": workspace["id"],
+                        "name": name,
+                        "writable": bool(grant["writable"] and workspace["writable"]),
+                    }
+                )
+        return out
+    folders = {f["id"]: f for f in summary.get("folders") or []}
     for grant in record.devGrants:
         folder = folders.get(grant["folderId"])
         if folder is not None:
@@ -107,10 +174,27 @@ def dev_grants(
     return out
 
 
-def site_folders_for(summary: dict[str, Any] | None, subject: str) -> list[dict[str, Any]]:
-    """The folders on a site's own list for `subject`, as it last reported
-    them. A cache: the site checks every call against its own copy again
-    (rule 2 of remote-nodes.md §3.3)."""
+def site_folders_for(
+    summary: dict[str, Any] | None, subject: str, *, own: bool = True
+) -> list[dict[str, Any]]:
+    """The workspaces (before 2b.3b, folders) on a site `subject` may use, as
+    it last reported them, named as the site names their view. A cache: the
+    site checks every call against its own copy again (rule 2 of
+    remote-nodes.md §3.3). `own` False leaves out their own workspaces, for a
+    person without `use-job-sites` (J77); so does no link, since only their
+    own worker opens them."""
+    if has_workspaces(summary):
+        mine_ok = own and linked(summary, subject) is not None
+        return [
+            {
+                "id": w["id"],
+                "name": name,
+                "writable": rules["change"] != "deny",
+                "mine": mine,
+            }
+            for name, w, rules, mine in workspace_view(summary, subject)
+            if (mine_ok or not mine) and not (rules["read"] == rules["change"] == "deny")
+        ]
     out = []
     for folder in (summary or {}).get("folders") or []:
         person = next((p for p in folder.get("people") or [] if p["subject"] == subject), None)
@@ -167,6 +251,7 @@ def may_use_site(summary: dict[str, Any] | None, subject: str) -> bool:
     last reported: the test for being told a site exists at all."""
     held = (
         bool(site_folders_for(summary, subject))
+        or bool(workspace_view(summary, subject))
         or any(entry.get("subject") == subject for entry in (summary or {}).get("access") or [])
         or any(entry.get("subject") == subject for entry in (summary or {}).get("links") or [])
     )

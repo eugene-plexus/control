@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 
-from .. import oidc, security
+from .. import oidc, permissions, security
 from .._generated.models import (
     OidcClient,
     OidcClientCreated,
@@ -67,8 +67,15 @@ def _active(request: Request) -> StateMachine:
     return machine
 
 
-def _view(record: dict[str, Any]) -> Person:
-    return Person.model_validate({k: v for k, v in record.items() if k != "passwordVerifier"})
+def _view(machine: StateMachine, record: dict[str, Any]) -> Person:
+    """A person, with what applies to them now (settings never lie): their
+    own permissions, or the install's defaults when they have none (J77)."""
+    return Person.model_validate(
+        {
+            **{k: v for k, v in record.items() if k != "passwordVerifier"},
+            "permissionsInEffect": permissions.in_effect(machine.state, record),
+        }
+    )
 
 
 def _person(machine: StateMachine, person_id: str) -> dict[str, Any]:
@@ -123,11 +130,20 @@ def _check_apps(machine: StateMachine, apps: list[str] | None) -> list[str] | No
     return list(dict.fromkeys(apps))
 
 
+def _permissions(chosen: list[Any] | None) -> list[str] | None:
+    """Exactly these permissions, once each, in the contract's order; None
+    for the install's defaults (J77)."""
+    if chosen is None:
+        return None
+    named = {str(getattr(p, "value", p)) for p in chosen}
+    return [p for p in permissions.DEFAULTS if p in named]
+
+
 @router.get("/v1/people", response_model=PersonList, response_model_exclude_none=True)
 async def list_people(request: Request) -> PersonList:
     machine = _active(request)
     people = sorted(machine.state.people.values(), key=lambda p: p["name"].casefold())
-    return PersonList(people=[_view(p) for p in people], operatorName=OPERATOR_NAME)
+    return PersonList(people=[_view(machine, p) for p in people], operatorName=OPERATOR_NAME)
 
 
 @router.post("/v1/people", response_model=Person, status_code=201, response_model_exclude_none=True)
@@ -146,11 +162,16 @@ async def create_person(request: Request, body: PersonCreateRequest) -> Person:
     }
     if body.displayName and body.displayName.strip():
         record["displayName"] = body.displayName.strip()
+    chosen = _permissions(body.permissions)
+    if chosen is not None:
+        # Kept only when set: a person on the defaults carries no key, so a
+        # standby older than J77 applies their entry as it always did.
+        record["permissions"] = chosen
     email = _check_email(machine, body.email)
     if email:
         record["email"] = email
     machine.append(OP_PUT_PERSON, {"person": record})
-    return _view(machine.state.people[record["id"]])
+    return _view(machine, machine.state.people[record["id"]])
 
 
 @router.patch("/v1/people/{person_id}", response_model=Person, response_model_exclude_none=True)
@@ -172,10 +193,16 @@ async def update_person(request: Request, person_id: str, body: PersonUpdateRequ
             record.pop("email", None)
     if "apps" in changes:
         record["apps"] = _check_apps(machine, changes["apps"])
+    if "permissions" in changes:
+        chosen = _permissions(body.permissions)
+        if chosen is None:
+            record.pop("permissions", None)
+        else:
+            record["permissions"] = chosen
     if "disabled" in changes and changes["disabled"] is not None:
         record["disabled"] = bool(changes["disabled"])
     machine.append(OP_PUT_PERSON, {"person": record})
-    return _view(machine.state.people[person_id])
+    return _view(machine, machine.state.people[person_id])
 
 
 @router.delete("/v1/people/{person_id}", status_code=204)
