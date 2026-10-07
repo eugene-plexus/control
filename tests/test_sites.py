@@ -1034,3 +1034,210 @@ def test_a_change_the_site_holds_is_202_not_a_refusal_and_names_its_people(
     listed = c.post("/oidc/job-sites", auth=auth(a.app), json={"refreshToken": a.token})
     (site,) = listed.json()["sites"]
     assert site["signing"] == {"state": "signed", "held": 1, "approvePage": page}
+
+
+# --------------------------------------------------------------------------- passkeys (J14a.3)
+
+
+def _passkey_site(c: TestClient) -> Ada:
+    a = ada_with_a_folder(c)
+    a.held.summary["signing"] = {"state": "unconfirmed", "held": 0, "passkeys": True}
+    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+    return a
+
+
+PAIRING = {
+    "credentialId": "Y3JlZA",
+    "publicKey": "cHVibGlj",
+    "alg": -7,
+    "rpId": "workbench.example",
+    "label": "Chrome on laptop",
+    "mac": "m" * 43,
+}
+
+
+def test_a_passkey_is_carried_to_the_site_and_the_code_never_is(root: TestClient) -> None:
+    """The root carries the public half and the MAC, exactly as sent; it
+    has no field for the code and refuses a body that carries one."""
+    c = root
+    a = _passkey_site(c)
+    pinned = {"id": "a" * 32, **{k: PAIRING[k] for k in ("credentialId", "alg", "rpId", "label")}}
+    command, paired = manage_through(
+        c,
+        a.keys,
+        a.site,
+        a.held,
+        lambda: c.post(
+            f"/oidc/job-sites/{a.site}/passkeys",
+            auth=auth(a.app),
+            json={"refreshToken": a.token, **PAIRING},
+        ),
+        lambda _: {"status": "done", "result": {**pinned, "addedAt": "2026-10-07T12:00:00Z"}},
+        action="passkey.pair",
+    )
+    assert command["subject"] == a.person["id"]
+    assert command["arguments"] == PAIRING
+    assert paired.status_code == 201, paired.text
+    assert paired.json()["id"] == "a" * 32
+    smuggled = c.post(
+        f"/oidc/job-sites/{a.site}/passkeys",
+        auth=auth(a.app),
+        json={"refreshToken": a.token, **PAIRING, "code": "ABCDE-FGHJK"},
+    )
+    assert smuggled.status_code == 422
+
+
+def test_held_changes_are_listed_and_approved_through_the_root(root: TestClient) -> None:
+    c = root
+    a = _passkey_site(c)
+    listing = {
+        "subject": a.person["id"],
+        "keys": ["b" * 32],
+        "passkeys": [],
+        "items": [{"id": "rules", "action": "rules.confirm", "words": ["x"], "heldAt": None}],
+    }
+    command, listed = manage_through(
+        c,
+        a.keys,
+        a.site,
+        a.held,
+        lambda: c.post(
+            f"/oidc/job-sites/{a.site}/held",
+            auth=auth(a.app),
+            json={"refreshToken": a.token, "key": "b" * 32},
+        ),
+        lambda _: {"status": "done", "result": listing},
+        action="held.list",
+    )
+    assert command["arguments"] == {"key": "b" * 32}
+    assert listed.status_code == 200 and listed.json() == listing
+    approval = {
+        "envelope": "{}x",
+        "key": "b" * 32,
+        "credentialId": "Y3JlZA",
+        "authenticatorData": "YXV0aA",
+        "clientDataJSON": "Y2xpZW50",
+        "signature": "c2ln",
+    }
+    command, approved = manage_through(
+        c,
+        a.keys,
+        a.site,
+        a.held,
+        lambda: c.post(
+            f"/oidc/job-sites/{a.site}/held/abc123/approve",
+            auth=auth(a.app),
+            json={"refreshToken": a.token, **approval},
+        ),
+        lambda _: {"status": "done", "result": {}},
+        action="held.approve",
+    )
+    # The change named in the address, not `rules`, which a test approving
+    # only the rules could not tell apart.
+    assert command["arguments"] == {"id": "abc123", **approval}
+    assert approved.status_code == 200 and approved.json()["id"] == a.site
+    # The site's refusal comes back in its words.
+    _, refused = manage_through(
+        c,
+        a.keys,
+        a.site,
+        a.held,
+        lambda: c.post(
+            f"/oidc/job-sites/{a.site}/held/rules/approve",
+            auth=auth(a.app),
+            json={"refreshToken": a.token, **approval},
+        ),
+        lambda _: {"status": "failed", "message": "The passkey signed something else."},
+        action="held.approve",
+    )
+    assert refused.status_code == 422 and "signed something else" in refused.text
+    command, rejected = manage_through(
+        c,
+        a.keys,
+        a.site,
+        a.held,
+        lambda: c.post(
+            f"/oidc/job-sites/{a.site}/held/abc123/reject",
+            auth=auth(a.app),
+            json={"refreshToken": a.token},
+        ),
+        lambda _: {"status": "done", "result": {}},
+        action="held.reject",
+    )
+    assert command["arguments"] == {"id": "abc123"} and rejected.status_code == 204
+    command, removed = manage_through(
+        c,
+        a.keys,
+        a.site,
+        a.held,
+        lambda: c.post(
+            f"/oidc/job-sites/{a.site}/passkeys/{'b' * 32}/remove",
+            auth=auth(a.app),
+            json={"refreshToken": a.token},
+        ),
+        lambda _: {"status": "done", "result": {}},
+        action="passkey.remove",
+    )
+    assert command["arguments"] == {"id": "b" * 32} and removed.status_code == 204
+    _, gone = manage_through(
+        c,
+        a.keys,
+        a.site,
+        a.held,
+        lambda: c.post(
+            f"/oidc/job-sites/{a.site}/passkeys/{'b' * 32}/remove",
+            auth=auth(a.app),
+            json={"refreshToken": a.token},
+        ),
+        lambda _: {"status": "failed", "message": "That passkey is not paired with this machine."},
+        action="passkey.remove",
+    )
+    assert gone.status_code == 422 and "not paired" in gone.text
+    not_a_key = c.post(
+        f"/oidc/job-sites/{a.site}/passkeys/abc123/remove",
+        auth=auth(a.app),
+        json={"refreshToken": a.token},
+    )
+    assert not_a_key.status_code == 422
+    bad = c.post(
+        f"/oidc/job-sites/{a.site}/held/NOT_AN_ID/reject",
+        auth=auth(a.app),
+        json={"refreshToken": a.token},
+    )
+    assert bad.status_code == 422
+
+
+def test_a_site_that_does_not_take_passkeys_is_told_to_update(root: TestClient) -> None:
+    """A site older than J14a.3 would refuse the action as unreadable;
+    the root says what to do instead, and queues nothing."""
+    c = root
+    a = ada_with_a_folder(c)
+    for path, body in (
+        ("passkeys", PAIRING),
+        ("held", {}),
+        ("held/abc/reject", {}),
+        (f"passkeys/{'b' * 32}/remove", {}),
+    ):
+        answer_ = c.post(
+            f"/oidc/job-sites/{a.site}/{path}",
+            auth=auth(a.app),
+            json={"refreshToken": a.token, **body},
+        )
+        assert answer_.status_code == 503, (path, answer_.text)
+        assert "does not take passkeys yet" in answer_.text
+    polled = c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+    assert polled.json() == {"operation": None}
+
+
+def test_only_the_sites_owner_reaches_its_passkeys(root: TestClient) -> None:
+    c = root
+    a = _passkey_site(c)
+    _, bo_token = add_person(c, a.app, "bo")
+    for path in ("passkeys", "held", f"passkeys/{'b' * 32}/remove"):
+        body = PAIRING if path == "passkeys" else {}
+        refused = c.post(
+            f"/oidc/job-sites/{a.site}/{path}",
+            auth=auth(a.app),
+            json={"refreshToken": bo_token, **body},
+        )
+        assert refused.status_code == 404, refused.text

@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import httpx
 import jwt
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, Path, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
 
@@ -40,7 +40,10 @@ from .._generated.models import (
     JobSiteAccessRequest,
     JobSiteAuditRequest,
     JobSiteFolderCreate,
+    JobSiteHeldListRequest,
     JobSiteInviteRequest,
+    JobSitePasskeyApproval,
+    JobSitePasskeyPair,
     JobSitePeopleRequest,
     JobSiteRequest,
     JobSiteServerEnable,
@@ -1073,6 +1076,84 @@ async def site_audit(request: Request, site: str, body: JobSiteAuditRequest) -> 
         request, body.refreshToken, site, "audit.read", {"limit": body.limit or 50}
     )
     return {"entries": value.get("entries") or []}
+
+
+# --- passkeys from Workbench (J14a.3) ----------------------------------------------------
+
+HeldId = Annotated[str, Path(pattern=r"^[a-z0-9]{1,32}$")]
+PasskeyId = Annotated[str, Path(pattern=r"^[a-f0-9]{32}$")]
+
+
+def _takes_passkeys(request: Request, token: str, site: str) -> None:
+    """A site older than J14a.3 does not know these actions: say so here
+    rather than queue one it would refuse as unreadable."""
+    _, _, record = _own_site(request, token, site)
+    summary = helpers.broker(request).summary(helpers.binding(record)) or {}
+    if not (summary.get("signing") or {}).get("passkeys"):
+        raise problem(
+            503,
+            "The site needs an update",
+            f"{record.label} does not take passkeys yet. Update Eugene on it first.",
+        )
+
+
+@router.post("/oidc/job-sites/{site}/passkeys", status_code=201)
+async def site_pair_passkey(
+    request: Request, site: str, body: JobSitePasskeyPair
+) -> dict[str, Any]:
+    """Carry a passkey Workbench made, and the MAC over it, to the site,
+    which pins it only if the MAC checks with the code it showed at the
+    machine. The code itself never reaches this root."""
+    _takes_passkeys(request, body.refreshToken, site)
+    return await _manage(
+        request,
+        body.refreshToken,
+        site,
+        "passkey.pair",
+        body.model_dump(mode="json", exclude={"refreshToken"}),
+    )
+
+
+@router.post("/oidc/job-sites/{site}/passkeys/{ident}/remove", status_code=204)
+async def site_remove_passkey(
+    request: Request, site: str, ident: PasskeyId, body: JobSiteRequest
+) -> None:
+    """A lost phone (J60): removing a passkey only takes a key away, so the
+    owner may do it from Workbench. What it approved stays."""
+    _takes_passkeys(request, body.refreshToken, site)
+    await _manage(request, body.refreshToken, site, "passkey.remove", {"id": ident})
+
+
+@router.post("/oidc/job-sites/{site}/held")
+async def site_held(request: Request, site: str, body: JobSiteHeldListRequest) -> dict[str, Any]:
+    """What the site holds for its owner, in the site's own words, with the
+    envelopes to sign when `key` is one of their passkeys."""
+    _takes_passkeys(request, body.refreshToken, site)
+    return await _manage(
+        request, body.refreshToken, site, "held.list", {"key": body.key} if body.key else {}
+    )
+
+
+@router.post("/oidc/job-sites/{site}/held/{ident}/approve")
+async def site_approve_held(
+    request: Request, site: str, ident: HeldId, body: JobSitePasskeyApproval
+) -> dict[str, Any]:
+    """A held change approved with the owner's passkey; the site checks the
+    assertion against the passkey it pinned, then applies the change."""
+    _takes_passkeys(request, body.refreshToken, site)
+    arguments = {"id": ident, **body.model_dump(mode="json", exclude={"refreshToken"})}
+    await _manage(request, body.refreshToken, site, "held.approve", arguments)
+    _, _, record = _own_site(request, body.refreshToken, site)
+    return _site_view(request, record)
+
+
+@router.post("/oidc/job-sites/{site}/held/{ident}/reject", status_code=204)
+async def site_reject_held(
+    request: Request, site: str, ident: HeldId, body: JobSiteRequest
+) -> None:
+    """Turning a held change down only keeps access from being given."""
+    _takes_passkeys(request, body.refreshToken, site)
+    await _manage(request, body.refreshToken, site, "held.reject", {"id": ident})
 
 
 @router.post("/oidc/job-sites/{site}/leave", status_code=204)

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from typing import Any, Literal
 
 from pydantic import (
@@ -626,6 +626,43 @@ class SiteAuditDecision(StrEnum):
 class SiteAuditKind(StrEnum):
     mcp = 'mcp'
     manage = 'manage'
+
+
+class SitePasskeyAlgorithm(IntEnum):
+    """
+    A passkey's COSE algorithm: -8 EdDSA, -7 ES256, -257 RS256.
+    """
+
+    integer__8 = -8
+    integer__7 = -7
+    integer__257 = -257
+
+
+class JobSiteHeldListRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    key: str | None = Field(None, pattern='^[a-f0-9]{32}$')
+
+
+class JobSitePasskeyApproval(BaseModel):
+    """
+    A held change approved with a passkey (`SitePasskeyApproval`, site-host.yaml).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    envelope: str = Field(..., max_length=262144, min_length=2)
+    key: str = Field(..., pattern='^[a-f0-9]{32}$')
+    credentialId: str = Field(
+        ..., max_length=1366, min_length=1, pattern='^[A-Za-z0-9_-]+$'
+    )
+    authenticatorData: str = Field(..., max_length=4096, min_length=1)
+    clientDataJSON: str = Field(..., max_length=8192, min_length=1)
+    signature: str = Field(..., max_length=1024, min_length=1)
 
 
 class SignedRootTls(BaseModel):
@@ -2691,8 +2728,12 @@ class SiteSigning(BaseModel):
     )
     approvePage: str | None = Field(
         None,
-        description='Where a person adds a key and approves held changes, on the machine\nitself. Null where this install has no such page yet (J14a.2, J14a.3).\n',
+        description='Where a person adds a key and approves held changes, on the machine\nitself: a Windows service install, and a per-user install on Windows,\nLinux or macOS (J14a.2). Null where this install has no such page (a\nLinux system install, whose owner pairs a passkey instead, J14a.3).\n',
         max_length=256,
+    )
+    passkeys: bool | None = Field(
+        None,
+        description="The site takes its owner's passkey from Workbench, paired with a code\nshown at the machine, and approvals made with it (J14a.3). Absent\nfrom a site older than that.\n",
     )
 
 
@@ -2908,6 +2949,25 @@ class SiteAuditEntry(BaseModel):
     decision: SiteAuditDecision
     outcome: SiteAnswerStatus | None = None
     reason: str | None = Field(None, max_length=1024)
+
+
+class JobSitePasskeyPair(BaseModel):
+    """
+    A passkey Workbench made, with the MAC keyed by the code shown at the machine (`SitePasskeyPair`, site-host.yaml).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    refreshToken: str = Field(..., max_length=16384, min_length=1)
+    credentialId: str = Field(
+        ..., max_length=1366, min_length=1, pattern='^[A-Za-z0-9_-]+$'
+    )
+    publicKey: str = Field(..., max_length=1100, min_length=1)
+    alg: SitePasskeyAlgorithm
+    rpId: str = Field(..., max_length=253, min_length=1)
+    label: str | None = Field(None, max_length=128)
+    mac: str = Field(..., pattern='^[A-Za-z0-9_-]{43}$')
 
 
 class RootTls(BaseModel):
