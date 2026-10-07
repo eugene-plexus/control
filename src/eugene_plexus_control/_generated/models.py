@@ -66,6 +66,12 @@ class SitePersonLink(BaseModel):
         description='Why not, when it is not, e.g. that they are not signed in on a Windows machine (J25).',
         max_length=1024,
     )
+    keys: int | None = Field(
+        None,
+        description='How many keys this person has pinned at the machine (J14a). Absent from a site older than J14a.',
+        ge=0,
+        le=8,
+    )
 
 
 class SiteId(RootModel[str]):
@@ -152,7 +158,9 @@ class SiteEnrollment(BaseModel):
     owner: str = Field(
         ..., description="The owner's person id.", max_length=64, min_length=1
     )
-    ownerName: str = Field(..., description='How the owner signs in', max_length=256)
+    ownerName: str = Field(
+        ..., description='How the owner signs in, for display.', max_length=256
+    )
     controlPublicKey: str = Field(
         ...,
         description="Base64 of the root's raw Ed25519 identity key. A site that pinned a key at its join (J7a) checks it is this one.",
@@ -200,6 +208,21 @@ class SiteServerKind(StrEnum):
 
     files = 'files'
     local = 'local'
+
+
+class SiteSigningState(StrEnum):
+    """
+    `unsigned`: the site's owner has no key pinned at the machine. Its rules
+    are trusted to the root, and no tool runs there as anyone (J48).
+    `unconfirmed`: the owner has a key, but has not approved the site's
+    current rules with it (J52); no tool runs. `signed`: every rule the site
+    holds was approved with its owner's key, at the machine; tools run.
+
+    """
+
+    unsigned = 'unsigned'
+    unconfirmed = 'unconfirmed'
+    signed = 'signed'
 
 
 class SiteTool(BaseModel):
@@ -311,13 +334,16 @@ class SiteAnswerStatus(StrEnum):
     `done`, inside `response`). `failed`: the site refused or could not run
     it, and `message` says why in the site's words; nothing ran. `uncertain`:
     a tool call started and its end could not be established; it may have
-    acted.
+    acted. `held` (J14a, J50): a change that gives access, from a person who
+    has a key pinned at the machine; the site keeps it until they approve it
+    there with that key, and `message` says where. Nothing changed yet.
 
     """
 
     done = 'done'
     failed = 'failed'
     uncertain = 'uncertain'
+    held = 'held'
 
 
 class SiteDevGrant(BaseModel):
@@ -408,10 +434,12 @@ class SiteInvitation(BaseModel):
     )
     label: str | None = None
     joinUrl: str | None = Field(
-        None, description='The address the machine joins through'
+        None,
+        description='The address the machine joins through, when this root knows one.',
     )
     rootKey: str = Field(
-        ..., description="Base64 of the root's raw Ed25519 identity key"
+        ...,
+        description="Base64 of the root's raw Ed25519 identity key, which the site pins (J7a).",
     )
 
 
@@ -490,6 +518,21 @@ class JobSiteServerPerson(BaseModel):
     person: str
     name: str = Field(..., description='How the person signs in.')
     tools: list[SiteToolGrant]
+
+
+class JobSiteHeld(BaseModel):
+    """
+    A change the site holds until its owner approves it at the machine with
+    their key (J14a, J50). Nothing changed yet; `message` says where to
+    approve it, in the site's words.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    held: Literal[True]
+    message: str = Field(..., max_length=1024)
 
 
 class JobSiteInviteRequest(BaseModel):
@@ -2631,6 +2674,28 @@ class SiteServer(BaseModel):
     tools: list[SiteTool] = Field(..., max_length=64)
 
 
+class SiteSigning(BaseModel):
+    """
+    Whether the site checks its owner's changes with the owner's own key (J14a).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    state: SiteSigningState
+    held: int = Field(
+        ...,
+        description='Changes the site holds until their person approves them at the machine (J50).',
+        ge=0,
+        le=64,
+    )
+    approvePage: str | None = Field(
+        None,
+        description='Where a person adds a key and approves held changes, on the machine\nitself. Null where this install has no such page yet (J14a.2, J14a.3).\n',
+        max_length=256,
+    )
+
+
 class McpRequest(BaseModel):
     """
     One MCP request of the 2026-07-28 revision: `server/discover`,
@@ -3190,6 +3255,7 @@ class SiteSummary(BaseModel):
         None,
         description='Whether this site can serve anyone but its owner. False on macOS,\nwhich has no folder boundary yet (§2.6). Absent means true.\n',
     )
+    signing: SiteSigning | None = None
 
 
 class SiteOperation(BaseModel):
@@ -3232,6 +3298,10 @@ class SiteOperation(BaseModel):
     action: str | None = Field(None, description='For `manage`, the action.')
     arguments: dict[str, Any] | None = Field(
         None, description='For `manage`, its arguments.'
+    )
+    names: dict[str, Any] | None = Field(
+        None,
+        description="For `manage`, how the root names each person the arguments name, by\nid. Display only: a site shows them on a held change marked as the\nroot's names (J54), and decides nothing by them.\n",
     )
     installMode: InstallModeName
 
@@ -3334,7 +3404,9 @@ class JobSite(BaseModel):
         description='Whether the site can serve anyone but its owner (false on macOS). Absent means true.',
     )
     lastContactAt: AwareDatetime | None = None
-    hostNode: str | None = Field(None, description='The node that hosts it (J32)')
+    hostNode: str | None = Field(
+        None, description='The node that hosts it (J32), for display.'
+    )
     folders: list[JobSiteFolder] = Field(
         ...,
         description='The folders registered on it, which its one file server offers by name (J6g), and who may use each.',
@@ -3345,6 +3417,10 @@ class JobSite(BaseModel):
     ownerInDevMode: bool | None = Field(
         None,
         description="Whether the site lets Eugene's owner in while Eugene is in dev mode (J6e). Null until the site has reported.",
+    )
+    signing: SiteSigning | None = Field(
+        None,
+        description="Whether the site checks its owner's changes with the owner's own key (J14a). Absent from a site older than J14a.",
     )
 
 

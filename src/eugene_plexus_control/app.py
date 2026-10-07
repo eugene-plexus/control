@@ -426,5 +426,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from .routes import sites as site_routes
 
     app.include_router(site_routes.router)
+    app.add_exception_handler(site_routes.HeldAtTheMachine, site_routes.held_response)
 
     return app

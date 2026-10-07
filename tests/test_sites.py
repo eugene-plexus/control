@@ -996,3 +996,41 @@ def test_deleting_the_owner_ends_a_call_queued_for_their_site(root: TestClient) 
         assert c.delete(f"/v1/people/{a.person['id']}").status_code == 204
         ended = pending.result(timeout=10)
     assert ended.status_code == 503 and time.perf_counter() - started < 10
+
+
+def test_a_change_the_site_holds_is_202_not_a_refusal_and_names_its_people(
+    root: TestClient,
+) -> None:
+    """J14a: a site whose owner has a key holds a change that gives access
+    until they approve it at the machine (J50). Workbench is told so, with
+    the site's words, and the site is sent how this root names each person,
+    for display only (J54)."""
+    c = root
+    a = ada_with_a_folder(c)
+    bo, _ = add_person(c, a.app, "bo")
+    words = "Waiting for your approval on desk, at http://127.0.0.1:8079/link/approve."
+    command, held = manage_through(
+        c,
+        a.keys,
+        a.site,
+        a.held,
+        lambda: c.post(
+            f"/oidc/job-sites/{a.site}/folders/{a.folder['id']}/people",
+            auth=auth(a.app),
+            json={"refreshToken": a.token, "people": [{"name": "bo", "writable": False}]},
+        ),
+        lambda _: {"status": "held", "message": words},
+        action="folder.people",
+    )
+    assert command["names"] == {bo["id"]: "bo"}
+    assert command["arguments"]["people"] == [{"subject": bo["id"], "writable": False}]
+    assert held.status_code == 202, held.text
+    assert held.json() == {"held": True, "message": words}
+    assert held.headers["cache-control"] == "no-store"
+    # The site's own signing state is shown as it reported it.
+    page = "http://127.0.0.1:8079/link/approve"
+    a.held.summary["signing"] = {"state": "signed", "held": 1, "approvePage": page}
+    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+    listed = c.post("/oidc/job-sites", auth=auth(a.app), json={"refreshToken": a.token})
+    (site,) = listed.json()["sites"]
+    assert site["signing"] == {"state": "signed", "held": 1, "approvePage": page}

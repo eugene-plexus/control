@@ -30,6 +30,7 @@ from urllib.parse import quote
 import httpx
 import jwt
 from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
 
 from .. import capabilities, oidc, security, site_tokens
@@ -771,6 +772,11 @@ def _person_id(state: Any, name: str) -> str:
     return str(person["id"])
 
 
+def _names(state: Any, subjects: Any) -> dict[str, str]:
+    """How this root names each person, by id, for a site to show (J54)."""
+    return {s: helpers.person_name(state, s) for s in subjects}
+
+
 def _folder_view(state: Any, folder: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": folder["id"],
@@ -835,16 +841,45 @@ def _site_view(request: Request, record: SiteRecord) -> dict[str, Any]:
             if server["kind"] == "local"
         ],
         "ownerInDevMode": summary.get("ownerInDevMode") if summary else None,
-        **{k: summary[k] for k in ("links", "linkPage", "sharing") if summary.get(k) is not None},
+        **{
+            k: summary[k]
+            for k in ("links", "linkPage", "sharing", "signing")
+            if summary.get(k) is not None
+        },
     }
 
 
+class HeldAtTheMachine(Exception):
+    """The site holds a change until its owner approves it there with their
+    key (J14a, J50). Answered as 202 `JobSiteHeld`, never as a refusal."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def held_response(_request: Request, exc: Exception) -> JSONResponse:
+    message = exc.message if isinstance(exc, HeldAtTheMachine) else str(exc)
+    return JSONResponse(
+        {"held": True, "message": message[:1024]},
+        status_code=202,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 async def _manage(
-    request: Request, token: str, site: str, action: str, arguments: dict[str, Any]
+    request: Request,
+    token: str,
+    site: str,
+    action: str,
+    arguments: dict[str, Any],
+    names: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """One management action, relayed to the site, which takes it from the
     owner it recorded at its join and nobody else (J6b). Its refusal comes
-    back as 422 in the site's own words."""
+    back as 422 in the site's own words. A change the site holds for its
+    owner's key raises `HeldAtTheMachine` (J14a). `names` says how this root
+    names the people the arguments name, for the site to show (J54)."""
     machine, subject, record = _own_site(request, token, site)
     bound = helpers.binding(record)
 
@@ -852,10 +887,20 @@ async def _manage(
         _own_site(request, token, site)
         _same_site(machine, bound)
         return helpers.envelope(
-            machine.state, bound, subject, kind="manage", action=action, arguments=arguments
+            machine.state,
+            bound,
+            subject,
+            kind="manage",
+            action=action,
+            arguments=arguments,
+            names=names or None,
         )
 
     outcome = await helpers.broker(request).submit(bound, check)
+    if outcome.get("status") == "held":
+        raise HeldAtTheMachine(
+            outcome.get("message") or "The site holds this change until you approve it there."
+        )
     if outcome.get("status") != "done":
         raise problem(
             422,
@@ -956,12 +1001,17 @@ async def site_folder_people(
     and who may change files in it; the site keeps the list (J6b, J6g)."""
     _own_site(request, body.refreshToken, site)
     state = request.app.state.machine.state
+    named = {entry.name: _person_id(state, entry.name) for entry in body.people}
     people = [
-        {"subject": _person_id(state, entry.name), "writable": bool(entry.writable)}
-        for entry in body.people
+        {"subject": named[entry.name], "writable": bool(entry.writable)} for entry in body.people
     ]
     folder = await _manage(
-        request, body.refreshToken, site, "folder.people", {"id": folder_id, "people": people}
+        request,
+        body.refreshToken,
+        site,
+        "folder.people",
+        {"id": folder_id, "people": people},
+        _names(state, named.values()),
     )
     return _folder_view(request.app.state.machine.state, folder)
 
@@ -981,7 +1031,12 @@ async def site_server_access(
         for entry in body.people
     ]
     value = await _manage(
-        request, body.refreshToken, site, "access.set", {"server": server, "people": people}
+        request,
+        body.refreshToken,
+        site,
+        "access.set",
+        {"server": server, "people": people},
+        _names(state, [p["subject"] for p in people]),
     )
     return _server_view(request.app.state.machine.state, value["server"], value["people"])
 
