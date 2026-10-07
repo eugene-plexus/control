@@ -99,6 +99,20 @@ def test_enrollment_records_where_the_agent_is(active_client: TestClient) -> Non
     assert active_client.get("/v1/nodes/shed").json().get("url") is None
 
 
+def test_a_join_token_never_begins_with_a_dash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """control#7: a command line reads `--token -AbC…` as an option. A
+    draw that begins with `-` is drawn again, never altered."""
+    from eugene_plexus_control import security
+
+    draws = iter(["-" + "a" * 42, "-" + "b" * 42, "c" * 43])
+    monkeypatch.setattr(security.secrets, "token_urlsafe", lambda _n: next(draws))
+    assert security.generate_join_token() == "c" * 43
+    monkeypatch.undo()
+    minted = [JoinTokenStore().mint(ttl_seconds=60, node_name=None).token for _ in range(300)]
+    assert not any(t.startswith("-") for t in minted)
+    assert {len(t) for t in minted} == {43}
+
+
 def test_a_join_token_cannot_be_replayed(active_client: TestClient) -> None:
     """409 rather than 401: "wrong credential" versus "that enrollment
     already happened, go look at the node list"."""

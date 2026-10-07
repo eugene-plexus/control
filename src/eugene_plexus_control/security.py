@@ -233,8 +233,16 @@ def generate_join_token() -> str:
 
     Deliberately opaque random rather than a JWT: it is stored only as a
     hash, so there is nothing to verify a signature against and nothing
-    to look up. A lost token is re-minted, never recovered."""
-    return secrets.token_urlsafe(32)
+    to look up. A lost token is re-minted, never recovered.
+
+    It never begins with `-`: every command that carries one (the agent's
+    `join --token`, `install.sh --token`, `install.ps1 -Token`, a site's
+    join) would read it as an option, about one token in 64 (control#7).
+    Drawing again keeps it uniform over the rest, at the same length."""
+    while True:
+        token = secrets.token_urlsafe(32)
+        if not token.startswith("-"):
+            return token
 
 
 def hash_join_token(token: str) -> str:
