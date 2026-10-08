@@ -37,7 +37,7 @@ from .auth_state import AuthState
 from .join_tokens import JoinTokenStore
 from .log_store import LogStore
 from .nodes_client import NodesClient
-from .replication import Follower
+from .replication import Follower, StandbyToken
 from .root_tls import RootTls
 from .routes import admin as admin_routes
 from .routes import auth as auth_routes
@@ -140,7 +140,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # default `node` and a promotion can name itself in the registry.
     # An env-free default of None is correct on a host that has not
     # enrolled: the operator names the target explicitly until it has.
-    app.state.node_name = _local_node_name(machine)
+    app.state.node_name = settings.node_name or _local_node_name(machine)
 
     app.state.follower = None
     app.state.node_poller = None
@@ -150,9 +150,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             machine,
             active_url=normalize_url(settings.active_url),
             interval_seconds=settings.follow_interval_seconds,
-            # No credential: replication takes an operator session, and
-            # a standby following unattended has none (design §5).
-            token_provider=None,
+            # The standby's own token, from the agent that started it
+            # because its node holds the standby grant (warm-standby.md).
+            # A standby started by hand has none, and is refused.
+            token_provider=(
+                StandbyToken(agent_url=settings.agent_url, spawn_token=settings.service_token)
+                if settings.agent_url and settings.service_token
+                else None
+            ),
         )
         follower.start()
         app.state.follower = follower

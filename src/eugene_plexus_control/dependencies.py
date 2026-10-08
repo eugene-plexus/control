@@ -194,16 +194,43 @@ def require_operator(
     """An operator session only.
 
     The level for anything that mutates control state, mints a join
-    token, revokes a node or rotates a key, and for the replication
-    surface, which carries the salt and the passphrase verifier."""
+    token, revokes a node or rotates a key. The replication surface takes
+    this or the standby's own token (`require_replica`)."""
     return verify_bearer(request, _bearer(request, creds), classes=(tokens.TYP_SESSION,))
 
 
-require_replica = require_operator
-"""The replication surface takes a session and nothing else (2026-09-25).
+def require_replica(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> tokens.Claims:
+    """An operator session, or the standby's own token (warm-standby.md SB2).
 
-A standby that follows unattended needs a credential of its own, and no
-production path has ever given it one; see the design's §5."""
+    The replication surface carries the salt, the passphrase verifier and
+    the sealed keys, so nothing else opens it. The standby's token is a
+    `sub: standby` service token that `tokens.verify` lets leave only the
+    node holding the grant; **the grant is checked again here against
+    applied state**, so removing it refuses the next pull while the token
+    still has time left. A locked root still serves its standby: the
+    material is sealed, and the standby's position stays known."""
+    token = _bearer(request, creds)
+    claims = verify_with_view(request, token, classes=(tokens.TYP_SESSION, tokens.TYP_SERVICE))
+    if not claims.is_service:
+        return verify_bearer(request, token, classes=(tokens.TYP_SESSION,))
+    from .applied import standby_node
+
+    holder = standby_node(request.app.state.machine.state)
+    if claims.sub == tokens.SUB_STANDBY and holder is not None and claims.issuer_node == holder:
+        return claims
+    raise problem(
+        status.HTTP_401_UNAUTHORIZED,
+        "Invalid token",
+        f"A {claims.sub!r} service token from {claims.iss!r} does not open replication: "
+        + (
+            f"only {holder!r}, the standby, does, with its standby token."
+            if holder
+            else "no machine is the standby."
+        ),
+    )
 
 
 def require_key_policy(

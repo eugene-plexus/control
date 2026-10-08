@@ -68,6 +68,7 @@ from eugene_plexus_control.applied import (
     OP_SET_PERSON_PASSWORD,
     OP_SET_SITE_DEV_GRANTS,
     OP_SET_SITE_HOST,
+    OP_SET_STANDBY,
     OP_UPDATE_NODE,
     AppliedState,
     ApplyError,
@@ -118,6 +119,7 @@ EXERCISED_OPS = {
     OP_REMOVE_SITE,
     OP_SET_SITE_HOST,
     OP_SET_SITE_DEV_GRANTS,
+    OP_SET_STANDBY,
 }
 
 
@@ -474,6 +476,11 @@ def _write_history(machine: StateMachine) -> bytes:
     # The older shape: `revokeNode`, then a rotation naming the node it
     # removed. Revoking takes the node's component and runtime with it.
     # Placed last so the cascade shows up in the compared state.
+    # The standby (warm-standby.md): given, taken back, given to another;
+    # the promotion below takes it from the node it promotes.
+    machine.append(OP_SET_STANDBY, {"node": "gpu-büro", "on": True})
+    machine.append(OP_SET_STANDBY, {"node": "gpu-büro", "on": False})
+    machine.append(OP_SET_STANDBY, {"node": "attic", "on": True})
     machine.append(OP_REVOKE_NODE, {"name": "gpu-büro"})
     last, last_public = _root_key()
     machine.append(

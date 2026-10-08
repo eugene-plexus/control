@@ -120,23 +120,6 @@ FIELDS: list[ConfigField] = [
         # back in prompt mode comes back locked.
     ),
     ConfigField(
-        key="standbyUrls",
-        label="Standby control roots",
-        description=(
-            "Where this install's warm standbys are. Each one pulls the "
-            "log from here and can be promoted if this host is not "
-            "coming back.\n\n"
-            "More than one standby is a configuration, not a mechanism — "
-            "list as many as you want, or none. What matters is that "
-            "`GET /v1/control/status` reports how far behind each one "
-            "is, so you find out whether failover is safe *before* you "
-            "need it rather than during."
-        ),
-        category="replication",
-        valueType=ConfigValueType.url_list,
-        default=[],
-    ),
-    ConfigField(
         key="nodePollIntervalSeconds",
         label="Node poll interval",
         description=(
@@ -333,7 +316,8 @@ def validate_patch(request: ConfigUpdateRequest) -> tuple[dict[str, Any], list[C
     for key, value in request.model_dump().items():
         field = _FIELDS_BY_KEY.get(key)
         if field is None:
-            rejected.append(ConfigFieldError(key=key, message="unknown field"))
+            message = RETIRED.get(key, "unknown field")
+            rejected.append(ConfigFieldError(key=key, message=message))
             continue
         error = _validate_value(field, value)
         if error is not None:
@@ -367,10 +351,14 @@ def running() -> dict[str, Any]:
 
 
 #: What an unset or empty value does (settings never lie, 2026-09-30).
-UNSET_MEANS: dict[str, str] = {
+UNSET_MEANS: dict[str, str] = {}
+
+#: Settings that no longer exist, and what replaced each. An old log still
+#: holds their values, which replay keeps and nothing reads or shows.
+RETIRED: dict[str, str] = {
     "standbyUrls": (
-        "No standbys. A standby replicates this root's log and can be promoted if this "
-        "host is not coming back; none is required."
+        "retired: the standby is the machine made one on Machines "
+        "(PUT /v1/nodes/{name}/standby), not a typed list"
     ),
 }
 
@@ -378,7 +366,10 @@ UNSET_MEANS: dict[str, str] = {
 def as_document(values: dict[str, Any]) -> ConfigDocument:
     # `installModeChangedAt` rides in applied config beside the mode it
     # dates, and is not a setting anyone edits.
-    merged = {**defaults(), **{k: v for k, v in values.items() if k != MODE_CHANGED_AT}}
+    merged = {
+        **defaults(),
+        **{k: v for k, v in values.items() if k != MODE_CHANGED_AT and k not in RETIRED},
+    }
     return ConfigDocument.model_validate(merged)
 
 

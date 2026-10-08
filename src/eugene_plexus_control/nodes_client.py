@@ -65,6 +65,9 @@ class NodeProbe:
     trust_bundle_version: int | None = None
     """The bundle version the node said it holds: how a revocation's
     progress is read, node by node, without tracking anything here."""
+    hosts_control: bool = False
+    """The node said its agent supervises the active control root: this
+    root's own machine, which can never be its standby (warm-standby.md)."""
 
 
 TokenFor = Callable[[str], str | None]
@@ -176,6 +179,7 @@ class NodesClient:
             arch=_str_or_none(body.get("arch")),
             devices=devices if isinstance(devices, list) else None,
             last_seen_at=datetime.now(UTC).isoformat(),
+            hosts_control=body.get("hostsControl") is True,
         )
 
     async def probe_all(

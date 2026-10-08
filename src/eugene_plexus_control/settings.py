@@ -55,6 +55,17 @@ class Settings(BaseSettings):
 
     agent_url: str | None = None
     """The supervising agent's private address, supplied by that agent."""
+    node_name: str | None = None
+    """The node this control root runs on, as its agent knows it. The agent
+    sets it for the standby it runs, so a promotion names that node: the
+    registry marks it the root and its standby grant goes
+    (warm-standby.md)."""
+    service_token: str | None = None
+    """A standby's only credential: the token its agent spawned it with
+    (`sub: standby`, good on this machine alone). The follower trades it at
+    that agent's `POST /v1/auth/service-token` for the 15-minute token the
+    active root's replication routes accept (warm-standby.md SB2, SB3). Set
+    by the agent, never by hand; no other control process has one."""
     agent_public_origin: str | None = None
     """Its explicit HTTPS entry-point origin; local calls stay on agent_url."""
     nodes_origin: str | None = None

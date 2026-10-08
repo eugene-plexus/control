@@ -104,6 +104,10 @@ OP_ENROLL_SITE = "enrollSite"
 OP_REMOVE_SITE = "removeSite"
 OP_SET_SITE_HOST = "setSiteHost"
 OP_SET_SITE_DEV_GRANTS = "setSiteDevGrants"
+OP_SET_STANDBY = "setStandby"
+
+#: The grant that makes a node the install's warm standby (warm-standby.md).
+GRANT_STANDBY = "standby"
 
 #: The owner's name on the sign-in page, which no person may take.
 OPERATOR_NAME = "operator"
@@ -141,6 +145,7 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_REMOVE_SITE,
         OP_SET_SITE_HOST,
         OP_SET_SITE_DEV_GRANTS,
+        OP_SET_STANDBY,
     }
 )
 
@@ -495,7 +500,7 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
     return replace(state, nodes={**state.nodes, name: record})
 
 
-_NODE_GRANTS = frozenset({"node", "gateway", "files"})
+_NODE_GRANTS = frozenset({"node", "gateway", "files", GRANT_STANDBY})
 
 
 def is_retired_site(record: NodeRecord | None) -> bool:
@@ -695,8 +700,45 @@ def _apply_promote(state: AppliedState, payload: dict[str, Any], index: int) -> 
         if record.role == ROLE_CONTROL and key != node:
             nodes[key] = replace(record, role=ROLE_STANDBY)
     if node in nodes:
-        nodes[node] = replace(nodes[node], role=ROLE_CONTROL)
+        # The promoted machine is the root now and follows nobody, so its
+        # standby grant goes (warm-standby.md §3.1).
+        promoted = nodes[node]
+        nodes[node] = replace(
+            promoted,
+            role=ROLE_CONTROL,
+            grants=tuple(g for g in promoted.grants if g != GRANT_STANDBY),
+        )
     return replace(state, nodes=nodes)
+
+
+def standby_node(state: AppliedState) -> str | None:
+    """The node that holds the standby grant, or None. At most one does."""
+    return next((n for n, r in state.nodes.items() if GRANT_STANDBY in r.grants), None)
+
+
+def _apply_set_standby(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    """Give one node the standby grant, or take it away (warm-standby.md SB1).
+
+    The route has refused everything this refuses before appending, so on
+    the writer these never fire; on a replica they mean the log is not one
+    this root wrote."""
+    name = _require_str(payload, "node", index)
+    on = payload.get("on")
+    if not isinstance(on, bool):
+        raise ApplyError(f"entry {index}: setStandby needs on: true or false")
+    record = state.nodes.get(name)
+    if record is None:
+        raise ApplyError(f"entry {index}: cannot make unknown node {name!r} the standby")
+    if is_retired_site(record):
+        raise ApplyError(f"entry {index}: a retired Job Site cannot be the standby")
+    if on:
+        holder = standby_node(state)
+        if holder not in (None, name):
+            raise ApplyError(f"entry {index}: {holder!r} is already the standby")
+        grants = tuple(sorted({*record.grants, GRANT_STANDBY}))
+    else:
+        grants = tuple(g for g in record.grants if g != GRANT_STANDBY)
+    return replace(state, nodes={**state.nodes, name: replace(record, grants=grants)})
 
 
 def _key_record(raw: Any) -> dict[str, Any]:
@@ -1178,6 +1220,7 @@ _HANDLERS: dict[str, _Handler] = {
     OP_REMOVE_SITE: _apply_remove_site,
     OP_SET_SITE_HOST: _apply_set_site_host,
     OP_SET_SITE_DEV_GRANTS: _apply_set_site_dev_grants,
+    OP_SET_STANDBY: _apply_set_standby,
 }
 
 

@@ -36,11 +36,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
+
+from . import tokens
 from ._http import internal_client
 from .applied import ApplyError
 from .state_machine import StateMachine
@@ -51,6 +56,82 @@ log = logging.getLogger(__name__)
 # while catches up in a few round trips, small enough that a single
 # response is not a surprise on a slow link between buildings.
 PAGE_LIMIT = 500
+
+#: A token with less than this left is traded again before it is sent.
+TOKEN_REFRESH_MARGIN_SECONDS = 120
+
+
+class ReplicationRefused(Exception):
+    """The active root, or this machine's agent, refused the standby: the
+    message is theirs, so the status names the observed cause."""
+
+
+class StandbyToken:
+    """The standby's credential (warm-standby.md SB2, SB3).
+
+    It holds the token its agent spawned it with, `sub: standby` and good
+    on this machine alone, and trades it at that agent's
+    `POST /v1/auth/service-token` for a 15-minute token addressed to
+    `control`, which the active root's replication routes accept while
+    this node holds the standby grant. Traded again before it runs out.
+    The agent mints only what the bundle grants this node, so a node
+    that lost the grant gets a refusal here, said in the agent's words.
+    """
+
+    def __init__(
+        self, *, agent_url: str, spawn_token: str, client: httpx.AsyncClient | None = None
+    ) -> None:
+        self._agent_url = agent_url.rstrip("/")
+        self._spawn_token = spawn_token
+        self._client = client or internal_client()
+        self._token: str | None = None
+        self._expires = 0.0
+
+    async def __call__(self) -> str:
+        if self._token is not None and self._expires - time.time() > TOKEN_REFRESH_MARGIN_SECONDS:
+            return self._token
+        response = await self._client.post(
+            f"{self._agent_url}/v1/auth/service-token",
+            json={"audience": tokens.RECIPIENT_CONTROL},
+            headers={"Authorization": f"Bearer {self._spawn_token}"},
+            timeout=10.0,
+        )
+        if response.status_code != 200:
+            raise ReplicationRefused(
+                f"this machine's agent gave the standby no token "
+                f"({response.status_code}): {_problem_text(response)}"
+            )
+        body = response.json()
+        self._token = str(body["token"])
+        self._expires = datetime.fromisoformat(str(body["expiresAt"])).timestamp()
+        return self._token
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+
+def _problem_text(response: httpx.Response) -> str:
+    """The detail a refusal carries, or its reason phrase."""
+    try:
+        body = response.json()
+    except ValueError:
+        return response.reason_phrase or "no reason given"
+    if isinstance(body, dict):
+        detail = body.get("detail")
+        if isinstance(detail, str) and detail:
+            return detail
+        if isinstance(detail, dict) and isinstance(detail.get("detail"), str):
+            return str(detail["detail"])
+    return response.reason_phrase or "no reason given"
+
+
+def _refused(response: httpx.Response, what: str) -> None:
+    """Raise the active root's own words when it refuses the standby."""
+    if response.status_code in (401, 403):
+        raise ReplicationRefused(
+            f"the active root refused this standby's {what} "
+            f"({response.status_code}): {_problem_text(response)}"
+        )
 
 
 @dataclass
@@ -124,6 +205,9 @@ class Follower:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
         await self._client.aclose()
+        closer = getattr(self._token_provider, "aclose", None)
+        if closer is not None:
+            await closer()
 
     # ----- the loop ---------------------------------------------------
 
@@ -216,11 +300,12 @@ class Follower:
         response = await self._client.get(
             f"{url.rstrip('/')}/v1/control/log",
             params={"after": after, "limit": PAGE_LIMIT},
-            headers=self._headers(),
+            headers=await self._headers(),
             timeout=max(5.0, self._interval * 2),
         )
         if response.status_code == 409:
             raise _Compacted()
+        _refused(response, "log read")
         response.raise_for_status()
         body = response.json()
         if not isinstance(body, dict):
@@ -230,9 +315,10 @@ class Follower:
     async def _install_snapshot(self, url: str) -> None:
         response = await self._client.get(
             f"{url.rstrip('/')}/v1/control/snapshot",
-            headers=self._headers(),
+            headers=await self._headers(),
             timeout=max(10.0, self._interval * 4),
         )
+        _refused(response, "snapshot read")
         response.raise_for_status()
         document = response.json()
         if not isinstance(document, dict):
@@ -242,9 +328,11 @@ class Follower:
         self.status.reachable = True
         self.status.last_contact_at = datetime.now(UTC).isoformat()
 
-    def _headers(self) -> dict[str, str]:
+    async def _headers(self) -> dict[str, str]:
         provider = self._token_provider
         token = provider() if callable(provider) else None
+        if inspect.isawaitable(token):
+            token = await token
         return {"Authorization": f"Bearer {token}"} if token else {}
 
 

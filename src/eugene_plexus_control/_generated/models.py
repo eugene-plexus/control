@@ -917,6 +917,13 @@ class TrustGrant(StrEnum):
       with `sub: agent` to `control`, and to **its own machine**.
       Nothing else: a site that joined with a leaked token reaches no
       other machine and no other component, on any network.
+    * `standby`: given to **one** node, beside `node`, by an owner's
+      `PUT /v1/nodes/{name}/standby` at the control root, never by a
+      join token and never claimed by the node
+      (`docs/design/warm-standby.md`, SB1). Service tokens with
+      `sub: standby` to `control`, and nothing else. The control root
+      accepts them on its replication routes alone, and only while
+      its applied state still names that node the standby (SB2).
 
     """
 
@@ -924,6 +931,7 @@ class TrustGrant(StrEnum):
     node = 'node'
     gateway = 'gateway'
     files = 'files'
+    standby = 'standby'
 
 
 class Role(StrEnum):
@@ -2242,19 +2250,45 @@ class Enrollment(BaseModel):
 
 
 class StandbyStatus(BaseModel):
-    url: AnyUrl
-    appliedIndex: int | None = None
+    """
+    What the active root knows of its standby, from the standby's own
+    pulls (`docs/design/warm-standby.md`, SB4), never from probing it.
+    A root that has restarted knows nothing until the next pull, and
+    says so with no `lastContactAt`.
+
+    """
+
+    node: str = Field(..., description='The node that holds the `standby` grant.')
+    url: AnyUrl | None = Field(
+        None,
+        description="That node's address, as `Node.url` records it. Absent when none is recorded.",
+    )
+    appliedIndex: int | None = Field(
+        None,
+        description='The index the standby had applied at its last pull: the `after`\nof its last log read, or the index of its last snapshot.\n',
+    )
     lagEntries: int | None = Field(
         None,
         description='How many entries behind this standby is. Reported as a count\nof entries rather than a duration, because entries are what\nwould be lost and seconds are not.\n',
         ge=0,
     )
-    lastContactAt: AwareDatetime | None = None
-    reachable: bool | None = None
+    lastContactAt: AwareDatetime | None = Field(
+        None,
+        description='When the standby last pulled. Absent until it has, since this root started.',
+    )
+    reachable: bool | None = Field(
+        None,
+        description='The standby pulled within the last three follow intervals.\nFalse when it has not pulled since this root started, which\n`lastContactAt` being absent tells apart from a standby that\nstopped.\n',
+    )
 
 
 class LogOp(StrEnum):
     """
+    **`setStandby` (2026-10-08)** gives one node the `standby` grant
+    (`on: true`) or takes it away (`on: false`); `promote` takes it from
+    the node it promotes (`docs/design/warm-standby.md`). At most one
+    node holds it.
+
     **The four Job Site operations (slice 2b.1, 2026-10-06)** are
     `enrollSite`, `removeSite`, `setSiteHost` (a node's display-only
     claim to host a site, J32) and `setSiteDevGrants` (Eugene's owner's
@@ -2329,6 +2363,7 @@ class LogOp(StrEnum):
     removeSite = 'removeSite'
     setSiteHost = 'setSiteHost'
     setSiteDevGrants = 'setSiteDevGrants'
+    setStandby = 'setStandby'
 
 
 class SnapshotPerson(BaseModel):
@@ -2534,8 +2569,13 @@ class PromoteRequest(BaseModel):
 
 
 class Reason(StrEnum):
+    """
+    `standby`: a `makeStandby` or `stopStandby` (2026-10-08).
+    """
+
     revocation = 'revocation'
     rotation = 'rotation'
+    standby = 'standby'
 
 
 class TrustChange(BaseModel):
@@ -2549,8 +2589,14 @@ class TrustChange(BaseModel):
     """
 
     version: int = Field(..., description='The bundle version this change produced.')
-    reason: Reason
+    reason: Reason = Field(
+        ..., description='`standby`: a `makeStandby` or `stopStandby` (2026-10-08).'
+    )
     revokedNode: str | None = Field(None, description='Set when `reason: revocation`.')
+    standbyNode: str | None = Field(
+        None,
+        description='Set when `reason: standby`: the node that holds the grant now.\nAbsent when no node does.\n',
+    )
     nodesBehind: list[str] = Field(
         ...,
         description='Nodes that had not acknowledged `version` when this answered:\nnamed, because "which host still trusts the old key" is the\nquestion an operator has. They take it from the push, or\nwhen they next pull.\n',
@@ -3370,7 +3416,7 @@ class ControlStatus(BaseModel):
     )
     standbys: list[StandbyStatus] | None = Field(
         None,
-        description='Present on the active root. **This is the "is failover safe\nright now" answer** — a standby trailing the active root\ncannot be promoted without losing the difference, and an\noperator should see that before a failure rather than during\none.\n',
+        description='Present on the active root. **This is the "is failover safe\nright now" answer** — a standby trailing the active root\ncannot be promoted without losing the difference, and an\noperator should see that before a failure rather than during\none.\n\nSince 2026-10-08, the node that holds the `standby` grant, from\napplied state; the `standbyUrls` setting is no longer read.\n',
     )
     activeUrl: AnyUrl | None = Field(
         None, description='Where the active root is, as reported by a standby.'
@@ -3999,7 +4045,7 @@ class Snapshot(BaseModel):
     )
     config: dict[str, Any] | None = Field(
         None,
-        description="The control root's own applied configuration.\n\nReplicated because `patchConfig` is one of the ops, so\nconfig *is* control state — and a snapshot that dropped it\nwould lose every config change made before the last\ncompaction. A promoted standby that came up without\n`standbyUrls` would silently have no standbys of its own,\nwhich is the failure mode where the second failover is the\none that hurts.\n",
+        description="The control root's own applied configuration.\n\nReplicated because `patchConfig` is one of the ops, so\nconfig *is* control state — and a snapshot that dropped it\nwould lose every config change made before the last\ncompaction. A promoted standby that came up without\n`standbyUrls` would silently have no standbys of its own,\nwhich is the failure mode where the second failover is the\none that hurts. (Since 2026-10-08 the standby is the node with\nthe `standby` grant, which is in `nodes`, and `standbyUrls` is\nno longer read.)\n",
     )
     signingKeyId: str | None = Field(
         None,

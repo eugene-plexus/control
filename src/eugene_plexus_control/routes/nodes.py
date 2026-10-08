@@ -46,10 +46,12 @@ from .._generated.models import (
 from ..applied import (
     OP_ENROLL_NODE,
     OP_REVOKE_NODE,
+    OP_SET_STANDBY,
     OP_UPDATE_NODE,
     NodeRecord,
     is_retired_site,
     normalize_url,
+    standby_node,
 )
 from ..auth_state import AuthState
 from ..dependencies import problem, require_authorized, via_public_sites
@@ -728,6 +730,96 @@ def _to_node(record: NodeRecord, probe: Any | None) -> Node:
             # clock skew on a worker refusing this root's tokens.
             "lastError": probe.error if probe is not None else None,
         }
+    )
+
+
+@router.put(
+    "/v1/nodes/{name}/standby",
+    response_model=TrustChange,
+    response_model_exclude_none=True,
+    status_code=202,
+    dependencies=[Depends(capabilities.require(capabilities.MEMBERSHIP))],
+)
+async def make_standby(request: Request, name: str) -> TrustChange:
+    """Make this node the install's warm standby (warm-standby.md SB1).
+
+    One `setStandby` entry, then a new bundle that lists the grant. The
+    node's agent sees it and starts a standby control root, which follows
+    this one with its own `sub: standby` token (SB2, SB3). One machine at a
+    time, and never this root's own.
+    """
+    return _set_standby(request, name, on=True)
+
+
+@router.delete(
+    "/v1/nodes/{name}/standby",
+    response_model=TrustChange,
+    response_model_exclude_none=True,
+    status_code=202,
+    dependencies=[Depends(capabilities.require(capabilities.MEMBERSHIP))],
+)
+async def stop_standby(request: Request, name: str) -> TrustChange:
+    """Stop this node being the standby. Its next pull is refused, whatever
+    its token's remaining life, and its agent deletes its copy."""
+    return _set_standby(request, name, on=False)
+
+
+def _set_standby(request: Request, name: str, *, on: bool) -> TrustChange:
+    machine: StateMachine = request.app.state.machine
+    auth: AuthState = request.app.state.auth_state
+    record = machine.state.nodes.get(name)
+    if record is None or is_retired_site(record):
+        raise problem(
+            status.HTTP_404_NOT_FOUND, "No such node", f"No node named {name!r} is enrolled."
+        )
+    if not machine.is_active:
+        raise _not_active(machine)
+    holder = standby_node(machine.state)
+    if on:
+        probe = request.app.state.node_probes.get(name)
+        if name == request.app.state.node_name or (probe is not None and probe.hosts_control):
+            raise problem(
+                status.HTTP_409_CONFLICT,
+                "This root's own machine",
+                f"{name!r} runs this control root, so a standby there would stop with it. "
+                "Choose another machine.",
+            )
+        if holder not in (None, name):
+            raise problem(
+                status.HTTP_409_CONFLICT,
+                "Already a standby",
+                f"{holder!r} is the standby. One machine at a time: stop {holder!r} being "
+                "the standby first.",
+            )
+    if auth.control_private_key is None:
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Control identity unavailable",
+            "This root's identity key is not in memory, so the trust bundle that carries "
+            "the change could not be signed. Nothing changed. Sign in, then try again.",
+        )
+    publisher = request.app.state.trust
+    if (holder == name) != on:
+        try:
+            machine.append(OP_SET_STANDBY, {"node": name, "on": on})
+        except NotActive as exc:
+            raise _not_active(machine) from exc
+        bundle = publisher.publish(request.app)
+        log.warning(
+            "%s %s the standby",
+            name,
+            "is now" if on else "is no longer",
+        )
+    else:
+        bundle = publisher.current
+    if not on:
+        request.app.state.standby_reports.pop(name, None)
+    version = bundle.version if bundle is not None else machine.state.index
+    return TrustChange(
+        version=version,
+        reason=Reason.standby,
+        standbyNode=standby_node(machine.state),
+        nodesBehind=trust.nodes_behind(request.app, version),
     )
 
 

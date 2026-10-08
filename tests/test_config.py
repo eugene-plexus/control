@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_control import config as config_module
 from eugene_plexus_control.app import create_app
+from eugene_plexus_control.applied import OP_PATCH_CONFIG
 
 from .conftest import PASSPHRASE, settings_for
 
@@ -30,7 +31,8 @@ def test_the_schema_describes_every_field_without_a_token(
     body = response.json()
     assert body["component"] == "control"
     keys = {field["key"] for field in body["fields"]}
-    assert "standbyUrls" in keys
+    assert "nodePollIntervalSeconds" in keys
+    assert "standbyUrls" not in keys, "retired: the standby is a grant (warm-standby.md)"
     assert "securityMode" in keys
     # Not present, and deliberately: the port is the agent's, and the
     # role is an env var because a role a config PATCH could change
@@ -87,19 +89,23 @@ def test_a_rejected_value_never_reaches_the_log(active_client: TestClient) -> No
     assert machine.state.index == before, "nothing valid was patched, so nothing was logged"
 
 
-def test_url_list_validation_rejects_duplicates_and_junk(active_client: TestClient) -> None:
-    good = active_client.patch(
-        "/v1/config", json={"standbyUrls": ["http://a:8083", "http://b:8083"]}
-    )
-    assert good.json()["applied"] == ["standbyUrls"]
+def test_the_retired_standby_list_is_refused_and_says_what_replaced_it(
+    active_client: TestClient,
+) -> None:
+    """warm-standby.md §3.1: the standby is the machine made one on Machines."""
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    before = machine.state.index
+    refused = active_client.patch("/v1/config", json={"standbyUrls": ["http://a:8083"]})
+    body = refused.json()
+    assert body["applied"] == [] and "Machines" in body["rejected"][0]["message"]
+    assert machine.state.index == before
 
-    duplicated = active_client.patch(
-        "/v1/config", json={"standbyUrls": ["http://a:8083", "http://a:8083"]}
-    )
-    assert "duplicates" in duplicated.json()["rejected"][0]["message"]
 
-    wrong_type = active_client.patch("/v1/config", json={"standbyUrls": "http://a:8083"})
-    assert "expected a list" in wrong_type.json()["rejected"][0]["message"]
+def test_an_old_logs_standby_list_replays_and_is_not_shown(active_client: TestClient) -> None:
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    machine.append(OP_PATCH_CONFIG, {"values": {"standbyUrls": ["http://a:8083"]}})
+    assert machine.state.config["standbyUrls"] == ["http://a:8083"], "replay keeps it"
+    assert "standbyUrls" not in active_client.get("/v1/config").json()
 
 
 def test_config_survives_a_restart_through_the_log(tmp_path: Path) -> None:
@@ -251,7 +257,6 @@ def test_what_values_are_doing_is_not_told_to_an_anonymous_caller(
     fields = {f["key"]: f for f in active_client.get("/v1/config/schema").json()["fields"]}
     assert fields["securityMode"]["status"]["level"] == "warning"
     assert "comes back locked" in fields["securityMode"]["status"]["text"]
-    assert "No standbys" in fields["standbyUrls"]["unsetMeans"]
     anonymous = TestClient(active_client.app)
     bare = {f["key"]: f for f in anonymous.get("/v1/config/schema").json()["fields"]}
     assert bare["securityMode"].get("status") is None
