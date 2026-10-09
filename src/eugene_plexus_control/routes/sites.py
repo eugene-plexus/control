@@ -688,6 +688,8 @@ async def mcp(request: Request, body: SiteMcpCall) -> dict[str, Any]:
             mine and name == named for name, _, _, mine in helpers.workspace_view(summary, subject)
         )
 
+    approval = body.approval.model_dump(mode="json", exclude_none=True) if body.approval else None
+
     def check() -> dict[str, Any]:
         subject, grants = authorized()
         return helpers.envelope(
@@ -698,6 +700,10 @@ async def mcp(request: Request, body: SiteMcpCall) -> dict[str, Any]:
             request=request_body,
             grants=grants,
             asked=bool(body.asked),
+            # A held call sent again, with the person's signature when made
+            # with a passkey (J14b): carried as Workbench sent it; the site
+            # checks it, and this root cannot make one.
+            approval=approval,
         )
 
     operation_id = _operation_id(body.refreshToken, body.operationId) if body.operationId else None
@@ -710,9 +716,11 @@ async def mcp(request: Request, body: SiteMcpCall) -> dict[str, Any]:
         "status": outcome.get("status", "failed"),
         "installMode": helpers.install_mode(machine.state),
     }
-    for key in ("message", "response"):
+    for key in ("message", "response", "held"):
         if outcome.get(key) is not None:
             answer[key] = outcome[key]
+    if "windowUntil" in outcome:
+        answer["windowUntil"] = outcome["windowUntil"]
     return answer
 
 
@@ -994,6 +1002,9 @@ def _linked_view(request: Request, record: SiteRecord, subject: str) -> dict[str
     }
     if summary.get("linkPage") is not None:
         view["linkPage"] = summary["linkPage"]
+    if summary.get("commands") is not None:
+        # Whether commands run on the machine at all (2b.4): theirs to know.
+        view["commands"] = summary["commands"]
     if isinstance(signing, dict):
         # Their own keys' state, not the owner's (SiteSigning.held is the
         # owner's count).
@@ -1040,7 +1051,7 @@ def _site_view(request: Request, record: SiteRecord) -> dict[str, Any]:
         "ownerInDevMode": summary.get("ownerInDevMode") if summary else None,
         **{
             k: summary[k]
-            for k in ("links", "linkPage", "sharing", "signing")
+            for k in ("links", "linkPage", "sharing", "signing", "commands")
             if summary.get(k) is not None
         },
     }
@@ -1315,6 +1326,36 @@ def _workspace_site(request: Request, token: str, site: str, *, use: bool = True
     _keeps_people(request, record)
 
 
+def _checks_calls(request: Request, record: SiteRecord) -> None:
+    """A site older than J14b does not check signed calls or run commands:
+    say so here rather than queue an action it would refuse."""
+    summary = helpers.broker(request).summary(helpers.binding(record)) or {}
+    if "commands" not in summary:
+        raise problem(
+            503,
+            "The site needs an update",
+            f"{record.label} does not check signed calls yet. Update Eugene on it first.",
+        )
+
+
+@router.post("/oidc/job-sites/{site}/window/close", status_code=204)
+async def site_close_window(request: Request, site: str, body: JobSiteRequest) -> None:
+    """Close the person's window now (J90): it only takes access away, so it
+    needs no signature, and no `use-job-sites` (J77)."""
+    _, _, record, _ = _my_site(request, body.refreshToken, site)
+    _checks_calls(request, record)
+    await _manage(request, body.refreshToken, site, "window.close", {}, mine=True)
+
+
+@router.post("/oidc/job-sites/{site}/commands/withdraw", status_code=204)
+async def site_withdraw_commands(request: Request, site: str, body: JobSiteRequest) -> None:
+    """The site's owner takes back the consent to commands on their machine
+    (J30, J89). Giving it again is done at the machine."""
+    _, _, record = _own_site(request, body.refreshToken, site)
+    _checks_calls(request, record)
+    await _manage(request, body.refreshToken, site, "commands.withdraw", {})
+
+
 @router.post("/oidc/job-sites/{site}/workspaces", status_code=201)
 async def site_add_workspace(
     request: Request, site: str, body: JobSiteWorkspaceCreate
@@ -1332,7 +1373,7 @@ async def site_add_workspace(
         )
     arguments: dict[str, Any] = {"name": name, "path": path, "writable": body.writable is not False}
     if body.rules is not None:
-        arguments["rules"] = body.rules.model_dump(mode="json")
+        arguments["rules"] = body.rules.model_dump(mode="json", exclude_none=True)
     if body.deny:
         arguments["deny"] = [pattern.root for pattern in body.deny]
     detail = await _manage(request, body.refreshToken, site, "workspace.add", arguments, mine=True)
@@ -1375,7 +1416,7 @@ async def site_workspace_rules(
         "rules.set",
         {
             "id": workspace_id,
-            "rules": body.rules.model_dump(mode="json"),
+            "rules": body.rules.model_dump(mode="json", exclude_none=True),
             "deny": [pattern.root for pattern in body.deny],
         },
         mine=True,
