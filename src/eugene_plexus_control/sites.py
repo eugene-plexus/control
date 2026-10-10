@@ -47,13 +47,8 @@ OFFER_SECONDS = 5.0
 
 OPERATOR = "operator"
 FILES = "files"
-PROTOCOL = "mcp-2026-07-28"
 PRODUCTION = "production"
 DEV = "dev"
-NEEDS_UPDATE = (
-    "This site's host is older than this root and speaks no MCP. Update Eugene on that "
-    "machine, then try again."
-)
 
 
 def new_site_id() -> str:
@@ -96,12 +91,6 @@ def unique_names(names: list[str]) -> list[str]:
     return out
 
 
-def has_workspaces(summary: dict[str, Any] | None) -> bool:
-    """A site since 2b.3b reports workspaces, by id and name, never path
-    (J76); an older one reports folders, with their paths."""
-    return summary is not None and isinstance(summary.get("workspaces"), list)
-
-
 def workspace_view(
     summary: dict[str, Any] | None, subject: str
 ) -> list[tuple[str, dict[str, Any], dict[str, str], bool]]:
@@ -136,39 +125,24 @@ def dev_grants(
     state: Any, record: SiteRecord, summary: dict[str, Any] | None
 ) -> list[dict[str, Any]]:
     """Eugene's owner's own grants on a site, named as the site last
-    reported its folders, and **only while the install is in dev mode**
+    reported its workspaces, and **only while the install is in dev mode**
     (J13b): switching to production ends them at once, because this is
     checked at every use. The site honours them only if its owner let
-    Eugene's owner in there (J6e), which it checks itself. Since 2b.3b a
-    grant names one of the site owner's workspaces by id alone (J76)."""
+    Eugene's owner in there (J6e), which it checks itself. A grant names one
+    of the site owner's workspaces by id alone (J76)."""
     if install_mode(state) != DEV or summary is None:
         return []
     out: list[dict[str, Any]] = []
-    if has_workspaces(summary):
-        owners = {w["id"]: (name, w) for name, w, _, _ in workspace_view(summary, record.owner)}
-        for grant in record.devGrants:
-            found = owners.get(grant["folderId"])
-            if found is not None:
-                name, workspace = found
-                out.append(
-                    {
-                        "folderId": workspace["id"],
-                        "name": name,
-                        "writable": bool(grant["writable"] and workspace["writable"]),
-                    }
-                )
-        return out
-    folders = {f["id"]: f for f in summary.get("folders") or []}
+    owners = {w["id"]: (name, w) for name, w, _, _ in workspace_view(summary, record.owner)}
     for grant in record.devGrants:
-        folder = folders.get(grant["folderId"])
-        if folder is not None:
+        found = owners.get(grant["folderId"])
+        if found is not None:
+            name, workspace = found
             out.append(
                 {
-                    "folderId": folder["id"],
-                    "name": folder["name"],
-                    "path": folder["path"],
-                    "identity": folder["identity"],
-                    "writable": bool(grant["writable"] and folder["writable"]),
+                    "folderId": workspace["id"],
+                    "name": name,
+                    "writable": bool(grant["writable"] and workspace["writable"]),
                 }
             )
     return out
@@ -177,36 +151,23 @@ def dev_grants(
 def site_folders_for(
     summary: dict[str, Any] | None, subject: str, *, own: bool = True
 ) -> list[dict[str, Any]]:
-    """The workspaces (before 2b.3b, folders) on a site `subject` may use, as
-    it last reported them, named as the site names their view. A cache: the
+    """The workspaces on a site `subject` may use, as it last reported
+    them, named as the site names their view. A cache: the
     site checks every call against its own copy again (rule 2 of
     remote-nodes.md §3.3). `own` False leaves out their own workspaces, for a
     person without `use-job-sites` (J77); so does no link, since only their
     own worker opens them."""
-    if has_workspaces(summary):
-        mine_ok = own and linked(summary, subject) is not None
-        return [
-            {
-                "id": w["id"],
-                "name": name,
-                "writable": rules["change"] != "deny",
-                "mine": mine,
-            }
-            for name, w, rules, mine in workspace_view(summary, subject)
-            if (mine_ok or not mine) and not (rules["read"] == rules["change"] == "deny")
-        ]
-    out = []
-    for folder in (summary or {}).get("folders") or []:
-        person = next((p for p in folder.get("people") or [] if p["subject"] == subject), None)
-        if person is not None:
-            out.append(
-                {
-                    "id": folder["id"],
-                    "name": folder["name"],
-                    "writable": bool(person["writable"] and folder["writable"]),
-                }
-            )
-    return out
+    mine_ok = own and linked(summary, subject) is not None
+    return [
+        {
+            "id": w["id"],
+            "name": name,
+            "writable": rules["change"] != "deny",
+            "mine": mine,
+        }
+        for name, w, rules, mine in workspace_view(summary, subject)
+        if (mine_ok or not mine) and not (rules["read"] == rules["change"] == "deny")
+    ]
 
 
 def site_local_servers_for(summary: dict[str, Any] | None, subject: str) -> list[dict[str, Any]]:
@@ -230,11 +191,7 @@ def link_fields(summary: dict[str, Any] | None, subject: str, owner: str) -> dic
     (their own once linked; until then the owner's, if the owner linked one),
     and where to link when they have not. From the site's last report, so a
     cache like the rest of the summary."""
-    reported = (summary or {}).get("links")
-    if reported is None:
-        # A site that predates linking says nothing about it; neither do we.
-        return {}
-    links = reported
+    links = (summary or {}).get("links") or []
     mine = next((entry for entry in links if entry.get("subject") == subject), None)
     if mine is not None:
         return {"linked": True, "account": mine.get("accountName"), "linkPage": None}
@@ -341,8 +298,6 @@ class Broker:
         status = self.status(bound)
         if not status.get("ready"):
             return False, status.get("reason") or "This site is not ready."
-        if status.get("protocol") != PROTOCOL:
-            return False, NEEDS_UPDATE
         return True, None
 
     async def submit(

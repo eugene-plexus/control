@@ -1,5 +1,5 @@
 """S0 of the hobbyist UX plan, control's half: the keyring entry is scoped
-per install, a legacy entry migrates once, the probe is measured, and
+per install, the probe is measured, and
 `GET /v1/auth/status` says unlocked and keyringAvailable.
 
 The single-slot fake in `test_keyring_unlock.py` cannot tell two
@@ -108,36 +108,6 @@ def test_a_second_install_on_the_machine_does_not_unlock_the_first(
     with _boot(b_dir) as restarted_b:
         assert restarted_b.get("/v1/control/status").status_code == 401
     assert len(dict_keyring.store) == 2, "neither restart discarded the other's key"
-
-
-def test_a_legacy_entry_is_read_once_and_moved(dict_keyring: DictKeyring) -> None:
-    install = keyring_store.install_id_for(SALT_A)
-    key = secrets.token_bytes(32)
-    dict_keyring.store[(keyring_store.SERVICE, keyring_store.LEGACY_USERNAME)] = _b64(key)
-    assert keyring_store.get_master_key(install) == key
-    assert (keyring_store.SERVICE, keyring_store.LEGACY_USERNAME) not in dict_keyring.store
-    assert dict_keyring.store[(keyring_store.SERVICE, keyring_store.username_for(install))] == _b64(
-        key
-    )
-
-
-def test_a_root_that_predates_scoping_still_auto_unlocks(
-    tmp_path: Path, dict_keyring: DictKeyring
-) -> None:
-    """An upgrade must not turn a root that came back on its own into one
-    that asks for the passphrase."""
-    directory = tmp_path / "install"
-    with _boot(directory) as client:
-        _initialize_and_enable(client)
-    # Move the stored key back to the pre-scoping slot, as an older build
-    # would have left it.
-    (((service, username), value),) = dict_keyring.store.items()
-    dict_keyring.store = {(service, keyring_store.LEGACY_USERNAME): value}
-
-    with _boot(directory) as restarted:
-        assert restarted.get("/v1/control/status").status_code == 401
-    assert (keyring_store.SERVICE, keyring_store.LEGACY_USERNAME) not in dict_keyring.store
-    assert (service, username) in dict_keyring.store
 
 
 def test_the_probe_is_a_round_trip_and_leaves_nothing_behind(dict_keyring: DictKeyring) -> None:

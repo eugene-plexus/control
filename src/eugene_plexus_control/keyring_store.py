@@ -19,9 +19,7 @@ live one and every acceptance run — and with `os_keyring` becoming the
 desktop default, a second install's wizard would silently replace the
 first install's stored key. So the username carries a fingerprint of
 this install's master-key salt: unique per install, minted before the
-master key, stored beside it. A legacy single-slot entry is read once,
-moved to its scoped name and deleted, so a root that predates this keeps
-auto-unlocking across the upgrade.
+master key, stored beside it.
 
 What the OS boundary actually is, per platform:
 
@@ -63,12 +61,8 @@ log = logging.getLogger(__name__)
 # co-exist on a host and hold different keys.
 SERVICE = "eugene-plexus-control"
 
-# The pre-scoping username. Read as a fallback and migrated; never
-# written to again.
-LEGACY_USERNAME = "master-key"
-
-# Kept for readers of the old name. Nothing in this module writes to it.
-USERNAME = LEGACY_USERNAME
+# The entry's username is this prefix plus the install's fingerprint.
+USERNAME_PREFIX = "master-key"
 
 
 def install_id_for(master_salt_b64: str) -> str:
@@ -80,7 +74,7 @@ def install_id_for(master_salt_b64: str) -> str:
 
 
 def username_for(install_id: str) -> str:
-    return f"{LEGACY_USERNAME}:{install_id}"
+    return f"{USERNAME_PREFIX}:{install_id}"
 
 
 def _read(username: str) -> bytes | None:
@@ -139,24 +133,11 @@ def get_master_key(install_id: str) -> bytes | None:
     """This install's stored master key, or None if absent, unreadable,
     or the backend is unavailable. Never raises.
 
-    Reads the scoped entry first; failing that, the legacy single-slot
-    entry, which is then moved to the scoped name — written first,
-    deleted second, so a failure between the two leaves a duplicate
-    rather than nothing. Whether the key opens this install's sealed
-    values is still the caller's to find out, and `_auto_unlock` still
-    discards one that does not.
+    Whether the key opens this install's sealed values is still the
+    caller's to find out, and `_auto_unlock` still discards one that
+    does not.
     """
-    scoped = username_for(install_id)
-    found = _read(scoped)
-    if found is not None:
-        return found
-    legacy = _read(LEGACY_USERNAME)
-    if legacy is None:
-        return None
-    if _write(scoped, legacy):
-        _delete(LEGACY_USERNAME)
-        log.info("moved the stored master key to its per-install keyring entry")
-    return legacy
+    return _read(username_for(install_id))
 
 
 def set_master_key(master_key: bytes, install_id: str) -> bool:
@@ -182,12 +163,9 @@ def delete_master_key(install_id: str) -> bool:
     entry is still there, deriving to a key that opens nothing. There is
     no passphrase-change endpoint today, so this is the way a stale
     secret actually arises. Deleting beats keeping a value whose failure
-    mode is "auto-unlock appeared to work". The legacy slot is cleared
-    too, for a root that switched modes before it ever migrated.
+    mode is "auto-unlock appeared to work".
     """
-    scoped = _delete(username_for(install_id))
-    legacy = _delete(LEGACY_USERNAME)
-    return scoped or legacy
+    return _delete(username_for(install_id))
 
 
 # --------------------------------------------------------------------------- #

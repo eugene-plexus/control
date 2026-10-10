@@ -39,12 +39,10 @@ from .._generated.models import (
     HostedSites,
     JobSiteAccessRequest,
     JobSiteAuditRequest,
-    JobSiteFolderCreate,
     JobSiteHeldListRequest,
     JobSiteInviteRequest,
     JobSitePasskeyApproval,
     JobSitePasskeyPair,
-    JobSitePeopleRequest,
     JobSiteRequest,
     JobSiteRulesRequest,
     JobSiteServerEnable,
@@ -350,15 +348,13 @@ async def check_person(
 
 
 def _owner_folders(summary: dict[str, Any] | None, owner: str) -> list[dict[str, Any]]:
-    """The site owner's workspaces as folders (`id`, `name`, `writable`, and
-    `path` from a site before 2b.3b only, J76)."""
-    if helpers.has_workspaces(summary):
-        return [
-            {"id": w["id"], "name": name, "path": None, "writable": w["writable"]}
-            for name, w, _, mine in helpers.workspace_view(summary, owner)
-            if mine
-        ]
-    return list((summary or {}).get("folders") or [])
+    """The site owner's workspaces as folders (`id`, `name`, `writable`; no
+    `path`, which a site never reports, J76)."""
+    return [
+        {"id": w["id"], "name": name, "path": None, "writable": w["writable"]}
+        for name, w, _, mine in helpers.workspace_view(summary, owner)
+        if mine
+    ]
 
 
 def _dev_view(request: Request, record: SiteRecord) -> dict[str, Any]:
@@ -841,19 +837,6 @@ def _my_site(request: Request, token: str, site: str) -> tuple[StateMachine, str
     return machine, subject, record, "linked"
 
 
-def _keeps_people(request: Request, record: SiteRecord) -> None:
-    """A site older than 2b.3b keeps no one's workspaces but its owner's
-    folders: say so here rather than queue an action it would refuse."""
-    summary = helpers.broker(request).summary(helpers.binding(record)) or {}
-    if not (summary.get("signing") or {}).get("people"):
-        raise problem(
-            503,
-            "The site needs an update",
-            f"{record.label} does not keep each person's workspaces yet. Update Eugene on it "
-            "first.",
-        )
-
-
 def _may_use_job_sites(request: Request, subject: str) -> None:
     if not permissions.has(request.app.state.machine.state, subject, permissions.USE_JOB_SITES):
         raise problem(
@@ -872,23 +855,6 @@ def _person_id(state: Any, name: str) -> str:
 def _names(state: Any, subjects: Any) -> dict[str, str]:
     """How this root names each person, by id, for a site to show (J54)."""
     return {s: helpers.person_name(state, s) for s in subjects}
-
-
-def _folder_view(state: Any, folder: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": folder["id"],
-        "name": folder["name"],
-        "path": folder["path"],
-        "writable": folder["writable"],
-        "people": [
-            {
-                "person": p["subject"],
-                "name": helpers.person_name(state, p["subject"]),
-                "writable": p["writable"],
-            }
-            for p in folder.get("people") or []
-        ],
-    }
 
 
 def _server_view(
@@ -951,31 +917,6 @@ def _own_workspaces(state: Any, summary: dict[str, Any], subject: str) -> list[d
     ]
 
 
-def _owner_folder_views(state: Any, summary: dict[str, Any], owner: str) -> list[dict[str, Any]]:
-    """The owner's workspaces as `JobSiteFolder`s, for a Workbench from before
-    2b.3b; from an older site, its folders as it reported them."""
-    if not helpers.has_workspaces(summary):
-        return [_folder_view(state, f) for f in summary.get("folders") or []]
-    return [
-        {
-            "id": w["id"],
-            "name": name,
-            "path": None,
-            "writable": w["writable"],
-            "people": [
-                {
-                    "person": p["subject"],
-                    "name": helpers.person_name(state, p["subject"]),
-                    "writable": p["change"] != "deny",
-                }
-                for p in w.get("people") or []
-            ],
-        }
-        for name, w, _, mine in helpers.workspace_view(summary, owner)
-        if mine
-    ]
-
-
 def _linked_view(request: Request, record: SiteRecord, subject: str) -> dict[str, Any]:
     """A site a person is linked to and does not own (2b.3b): only their own
     -- their workspaces, their link, their keys' state."""
@@ -1034,7 +975,7 @@ def _site_view(request: Request, record: SiteRecord) -> dict[str, Any]:
         "account": status_.get("account"),
         "lastContactAt": _contact(request, record.id),
         "hostNode": record.hostNode,
-        "folders": _owner_folder_views(state, summary, record.owner),
+        "folders": [],
         "servers": [
             _server_view(
                 state,
@@ -1201,53 +1142,6 @@ async def invite(request: Request, body: JobSiteInviteRequest) -> dict[str, Any]
     }
 
 
-@router.post("/oidc/job-sites/{site}/folders", status_code=201)
-async def site_add_folder(request: Request, site: str, body: JobSiteFolderCreate) -> dict[str, Any]:
-    name, path = body.name.strip(), body.path.strip()
-    if not name or not path or any(ord(c) < 32 for c in name + path):
-        raise problem(
-            422, "Invalid folder", "Use a nonempty folder name and path without control characters."
-        )
-    folder = await _manage(
-        request,
-        body.refreshToken,
-        site,
-        "folder.add",
-        {"name": name, "path": path, "writable": bool(body.writable)},
-    )
-    return _folder_view(request.app.state.machine.state, folder)
-
-
-@router.post("/oidc/job-sites/{site}/folders/{folder_id}/remove", status_code=204)
-async def site_remove_folder(
-    request: Request, site: str, folder_id: str, body: JobSiteRequest
-) -> None:
-    await _manage(request, body.refreshToken, site, "folder.remove", {"id": folder_id})
-
-
-@router.post("/oidc/job-sites/{site}/folders/{folder_id}/people")
-async def site_folder_people(
-    request: Request, site: str, folder_id: str, body: JobSitePeopleRequest
-) -> dict[str, Any]:
-    """J11: the site's owner says who may use a folder, themselves included,
-    and who may change files in it; the site keeps the list (J6b, J6g)."""
-    _own_site(request, body.refreshToken, site)
-    state = request.app.state.machine.state
-    named = {entry.name: _person_id(state, entry.name) for entry in body.people}
-    people = [
-        {"subject": named[entry.name], "writable": bool(entry.writable)} for entry in body.people
-    ]
-    folder = await _manage(
-        request,
-        body.refreshToken,
-        site,
-        "folder.people",
-        {"id": folder_id, "people": people},
-        _names(state, named.values()),
-    )
-    return _folder_view(request.app.state.machine.state, folder)
-
-
 @router.post("/oidc/job-sites/{site}/servers/{server}/access")
 async def site_server_access(
     request: Request, site: str, server: str, body: JobSiteAccessRequest
@@ -1301,11 +1195,8 @@ async def site_settings(request: Request, site: str, body: JobSiteSettings) -> d
 @router.post("/oidc/job-sites/{site}/audit")
 async def site_audit(request: Request, site: str, body: JobSiteAuditRequest) -> dict[str, Any]:
     """The site's own audit log, read from the machine: each person the lines
-    that belong to them, the site's owner the rest (J80). A site older than
-    2b.3b answers its owner alone."""
-    _, _, record, role = _my_site(request, body.refreshToken, site)
-    if role == "linked":
-        _keeps_people(request, record)
+    that belong to them, the site's owner the rest (J80)."""
+    _my_site(request, body.refreshToken, site)
     value = await _manage(
         request, body.refreshToken, site, "audit.read", {"limit": body.limit or 50}, mine=True
     )
@@ -1318,32 +1209,18 @@ WorkspaceId = Annotated[str, Path(pattern=r"^[a-f0-9]{32}$")]
 
 
 def _workspace_site(request: Request, token: str, site: str, *, use: bool = True) -> None:
-    """The person's own site or one they are linked to, one that keeps each
-    person's workspaces, and (`use`) the person may use job sites (J77)."""
-    _, subject, record, _ = _my_site(request, token, site)
+    """The person's own site or one they are linked to, and (`use`) the
+    person may use job sites (J77)."""
+    _, subject, _, _ = _my_site(request, token, site)
     if use:
         _may_use_job_sites(request, subject)
-    _keeps_people(request, record)
-
-
-def _checks_calls(request: Request, record: SiteRecord) -> None:
-    """A site older than J14b does not check signed calls or run commands:
-    say so here rather than queue an action it would refuse."""
-    summary = helpers.broker(request).summary(helpers.binding(record)) or {}
-    if "commands" not in summary:
-        raise problem(
-            503,
-            "The site needs an update",
-            f"{record.label} does not check signed calls yet. Update Eugene on it first.",
-        )
 
 
 @router.post("/oidc/job-sites/{site}/window/close", status_code=204)
 async def site_close_window(request: Request, site: str, body: JobSiteRequest) -> None:
     """Close the person's window now (J90): it only takes access away, so it
     needs no signature, and no `use-job-sites` (J77)."""
-    _, _, record, _ = _my_site(request, body.refreshToken, site)
-    _checks_calls(request, record)
+    _my_site(request, body.refreshToken, site)
     await _manage(request, body.refreshToken, site, "window.close", {}, mine=True)
 
 
@@ -1351,8 +1228,7 @@ async def site_close_window(request: Request, site: str, body: JobSiteRequest) -
 async def site_withdraw_commands(request: Request, site: str, body: JobSiteRequest) -> None:
     """The site's owner takes back the consent to commands on their machine
     (J30, J89). Giving it again is done at the machine."""
-    _, _, record = _own_site(request, body.refreshToken, site)
-    _checks_calls(request, record)
+    _own_site(request, body.refreshToken, site)
     await _manage(request, body.refreshToken, site, "commands.withdraw", {})
 
 
@@ -1430,8 +1306,7 @@ async def site_share_workspace(
 ) -> dict[str, Any]:
     """The site's owner shares one of their own workspaces (J69), naming
     people by how they sign in, each with their rules there (J70)."""
-    _, _, record = _own_site(request, body.refreshToken, site)
-    _keeps_people(request, record)
+    _own_site(request, body.refreshToken, site)
     state = request.app.state.machine.state
     named = {entry.name: _person_id(state, entry.name) for entry in body.people}
     people = [
@@ -1456,19 +1331,8 @@ PasskeyId = Annotated[str, Path(pattern=r"^[a-f0-9]{32}$")]
 
 
 def _takes_passkeys(request: Request, token: str, site: str) -> None:
-    """A site older than J14a.3 does not know these actions, and one older
-    than 2b.3b takes them from its owner alone: say so here rather than queue
-    one it would refuse."""
-    _, _, record, role = _my_site(request, token, site)
-    if role == "linked":
-        _keeps_people(request, record)
-    summary = helpers.broker(request).summary(helpers.binding(record)) or {}
-    if not (summary.get("signing") or {}).get("passkeys"):
-        raise problem(
-            503,
-            "The site needs an update",
-            f"{record.label} does not take passkeys yet. Update Eugene on it first.",
-        )
+    """The person's own site or one they are linked to."""
+    _my_site(request, token, site)
 
 
 @router.post("/oidc/job-sites/{site}/passkeys", status_code=201)

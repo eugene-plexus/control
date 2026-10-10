@@ -171,7 +171,8 @@ class Report:
         self.summary: dict[str, Any] = {
             "owner": owner,
             "ownerInDevMode": False,
-            "folders": [],
+            "workspaces": [],
+            "links": [],
             "servers": [],
             "access": [],
         }
@@ -179,10 +180,22 @@ class Report:
     def report(self) -> dict[str, Any]:
         return {**REPORT, "site": self.summary}
 
-    def folder(self, **values: Any) -> dict[str, Any]:
-        folder = {"people": [], **values}
-        self.summary["folders"].append(folder)
-        return folder
+    def workspace(self, **values: Any) -> dict[str, Any]:
+        workspace = {"people": [], **values}
+        self.summary["workspaces"].append(workspace)
+        return workspace
+
+    def link(self, subject: str, account: str) -> None:
+        self.summary["links"].append(
+            {
+                "subject": subject,
+                "accountName": account,
+                "available": True,
+                "keys": 1,
+                "signing": "signed",
+                "held": 0,
+            }
+        )
 
 
 def manage_through(
@@ -207,12 +220,14 @@ class Ada:
     app: dict[str, Any]
     person: dict[str, Any]
     token: str
-    folder: dict[str, Any]
+    workspace: dict[str, Any]
     held: Report
 
 
-def ada_with_a_folder(c: TestClient) -> Ada:
-    """Ada's site `desk`, with one writable folder nobody may use yet."""
+def ada_with_a_workspace(c: TestClient) -> Ada:
+    """Ada's site `desk`, reporting one workspace of hers, `Notes`, that
+    nobody may use yet: she has not linked an account there and has shared
+    it with no one."""
     app = workbench(c)
     ada, ada_token = add_person(c, app, "ada")
     keys, joined = join_site(c, ada)
@@ -220,33 +235,31 @@ def ada_with_a_folder(c: TestClient) -> Ada:
     site = joined.json()["id"]
     assert joined.json()["owner"] == ada["id"]
     held = Report(ada["id"])
+    workspace = held.workspace(
+        id="a" * 32,
+        name="Notes",
+        holder=ada["id"],
+        writable=True,
+        rules={"read": "allow", "change": "ask"},
+    )
     assert c.post("/v1/sites/poll", headers=keys.bearer(site), json=held.report()).json() == {
         "operation": None
     }
+    return Ada(keys, site, app, ada, ada_token, workspace, held)
 
-    def added(command: dict[str, Any]) -> dict[str, Any]:
-        assert command["subject"] == ada["id"]
-        assert command["site"] == site
-        folder = held.folder(
-            id="a" * 32, name="Notes", path="C:/Notes", identity="vol:file", writable=True
-        )
-        return {"status": "done", "result": folder}
 
-    _, folder = manage_through(
-        c,
-        keys,
-        site,
-        held,
-        lambda: c.post(
-            f"/oidc/job-sites/{site}/folders",
-            auth=auth(app),
-            json={"refreshToken": ada_token, "name": "Notes", "path": "C:/Notes", "writable": True},
-        ),
-        added,
-        action="folder.add",
-    )
-    assert folder.status_code == 201, folder.text
-    return Ada(keys, site, app, ada, ada_token, folder.json(), held)
+def share_notes(c: TestClient, a: Ada, subject: str, *, change: str = "deny") -> None:
+    """The site reports `Notes` shared with `subject`: to read, and to change
+    only if `change` allows."""
+    a.workspace["people"].append({"subject": subject, "read": "allow", "change": change})
+    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+
+
+def ada_links(c: TestClient, a: Ada) -> None:
+    """The site reports Ada's own account linked there, so her own
+    workspaces are usable."""
+    a.held.link(a.person["id"], "HOST/ada")
+    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
 
 
 def rpc(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -370,12 +383,6 @@ def test_from_outside_only_a_site_joins(root: TestClient) -> None:
     keys = node_keys("far")
     node = root.post("/v1/nodes/enroll", json=keys.body(mint_join_token(root)), headers=PUBLIC)
     assert node.status_code == 403
-    old = root.post(
-        "/v1/nodes/enroll",
-        json=keys.body(mint_join_token(root)),
-        headers={"X-Eugene-Plexus-Entry": "public-nodes"},
-    )
-    assert old.status_code == 403
     app = workbench(root)
     ada, _ = add_person(root, app, "ada")
     _, joined = join_site(root, ada, headers=PUBLIC)
@@ -454,29 +461,41 @@ def test_deleting_the_owner_removes_their_sites(root: TestClient) -> None:
 # --------------------------------------------------------------------------- using a site
 
 
-def test_only_the_site_owner_grants_and_the_grantee_reads(root: TestClient) -> None:
+def test_only_the_site_owner_shares_and_the_grantee_reads(root: TestClient) -> None:
     c = root
-    a = ada_with_a_folder(c)
+    a = ada_with_a_workspace(c)
     bo, bo_token = add_person(c, a.app, "bo")
+    notes = a.workspace["id"]
     assert read(c, a, bo_token).status_code == 403
-    assert read(c, a, a.token).status_code == 403  # not even its owner, yet
-    # Bo cannot grant himself anything on Ada's site, nor learn that it exists.
-    bo_grants = c.post(
-        f"/oidc/job-sites/{a.site}/folders/{a.folder['id']}/people",
+    assert read(c, a, a.token).status_code == 403  # not even its owner, until they link
+    # Bo cannot share Ada's workspace, nor learn that her site exists.
+    bo_shares = c.post(
+        f"/oidc/job-sites/{a.site}/workspaces/{notes}/people",
         auth=auth(a.app),
-        json={"refreshToken": bo_token, "people": [{"name": "bo", "writable": False}]},
+        json={
+            "refreshToken": bo_token,
+            "people": [{"name": "bo", "read": "allow", "change": "deny"}],
+        },
     )
-    assert bo_grants.status_code == 404
+    assert bo_shares.status_code == 404
     assert not c.app.state.site_broker.jobs
+    shared_with = [{"subject": bo["id"], "read": "allow", "change": "deny"}]
 
-    def granted(command: dict[str, Any]) -> dict[str, Any]:
+    def shared(command: dict[str, Any]) -> dict[str, Any]:
         assert command["subject"] == a.person["id"]
-        assert command["arguments"] == {
-            "id": a.folder["id"],
-            "people": [{"subject": bo["id"], "writable": False}],
+        assert command["arguments"] == {"id": notes, "people": shared_with}
+        a.workspace["people"] = command["arguments"]["people"]
+        return {
+            "status": "done",
+            "result": {
+                "id": notes,
+                "name": "Notes",
+                "path": "C:/Notes",
+                "writable": True,
+                "rules": a.workspace["rules"],
+                "people": shared_with,
+            },
         }
-        a.held.summary["folders"][0]["people"] = command["arguments"]["people"]
-        return {"status": "done", "result": a.held.summary["folders"][0]}
 
     _, given = manage_through(
         c,
@@ -484,15 +503,20 @@ def test_only_the_site_owner_grants_and_the_grantee_reads(root: TestClient) -> N
         a.site,
         a.held,
         lambda: c.post(
-            f"/oidc/job-sites/{a.site}/folders/{a.folder['id']}/people",
+            f"/oidc/job-sites/{a.site}/workspaces/{notes}/people",
             auth=auth(a.app),
-            json={"refreshToken": a.token, "people": [{"name": "BO", "writable": False}]},
+            json={
+                "refreshToken": a.token,
+                "people": [{"name": "BO", "read": "allow", "change": "deny"}],
+            },
         ),
-        granted,
-        action="folder.people",
+        shared,
+        action="workspace.people",
     )
     assert given.status_code == 200, given.text
-    assert given.json()["people"] == [{"person": bo["id"], "name": "bo", "writable": False}]
+    assert given.json()["people"] == [
+        {"person": bo["id"], "name": "bo", "read": "allow", "change": "deny"}
+    ]
     listed = c.post("/oidc/sites/servers", auth=auth(a.app), json={"refreshToken": bo_token})
     assert listed.json()["servers"] == [
         {
@@ -503,7 +527,10 @@ def test_only_the_site_owner_grants_and_the_grantee_reads(root: TestClient) -> N
             "kind": "files",
             "available": True,
             "reason": None,
-            "folders": [{"id": a.folder["id"], "name": "Notes", "writable": False}],
+            "linked": False,
+            "account": None,
+            "linkPage": None,
+            "folders": [{"id": notes, "name": "Notes", "writable": False, "mine": False}],
         }
     ]
     command, answered = read_through(c, a, bo_token)
@@ -513,8 +540,8 @@ def test_only_the_site_owner_grants_and_the_grantee_reads(root: TestClient) -> N
     assert answered.status_code == 200, answered.text
     assert answered.json()["installMode"] == "production"
     mine = c.post("/oidc/job-sites", auth=auth(a.app), json={"refreshToken": a.token}).json()
-    assert mine["sites"][0]["folders"][0]["people"] == [
-        {"person": bo["id"], "name": "bo", "writable": False}
+    assert mine["sites"][0]["workspaces"][0]["people"] == [
+        {"person": bo["id"], "name": "bo", "read": "allow", "change": "deny"}
     ]
     assert (
         c.post("/oidc/job-sites", auth=auth(a.app), json={"refreshToken": bo_token}).json()["sites"]
@@ -524,19 +551,22 @@ def test_only_the_site_owner_grants_and_the_grantee_reads(root: TestClient) -> N
 
 def test_the_sites_refusal_comes_back_in_its_own_words(root: TestClient) -> None:
     c = root
-    a = ada_with_a_folder(c)
+    a = ada_with_a_workspace(c)
     _, refused = manage_through(
         c,
         a.keys,
         a.site,
         a.held,
         lambda: c.post(
-            f"/oidc/job-sites/{a.site}/folders/{a.folder['id']}/people",
+            f"/oidc/job-sites/{a.site}/workspaces/{a.workspace['id']}/people",
             auth=auth(a.app),
-            json={"refreshToken": a.token, "people": [{"name": "ada", "writable": True}]},
+            json={
+                "refreshToken": a.token,
+                "people": [{"name": "ada", "read": "allow", "change": "allow"}],
+            },
         ),
         lambda _: {"status": "failed", "message": "Only this machine's owner changes it."},
-        action="folder.people",
+        action="workspace.people",
     )
     assert refused.status_code == 422 and "Only this machine's owner" in refused.text
 
@@ -545,9 +575,8 @@ def test_nothing_queued_for_one_enrollment_reaches_another(root: TestClient) -> 
     """A site removed while a call waits: the call ends, and the site that
     joins again (a new id) cannot claim it."""
     c = root
-    a = ada_with_a_folder(c)
-    a.held.summary["folders"][0]["people"] = [{"subject": a.person["id"], "writable": True}]
-    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+    a = ada_with_a_workspace(c)
+    ada_links(c, a)
     with ThreadPoolExecutor() as pool:
         pending = pool.submit(read, c, a, a.token)
         for _ in range(100):
@@ -567,9 +596,8 @@ def test_nothing_queued_for_one_enrollment_reaches_another(root: TestClient) -> 
 
 def test_a_result_larger_than_the_limit_is_refused(root: TestClient) -> None:
     c = root
-    a = ada_with_a_folder(c)
-    a.held.summary["folders"][0]["people"] = [{"subject": a.person["id"], "writable": True}]
-    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+    a = ada_with_a_workspace(c)
+    ada_links(c, a)
     with ThreadPoolExecutor() as pool:
         pending = pool.submit(read, c, a, a.token)
         ident, _ = deliver(c, a.keys, a.site, a.held.report())
@@ -588,12 +616,12 @@ def test_a_result_larger_than_the_limit_is_refused(root: TestClient) -> None:
 
 def test_production_shows_membership_only_and_dev_mode_shows_the_rest(root: TestClient) -> None:
     c = root
-    a = ada_with_a_folder(c)
+    a = ada_with_a_workspace(c)
     (listed,) = c.get("/v1/sites").json()["sites"]
     assert listed["id"] == a.site and listed["ownerName"] == "ada" and listed["online"] is True
     assert listed["dev"] is None
     production = c.patch(
-        f"/v1/sites/{a.site}/folders/{a.folder['id']}", json={"ownerAccess": "read"}
+        f"/v1/sites/{a.site}/folders/{a.workspace['id']}", json={"ownerAccess": "read"}
     )
     assert production.status_code == 409
     assert c.patch("/v1/config", json={"installMode": "dev"}).status_code == 200
@@ -603,12 +631,12 @@ def test_production_shows_membership_only_and_dev_mode_shows_the_rest(root: Test
         {
             "id": "a" * 32,
             "name": "Notes",
-            "path": "C:/Notes",
+            "path": None,
             "writable": True,
             "ownerAccess": "none",
         }
     ]
-    given = c.patch(f"/v1/sites/{a.site}/folders/{a.folder['id']}", json={"ownerAccess": "read"})
+    given = c.patch(f"/v1/sites/{a.site}/folders/{a.workspace['id']}", json={"ownerAccess": "read"})
     assert given.status_code == 200, given.text
     assert given.json()["dev"]["folders"][0]["ownerAccess"] == "read"
     # The owner's grant reaches Workbench only once the site's owner lets them in (J6e).
@@ -822,9 +850,8 @@ def test_an_offer_nobody_claimed_is_offered_again(
     its answer went nowhere. The restarted host must still get it."""
     monkeypatch.setattr(sites, "OFFER_SECONDS", 0.05)
     c = root
-    a = ada_with_a_folder(c)
-    a.held.summary["folders"][0]["people"] = [{"subject": a.person["id"], "writable": True}]
-    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+    a = ada_with_a_workspace(c)
+    ada_links(c, a)
     with ThreadPoolExecutor() as pool:
         pending = pool.submit(read, c, a, a.token)
         lost = None
@@ -854,7 +881,7 @@ def test_the_broker_keeps_reports_to_the_enrollment_that_made_them() -> None:
     broker = sites.Broker()
     old = {"site": "s-a", "enrolledAt": "2026-10-06T10:00:00+00:00"}
     new = {"site": "s-a", "enrolledAt": "2026-10-06T11:00:00+00:00"}
-    asyncio.run(broker.poll(old, {"ready": True, "protocol": sites.PROTOCOL}))
+    asyncio.run(broker.poll(old, {"ready": True, "protocol": "mcp-2026-07-28"}))
     assert broker.report(old) is not None and broker.last_contact(old) is not None
     assert broker.report(new) is None and broker.last_contact(new) is None
     assert broker.status(new)["online"] is False
@@ -889,7 +916,7 @@ def test_a_site_claims_and_answers_only_its_own_operations() -> None:
 def test_a_call_is_checked_against_the_enrollment_it_was_queued_for(root: TestClient) -> None:
     from eugene_plexus_control.routes import sites as site_routes
 
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     machine = root.app.state.machine
     bound = sites.binding(machine.state.sites[a.site])
     assert site_routes._same_site(machine, bound).id == a.site
@@ -963,7 +990,7 @@ def test_a_person_may_hold_three_open_invitations_and_no_more(root: TestClient) 
 def test_eugenes_owner_gets_production_mode_not_a_silent_nothing(root: TestClient) -> None:
     """In production the refusal says so; it is not the same answer as having
     no grant, because the owner can do something about it (switch to dev)."""
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     operator = _tokens(root, a.app, name="operator")["refresh_token"]
     refused = read(root, a, operator)
     assert refused.status_code == 403
@@ -981,11 +1008,9 @@ def test_deleting_the_owner_ends_a_call_queued_for_their_site(root: TestClient) 
     """Their site goes with them, and so does what was waiting for it: the
     caller hears at once, rather than after the call's 20 s."""
     c = root
-    a = ada_with_a_folder(c)
-    a.held.summary["folders"][0]["people"] = [{"subject": a.person["id"], "writable": True}]
+    a = ada_with_a_workspace(c)
     bo, bo_token = add_person(c, a.app, "bo")
-    a.held.summary["folders"][0]["people"].append({"subject": bo["id"], "writable": False})
-    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
+    share_notes(c, a, bo["id"])
     with ThreadPoolExecutor() as pool:
         started = time.perf_counter()
         pending = pool.submit(read, c, a, bo_token)
@@ -1006,7 +1031,7 @@ def test_a_change_the_site_holds_is_202_not_a_refusal_and_names_its_people(
     the site's words, and the site is sent how this root names each person,
     for display only (J54)."""
     c = root
-    a = ada_with_a_folder(c)
+    a = ada_with_a_workspace(c)
     bo, _ = add_person(c, a.app, "bo")
     words = "Waiting for your approval on desk, at http://127.0.0.1:8079/link/approve."
     command, held = manage_through(
@@ -1015,15 +1040,20 @@ def test_a_change_the_site_holds_is_202_not_a_refusal_and_names_its_people(
         a.site,
         a.held,
         lambda: c.post(
-            f"/oidc/job-sites/{a.site}/folders/{a.folder['id']}/people",
+            f"/oidc/job-sites/{a.site}/workspaces/{a.workspace['id']}/people",
             auth=auth(a.app),
-            json={"refreshToken": a.token, "people": [{"name": "bo", "writable": False}]},
+            json={
+                "refreshToken": a.token,
+                "people": [{"name": "bo", "read": "allow", "change": "deny"}],
+            },
         ),
         lambda _: {"status": "held", "message": words},
-        action="folder.people",
+        action="workspace.people",
     )
     assert command["names"] == {bo["id"]: "bo"}
-    assert command["arguments"]["people"] == [{"subject": bo["id"], "writable": False}]
+    assert command["arguments"]["people"] == [
+        {"subject": bo["id"], "read": "allow", "change": "deny"}
+    ]
     assert held.status_code == 202, held.text
     assert held.json() == {"held": True, "message": words}
     assert held.headers["cache-control"] == "no-store"
@@ -1040,7 +1070,7 @@ def test_a_change_the_site_holds_is_202_not_a_refusal_and_names_its_people(
 
 
 def _passkey_site(c: TestClient) -> Ada:
-    a = ada_with_a_folder(c)
+    a = ada_with_a_workspace(c)
     a.held.summary["signing"] = {"state": "unconfirmed", "held": 0, "passkeys": True}
     c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
     return a
@@ -1205,28 +1235,6 @@ def test_held_changes_are_listed_and_approved_through_the_root(root: TestClient)
         json={"refreshToken": a.token},
     )
     assert bad.status_code == 422
-
-
-def test_a_site_that_does_not_take_passkeys_is_told_to_update(root: TestClient) -> None:
-    """A site older than J14a.3 would refuse the action as unreadable;
-    the root says what to do instead, and queues nothing."""
-    c = root
-    a = ada_with_a_folder(c)
-    for path, body in (
-        ("passkeys", PAIRING),
-        ("held", {}),
-        ("held/abc/reject", {}),
-        (f"passkeys/{'b' * 32}/remove", {}),
-    ):
-        answer_ = c.post(
-            f"/oidc/job-sites/{a.site}/{path}",
-            auth=auth(a.app),
-            json={"refreshToken": a.token, **body},
-        )
-        assert answer_.status_code == 503, (path, answer_.text)
-        assert "does not take passkeys yet" in answer_.text
-    polled = c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
-    assert polled.json() == {"operation": None}
 
 
 def test_only_the_sites_owner_reaches_its_passkeys(root: TestClient) -> None:

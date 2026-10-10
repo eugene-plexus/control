@@ -22,10 +22,6 @@ that reacts to a network blip by deleting configuration.
 Every node is asked **concurrently**, with a per-request timeout from
 config. Sequentially, one unreachable host in another building would
 make the whole dashboard wait for it in turn.
-
-`GET /v1/node` may 404 on an agent that predates M5. That is treated as
-"this agent has no node identity yet" rather than as an error, because
-during a rolling upgrade it is the true answer.
 """
 
 from __future__ import annotations
@@ -150,16 +146,6 @@ class NodesClient:
         try:
             body = await self._get(url, "/v1/node", token)
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 404:
-                # An agent that predates M5 has no node surface. It is
-                # reachable and supervising; it simply has nothing to
-                # say about identity yet.
-                return NodeProbe(
-                    name=name,
-                    reachable=True,
-                    last_seen_at=datetime.now(UTC).isoformat(),
-                    error="agent has no /v1/node yet",
-                )
             return NodeProbe(name=name, reachable=False, error=_describe(exc))
         except (httpx.HTTPError, ValueError) as exc:
             return NodeProbe(name=name, reachable=False, error=_describe(exc))

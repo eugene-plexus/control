@@ -164,8 +164,7 @@ async def create_person(request: Request, body: PersonCreateRequest) -> Person:
         record["displayName"] = body.displayName.strip()
     chosen = _permissions(body.permissions)
     if chosen is not None:
-        # Kept only when set: a person on the defaults carries no key, so a
-        # standby older than J77 applies their entry as it always did.
+        # Kept only when set: a person on the defaults carries no key.
         record["permissions"] = chosen
     email = _check_email(machine, body.email)
     if email:

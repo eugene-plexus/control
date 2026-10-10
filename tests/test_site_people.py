@@ -21,7 +21,7 @@ from .test_sites import (
     NODES_ORIGIN,
     Ada,
     _root,
-    ada_with_a_folder,
+    ada_with_a_workspace,
     add_person,
     answer,
     auth,
@@ -51,9 +51,8 @@ MINE = "b" * 32
 def people_site(c: TestClient) -> tuple[Ada, dict[str, Any], str]:
     """Ada's site reporting as a 2b.3b site: her `Notes` workspace shared with
     Bo to read, and Bo linked with a workspace of his own, `Mine`."""
-    a = ada_with_a_folder(c)
+    a = ada_with_a_workspace(c)
     bo, bo_token = add_person(c, a.app, "bo")
-    a.held.summary.pop("folders")
     a.held.summary["workspaces"] = [
         {
             "id": NOTES,
@@ -163,7 +162,7 @@ def test_permissions_follow_the_defaults_until_a_person_has_their_own(root: Test
 
 def test_without_add_job_sites_a_person_adds_no_machine(root: TestClient) -> None:
     c = root
-    a = ada_with_a_folder(c)
+    a = ada_with_a_workspace(c)
     assert c.patch("/v1/config", json={"siteJoinUrl": "http://192.168.1.5:8083"}).status_code == 200
     c.patch(f"/v1/people/{a.person['id']}", json={"permissions": ["use-job-sites"]})
     refused = c.post(
@@ -178,7 +177,7 @@ def test_without_add_job_sites_a_person_adds_no_machine(root: TestClient) -> Non
 
 def test_without_use_job_sites_a_person_links_nothing(root: TestClient) -> None:
     c = root
-    a = ada_with_a_folder(c)
+    a = ada_with_a_workspace(c)
     bo, _ = add_person(c, a.app, "bo")
     c.patch(f"/v1/people/{bo['id']}", json={"permissions": []})
     page = _link_authorize(c)
@@ -288,7 +287,7 @@ def test_a_linked_person_sees_only_their_own_and_the_owner_sees_none_of_it(
     assert own["workspaces"][0]["people"] == [
         {"person": bo["id"], "name": "bo", "read": "allow", "change": "deny"}
     ]
-    assert [f["name"] for f in own["folders"]] == ["Notes"] and own["folders"][0]["path"] is None
+    assert own["folders"] == []
     # Bo's workspace reaches nobody else, and Ada's list never names it.
     assert "Mine" not in str(adas)
 
@@ -343,19 +342,6 @@ def test_only_the_owner_shares_and_nobody_unlinked_reaches_a_site(root: TestClie
             f"/oidc/job-sites/{a.site}/{path}", auth=auth(a.app), json={"refreshToken": cy_token}
         )
         assert refused.status_code == 404, (path, refused.text)
-
-
-def test_a_site_from_before_keeps_no_ones_workspaces_and_says_so(root: TestClient) -> None:
-    c = root
-    a, _bo, bo_token = people_site(c)
-    a.held.summary["signing"] = {"state": "signed", "held": 0, "passkeys": True}
-    c.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
-    refused = c.post(
-        f"/oidc/job-sites/{a.site}/workspaces/list",
-        auth=auth(a.app),
-        json={"refreshToken": bo_token},
-    )
-    assert refused.status_code == 503 and "Update Eugene" in refused.text
 
 
 # --- names, asked, dev mode (J72, J76) ----------------------------------------------------

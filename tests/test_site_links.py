@@ -26,9 +26,8 @@ from .test_oidc import _challenge, _request_id
 from .test_sites import (
     NODES_ORIGIN,
     Ada,
-    Report,
     _root,
-    ada_with_a_folder,
+    ada_with_a_workspace,
     add_person,
     auth,
     join_site,
@@ -294,7 +293,7 @@ def test_the_link_pages_access_token_speaks_for_nobody_at_userinfo(root: TestCli
 
 
 def _joined(root: TestClient) -> tuple[Ada, dict[str, str]]:
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     return a, a.keys.bearer(a.site)
 
 
@@ -427,12 +426,12 @@ def _remove(c: TestClient, a: Ada, token: str, **fields: Any) -> Any:
 
 
 def _share_with(root: TestClient, a: Ada, person: dict[str, Any]) -> None:
-    a.held.summary["folders"][0]["people"] = [{"subject": person["id"], "writable": False}]
+    a.workspace["people"] = [{"subject": person["id"], "read": "allow", "change": "deny"}]
     root.post("/v1/sites/poll", headers=a.keys.bearer(a.site), json=a.held.report())
 
 
 def test_a_person_removes_their_own_link_through_the_hosting_agent(root: TestClient) -> None:
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     fake = _hosted(root, a)
     bo, bo_token = add_person(root, a.app, "bo")
     _share_with(root, a, bo)
@@ -447,7 +446,7 @@ def test_a_person_removes_their_own_link_through_the_hosting_agent(root: TestCli
 
 
 def test_a_person_cannot_remove_anothers_link_but_the_owner_can(root: TestClient) -> None:
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     fake = _hosted(root, a)
     bo, bo_token = add_person(root, a.app, "bo")
     _share_with(root, a, bo)
@@ -461,7 +460,7 @@ def test_a_person_cannot_remove_anothers_link_but_the_owner_can(root: TestClient
 
 
 def test_a_site_one_may_not_use_is_not_found(root: TestClient) -> None:
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     fake = _hosted(root, a)
     _, cy_token = add_person(root, a.app, "cy")  # no grant, no link
     assert _remove(root, a, cy_token).status_code == 404
@@ -475,7 +474,7 @@ def test_a_site_one_may_not_use_is_not_found(root: TestClient) -> None:
 
 
 def test_a_server_grant_or_a_link_is_enough_to_know_the_site(root: TestClient) -> None:
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     fake = _hosted(root, a)
     bo, bo_token = add_person(root, a.app, "bo")
     cy, cy_token = add_person(root, a.app, "cy")
@@ -488,7 +487,7 @@ def test_a_server_grant_or_a_link_is_enough_to_know_the_site(root: TestClient) -
 
 
 def test_no_hosting_node_is_a_conflict_and_an_agents_409_is_relayed(root: TestClient) -> None:
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     fake = FakeNodes()
     root.app.state.nodes_client = fake  # type: ignore[attr-defined]
     none = _remove(root, a, a.token)
@@ -505,7 +504,7 @@ def test_no_hosting_node_is_a_conflict_and_an_agents_409_is_relayed(root: TestCl
 
 
 def test_an_agent_that_does_not_answer_is_a_503(root: TestClient) -> None:
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     fake = _hosted(root, a)
     fake.raises = httpx.ConnectError("refused")
     assert _remove(root, a, a.token).status_code == 503
@@ -515,7 +514,7 @@ def test_an_agent_that_does_not_answer_is_a_503(root: TestClient) -> None:
 
 
 def test_removal_needs_the_workbench_client_and_a_live_sign_in(root: TestClient) -> None:
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     _hosted(root, a)
     no_client = root.post("/oidc/sites/link/remove", json={"refreshToken": a.token, "site": a.site})
     assert no_client.status_code == 401
@@ -526,10 +525,7 @@ def test_removal_needs_the_workbench_client_and_a_live_sign_in(root: TestClient)
 
 
 def _with_links(root: TestClient, a: Ada, bo: dict[str, Any]) -> None:
-    a.held.summary["folders"][0]["people"] = [
-        {"subject": a.person["id"], "writable": True},
-        {"subject": bo["id"], "writable": False},
-    ]
+    a.workspace["people"] = [{"subject": bo["id"], "read": "allow", "change": "deny"}]
     a.held.summary["links"] = [
         {"subject": a.person["id"], "accountName": "HOST\\ada", "available": True}
     ]
@@ -539,7 +535,7 @@ def _with_links(root: TestClient, a: Ada, bo: dict[str, Any]) -> None:
 
 
 def test_the_owners_page_carries_the_links_the_link_page_and_sharing(root: TestClient) -> None:
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     bo, _ = add_person(root, a.app, "bo")
     _with_links(root, a, bo)
     listed = root.post("/oidc/job-sites", auth=auth(a.app), json={"refreshToken": a.token})
@@ -553,7 +549,7 @@ def test_the_owners_page_carries_the_links_the_link_page_and_sharing(root: TestC
 def test_each_grant_says_whether_this_person_linked_and_as_whom_they_run(
     root: TestClient,
 ) -> None:
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     bo, bo_token = add_person(root, a.app, "bo")
     _with_links(root, a, bo)
     unlinked = root.post("/oidc/sites/servers", auth=auth(a.app), json={"refreshToken": bo_token})
@@ -578,7 +574,7 @@ def test_each_grant_says_whether_this_person_linked_and_as_whom_they_run(
 
 
 def test_an_owner_who_has_not_linked_leaves_the_account_empty(root: TestClient) -> None:
-    a = ada_with_a_folder(root)
+    a = ada_with_a_workspace(root)
     bo, bo_token = add_person(root, a.app, "bo")
     _with_links(root, a, bo)
     a.held.summary["links"] = []
@@ -587,17 +583,3 @@ def test_an_owner_who_has_not_linked_leaves_the_account_empty(root: TestClient) 
         "/oidc/sites/servers", auth=auth(a.app), json={"refreshToken": bo_token}
     ).json()["servers"]
     assert grant["linked"] is False and grant["account"] is None
-
-
-def test_an_old_report_with_no_links_still_lists(root: TestClient) -> None:
-    a = ada_with_a_folder(root)
-    assert isinstance(a.held, Report) and "links" not in a.held.summary
-    _share_with(root, a, a.person)
-    (grant,) = root.post(
-        "/oidc/sites/servers", auth=auth(a.app), json={"refreshToken": a.token}
-    ).json()["servers"]
-    assert "linked" not in grant and "account" not in grant and "linkPage" not in grant
-    (site,) = root.post("/oidc/job-sites", auth=auth(a.app), json={"refreshToken": a.token}).json()[
-        "sites"
-    ]
-    assert "links" not in site

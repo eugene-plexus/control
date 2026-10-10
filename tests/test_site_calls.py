@@ -154,15 +154,6 @@ def test_only_the_owner_takes_back_the_consent_to_commands(root: TestClient) -> 
     assert response.status_code == 204, response.text
 
 
-def test_a_site_older_than_signed_calls_says_it_needs_an_update(root: TestClient) -> None:
-    a, _, bo_token = people_site(root)
-    for path, token in (("window/close", bo_token), ("commands/withdraw", a.token)):
-        answer_ = root.post(
-            f"/oidc/job-sites/{a.site}/{path}", auth=auth(a.app), json={"refreshToken": token}
-        )
-        assert answer_.status_code == 503 and "signed calls" in answer_.text
-
-
 def test_the_site_lists_say_whether_commands_run_there(root: TestClient) -> None:
     a, _, bo_token = calls_site(root)
     mine = root.post("/oidc/job-sites", auth=auth(a.app), json={"refreshToken": a.token})

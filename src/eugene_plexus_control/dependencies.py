@@ -60,12 +60,10 @@ PUBLIC_SITES = "public-sites"
 public route for Job Sites (`public_sites`, J31), and stripped by it from
 everything else. It can only narrow what a request may do: a caller who adds
 it by hand on the LAN gets the public route's rules, never more."""
-PUBLIC_NODES = "public-nodes"
-"""What an entry point older than slice 2b.1 sets on the same route."""
 
 
 def via_public_sites(request: Request) -> bool:
-    return request.headers.get(ENTRY_HEADER, "").strip().lower() in (PUBLIC_SITES, PUBLIC_NODES)
+    return request.headers.get(ENTRY_HEADER, "").strip().lower() == PUBLIC_SITES
 
 
 def problem(status_code: int, title: str, detail: str) -> HTTPException:
