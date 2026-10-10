@@ -541,6 +541,11 @@ class BackendKind(StrEnum):
     /v1/speak` to its text-to-speech route and `POST /v1/transcribe` to
     its speech-to-text route.
 
+    `gemini_api` is Google's own Gemini API (`generateContent`, keyed by
+    `x-goog-api-key`; `docs/design/gemini-provider.md`, G1): chat,
+    embeddings, images, Veo video, speech and transcription, translated
+    both ways, with each model's capabilities from Google's own listing.
+
     """
 
     anthropic_api = 'anthropic_api'
@@ -550,6 +555,7 @@ class BackendKind(StrEnum):
     openai_compat_http = 'openai_compat_http'
     systemone_http = 'systemone_http'
     elevenlabs_http = 'elevenlabs_http'
+    gemini_api = 'gemini_api'
 
 
 class ComputeDeviceKind(StrEnum):
@@ -595,9 +601,13 @@ class EngineKind(StrEnum):
     it or tell when it is ready.
 
     `strata` is experimental. It launches Strata's Python HTTP
-    server and native engine together, using a prepared Strata JSON
-    configuration as `RuntimeSpec.modelPath`. It does not accept an
-    arbitrary GGUF or prepare model weights automatically.
+    server and native engine together, and loads a model Strata
+    prepared (`ModelFormat` `prepared`): `RuntimeSpec.modelPath`
+    names that model's provenance file (`PreparedProvenance`), whose
+    `entry` is Strata's own JSON configuration. A runtime declared
+    before LS3 may name the JSON configuration itself; that still
+    launches. It does not accept an arbitrary GGUF, and does not yet
+    prepare one itself (LS5).
 
     `kev` drives upstream `python -m kev.serve` and loads Kev
     decision checkpoints (`kev_checkpoint` format) — a decision
@@ -615,8 +625,8 @@ class EngineKind(StrEnum):
     `llama_cpp` drives upstream `llama-server` and loads GGUF.
     `vllm` drives upstream `vllm serve` and loads safetensors.
     `mlx` drives upstream `mlx_lm.server` and loads MLX-format
-    safetensors, on Apple silicon only — experimental until a
-    physical Mac run is recorded. We never ship an engine — every
+    safetensors, on Apple silicon only; not experimental since its
+    run on GitHub's macOS runners (A4, 2026-09-30). We never ship an engine — every
     one of them is an upstream project we wrap and track.
 
     They differ in far more than argv, and that is why readiness
@@ -680,19 +690,423 @@ class ModelFormat(StrEnum):
       scanner on purpose, and the decision head is what makes this
       one a launchable model instead. Decision-only —
       `ModelCapabilities.decision`, never `chat`.
+    * `prepared` — what one engine made for itself from another
+      model, in the engine's own format: Strata's expert pack,
+      lookup table and MTP helper, with its JSON configuration
+      (library-sources-and-engines.md §4.5, Troy's L6). The library
+      does not read the engine's files; a small provenance file
+      beside them, `<name>.eugene-prepared.json`
+      (`PreparedProvenance`), names the engine, its entry file and
+      what it was made from, and is the model's path. Only the
+      engine it was prepared for loads it
+      (`ModelRequirement.preparedFor`).
 
     Shared because it appears on both sides of a join: a library
-    entry declares what a model *is*, and
-    `EngineDescriptor.modelFormats` declares what an engine can
-    *load*. Nothing can serve a safetensors model until the vLLM
-    adapter lands, and that answer comes from the engine's
-    descriptor rather than from anything the library knows.
+    entry declares what a model *is*, and an engine's
+    `ModelRequirement`s declare what it can *load*. The format is
+    the first term of that join, not the whole of it
+    (library-sources-and-engines.md).
 
     """
 
     gguf = 'gguf'
     safetensors = 'safetensors'
     kev_checkpoint = 'kev_checkpoint'
+    prepared = 'prepared'
+
+
+class MlxQuantizationRule(StrEnum):
+    """
+    The one marker the library reads that decides an engine: a
+    safetensors folder whose `config.json` carries MLX's
+    quantization block packs its weights as integers only MLX reads.
+    `required`: only such a folder matches; `forbidden`: never one.
+
+    """
+
+    required = 'required'
+    forbidden = 'forbidden'
+
+
+class ModelRequirementAuthority(StrEnum):
+    """
+    Who can say a match will load. Absent means `eugene`. `eugene`:
+    the fields above are the whole rule, so a match is `runs`. `engine`: the engine decides
+    when it loads (vLLM's model registry, for one), so a match is
+    only `may_run` (Troy's L4).
+
+    """
+
+    eugene = 'eugene'
+    engine = 'engine'
+
+
+class Context(RootModel[int]):
+    root: int = Field(..., ge=1)
+
+
+class ModelPreparation(BaseModel):
+    """
+    A match that runs only after the engine prepares it (Strata builds
+    an expert pack, a lookup table and an MTP helper from a GGUF). The
+    verdict is `after_preparation`; the original file is never
+    changed.
+
+    """
+
+    recipe: str = Field(
+        ..., description="The adapter's name for the step, e.g. `strata-prepare`."
+    )
+    note: str | None = Field(None, description='What the step makes, in words.')
+    diskBytes: int | None = Field(
+        None,
+        description="About how much the preparation writes beside the files, by the\nengine's own rule on the node that reported it (LS5): set on an\nengine's `supportedModels`, where the model is known. Strata's\nsetup counts 8 GB, more when the node's RAM is short of the\nmodel's experts. The agent checks free space against it before\nthe preparation starts. Absent: not known.\n",
+        ge=0,
+    )
+    contexts: list[Context] | None = Field(
+        None,
+        description="The context sizes, in tokens, the preparation can be asked for\n(LS5): an engine that fixes the context when it prepares\noffers its own choices, and without one takes its own\nrecommendation for the node. Strata's are its setup's own.\nAbsent: the preparation takes no context.\n",
+    )
+    minEngineVersion: str | None = Field(
+        None,
+        description="The oldest version of the engine that prepares this model, as\nthe engine's own setup states it (LS7, B30): e.g. Strata's\n`v0.1.38` for UD-IQ4_XS. Absent: any version the adapter runs.\n",
+    )
+    engineTooOld: str | None = Field(
+        None,
+        description='Set by the node that reported it when its installed engine is\nolder than `minEngineVersion` (LS7, B30): the installed\nversion, so the console says *needs Strata vX: update Strata on\nthis node* before a preparation would fail halfway. Absent: the\ninstalled engine can prepare it, or none is installed.\n',
+    )
+
+
+class PreparedFile(BaseModel):
+    """
+    One file a prepared model is made of (LS7).
+    """
+
+    path: str = Field(
+        ...,
+        description='Relative to the folder holding the provenance file, with `/`.',
+        min_length=1,
+    )
+    sizeBytes: int | None = Field(None, ge=0)
+    shared: bool | None = Field(
+        False,
+        description="Used by other models the same engine prepared in this folder too\n(Strata's MTP helper): kept while any of them is.\n",
+    )
+
+
+class PreparedSource(BaseModel):
+    """
+    What a prepared model was made from, as far as it is known. Every
+    field is optional: a model adopted from outside Eugene may say
+    nothing, and "not known" is shown as such.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    path: str | None = Field(
+        None,
+        description="The source model's `LibraryModel.path`, when it is a library\nmodel. The library links the two by it (`PreparedDetail.sourceModelId`).\n",
+    )
+    repoId: str | None = Field(
+        None,
+        description='The hub repo it came from, e.g. `ISTA-DASLab/Qwen3.8-Flash-Next-GGUF`.',
+    )
+    file: str | None = Field(
+        None,
+        description='The repo-relative file, for a GGUF (its first shard when split).',
+    )
+    revision: str | None = Field(None, description='The repo commit.')
+
+
+class SupportedModel(BaseModel):
+    """
+    One model an engine's adapter publishes as supported
+    (library-sources-and-engines.md §4.4, LS4): which files on a hub,
+    and what the engine does with them. Read off the engine's own
+    documentation and setup at the version the adapter pins, never
+    written from memory. The list ships with the adapter in the agent
+    (Troy's L7, `EngineDescriptor.supportedModels`), so a new engine
+    brings its own and a node's list is the one its adapter would
+    prepare and run. A caller hands it to the library's search
+    (`EngineModelList`), which shows it as one source among the others
+    (`CatalogueSourceKind` `engine_list`).
+
+    """
+
+    id: str = Field(
+        ...,
+        description="Unique within the engine's list and stable across versions of\nit, e.g. Strata's own name for the choice (`coder-IQ1_M`).\n",
+        min_length=1,
+    )
+    title: str = Field(
+        ..., description='What to call it, e.g. `Qwen3.8-Flash-Next IQ2_XS`.'
+    )
+    about: str | None = Field(
+        None, description="The engine's own words for it, from its documentation."
+    )
+    publisher: str | None = Field(
+        None,
+        description='Who made the files, e.g. `Qwen; GSQ-RCO quants by ISTA-DASLab`.',
+    )
+    license: str | None = Field(
+        None,
+        description="When the files carry a licence of their own the person should\nread before downloading, the engine's words for it.\n",
+    )
+    format: ModelFormat
+    architecture: str | None = Field(
+        None,
+        description='As the hub reads the files (`general.architecture` for a GGUF).',
+    )
+    quantization: str | None = Field(
+        None, description="The engine's name for the size, e.g. `IQ2_XS`."
+    )
+    source: PreparedSource = Field(
+        ...,
+        description="Where the files are, all three named: `repoId`, `file` (a\nGGUF's first shard, repo-relative) and the `revision` the engine\npins. What a preparation records as its source (LS5).\n",
+    )
+    sizeBytes: int | None = Field(
+        None,
+        description='Every file of it summed, as the hub lists them at `source.revision`.',
+        ge=0,
+    )
+    preparation: ModelPreparation | None = Field(
+        None,
+        description='What the engine does to the files before it runs them, if anything.',
+    )
+    recommended: bool | None = Field(
+        False, description="The engine's own documentation recommends it."
+    )
+    experimental: bool | None = Field(
+        False, description="The engine's own documentation calls it experimental."
+    )
+
+
+class EngineModelList(BaseModel):
+    """
+    One engine's `supportedModels`, as a caller sends it to the
+    library's search (`CatalogueSearchRequest.engines`): the console the
+    picked node's, as it sends that node's `accepts` to the judge, so the
+    library calls no agent.
+
+    """
+
+    engine: EngineKind
+    models: list[SupportedModel]
+
+
+class EligibilityCandidate(BaseModel):
+    """
+    A model not in the library yet, judged by its facts
+    (library-sources-and-engines.md, LS2): a version in a catalogue
+    repo, a starter entry, or a search row. The library's catalogue
+    answers carry these ready to send back (`CatalogueCandidate.facts`,
+    `StarterModel.facts`, `CatalogueSearchResult.facts`), so a caller
+    derives nothing itself.
+
+    The same terms as a library model's, with one difference: here an
+    absent fact is *not known yet*, where on a library model it means
+    *unreadable*. A term that constrains a fact nobody knows cannot be
+    checked, so a match resting on it is at best `may_run` (an
+    `after_preparation` match stays one), its reason names what was
+    assumed, and the answer is `approximate`.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="The caller's handle for it, echoed as `ModelEligibility.modelId`.\nOpaque; unique within one request.\n",
+    )
+    format: ModelFormat
+    architecture: str | None = Field(
+        None,
+        description="GGUF's `general.architecture`, as the hub read it from the\nrepo's GGUF, or a safetensors folder's `architectures[0]`, from\nits remote `config.json`.\n",
+    )
+    quantization: str | None = Field(
+        None,
+        description="The GGUF quantization, from the file's name (the scan's own fallback).",
+    )
+    file: str | None = Field(
+        None,
+        description="The file's name without its folder: a GGUF's first shard\n(`ModelRequirement.files`, LS4). Absent: not known yet, as on a\nsearch row, which names a repo rather than a file.\n",
+    )
+    sizeBytes: int | None = Field(
+        None,
+        description="The weights' size: every file the engine loads, shards included,\nwithout a separate vision projector, as the hub lists them (LS6,\nfor an engine's fit). Absent: not known yet, as on a search row,\nand then no engine's fit is estimated for it.\n",
+        ge=0,
+    )
+    mlxQuantized: bool | None = Field(
+        None,
+        description="Whether the folder's `config.json` carries MLX's quantization\nblock (`MlxQuantizationRule`). Absent: not known.\n",
+    )
+    approximate: bool | None = Field(
+        False,
+        description="Guessed from a search row's tags and the hub's repo-level\nmetadata rather than read from one version's files: a repo can\nhold many versions, and only its detail lists them.\n",
+    )
+
+
+class EngineVerdictKind(StrEnum):
+    """
+    One model against one engine. `runs`: a requirement with authority
+    `eugene` matches. `may_run`: only the engine can tell, at load, or
+    (for an `EligibilityCandidate`) a term rests on a fact not known
+    yet. `after_preparation`: it runs once the engine prepares it.
+    `no`: no requirement matches, and `reason` says which term failed.
+
+    """
+
+    runs = 'runs'
+    may_run = 'may_run'
+    after_preparation = 'after_preparation'
+    no = 'no'
+
+
+class EligibilityLevel(StrEnum):
+    """
+    The one dot a model carries (Troy's L5, 2026-10-09), in his words:
+
+    * `works_here`: *Will work on this machine now*. An available
+      engine `runs` or `may_run` it.
+    * `other_engine`: *Will work with a different engine*. An engine
+      this node could install would run it, or an available engine
+      runs it after preparation.
+    * `not_here`: *Can not work on this machine*. No engine this
+      hardware can have accepts it, or (when the request asked for fit,
+      LS6) every engine that would run it says it does not fit
+      (`EngineFit.verdict` `no`).
+
+    An engine whose fit is `no` counts as one that cannot run the
+    model, so a model too large for llama.cpp that Strata runs after
+    preparing it is `other_engine`. A fit that is *not estimated*, or
+    `unknown`, never counts against a model: only a measured `no` does.
+
+    """
+
+    works_here = 'works_here'
+    other_engine = 'other_engine'
+    not_here = 'not_here'
+
+
+class FitModelKind(StrEnum):
+    """
+    How an engine uses memory, so its fit is its own (LS6, Troy's L11;
+    library-sources-and-engines.md §6.1). Engines differ in both
+    directions, so one engine's arithmetic is never another's answer.
+
+    * `spill` (llama.cpp): weights, the KV cache for the context and an
+      overhead allowance against the cards' free memory; what does not
+      fit moves to system memory, experts first on a mixture-of-experts
+      model (`FitOffload`). The library's arithmetic since M3.
+    * `reserved_share` (vLLM): the engine takes a share of each card's
+      **total** memory when it starts (`gpuMemoryUtilization`) and
+      refuses to start when less than that is free; weights and
+      overhead come out of the share and the KV cache must hold the
+      whole context in what is left. The model is split evenly across
+      the cards it uses (tensor parallel). Nothing spills to system
+      memory, so there is no `split`. Read off vLLM's own
+      `request_memory` (upstream main, 2026-10-09).
+    * `engine_table`: the engine's own table of what each model it runs
+      needs, applied to this node by its adapter (`EngineFitModel.table`):
+      Strata's setup's RAM figures and its low-RAM and RAM-budget modes.
+
+    """
+
+    spill = 'spill'
+    reserved_share = 'reserved_share'
+    engine_table = 'engine_table'
+
+
+class FitQuestion(BaseModel):
+    """
+    Ask the judge for each engine's fit as well (LS6): the node's
+    memory as the caller measured it (the console the picked node's
+    devices, as for `GET /v1/models/{id}/fit`), and the context to score
+    at. A sum over cards is spread evenly across `gpuCount` of them.
+
+    """
+
+    contextLength: int | None = Field(
+        None, description="Absent: the library's `guidanceContextLength`.", ge=1
+    )
+    vramFreeBytes: int | None = Field(
+        None, description="Free memory on the node's cards, summed.", ge=0
+    )
+    vramTotalBytes: int | None = Field(
+        None,
+        description="Their total memory, summed. A share-taking engine's share is of\nthis (`reserved_share`). Absent: taken as `vramFreeBytes`.\n",
+        ge=0,
+    )
+    gpuCount: int | None = Field(
+        None,
+        description='How many cards the sums cover. Absent: one when there is VRAM, none otherwise.',
+        ge=0,
+    )
+    ramAvailableBytes: int | None = Field(None, ge=0)
+    ramTotalBytes: int | None = Field(None, ge=0)
+    unifiedMemory: bool | None = Field(
+        None,
+        description='One pool shared with system memory (`MemoryBudget.unifiedMemory`).',
+    )
+
+
+class FitVerdict(StrEnum):
+    """
+    Lives here since LS6, because an engine's fit (`EngineFit`) uses it
+    as well as the library's `Fit`. For a `spill` engine:
+
+    * `fits` — inside **free** VRAM. Fully offloaded, no host memory
+      in the generation path.
+    * `tight` — inside total VRAM but not free VRAM. It would fit on
+      an idle GPU; something is holding memory right now, and
+      closing it is the operator's call.
+    * `split` — needs host memory as well. Runnable with partial
+      offload, and a decision rather than a failure. How much slower
+      depends on what moves, which `Fit.offload` says: experts (a
+      MoE model, little slower) or whole layers (much slower).
+    * `no` — larger than VRAM and RAM together.
+    * `unknown` — there is a GPU here and we could not read how much
+      memory it has, so no comparison against it can be made. Added
+      2026-09-18 (roadmap R2.3, review §6.2 #28) because the
+      alternative was worse than silence: `_intel_gpus` reports
+      `vramTotalBytes: 0` for a card whose size `xpu-smi` will not
+      state, the verdict then took the *no accelerator* branch,
+      compared the weights against host memory, and told a 16 GB Arc
+      owner that a 30 GB model **fits** — with `gpuCount: 1` printed
+      beside it. Wrong in the direction that runs out of memory at
+      load.
+
+      It is a property of the machine and not of the model, so every
+      candidate on such a host reports it, including small ones: a
+      favourable answer computed against a number we do not have is
+      right by luck.
+
+    For a `reserved_share` engine: `fits` when the model and the
+    context's cache fit its share and the share is free; `tight` when
+    they fit the share but less than the share is free now (the engine
+    refuses to start until it is); `no` when they do not fit the share.
+    Never `split`.
+
+    For an `engine_table` engine, the engine's own words map onto these:
+    Strata's *fits* and RAM-budget mode are `fits`; its low-RAM mode
+    (part of the experts on the card, the rest from the SSD) is `split`;
+    *tight* (a few GB short, so the system pages) is `tight`; *does not
+    fit* is `no`; a node with no graphics card it can read is `unknown`.
+
+    Five values rather than a percentage because a percentage of
+    *what* — VRAM, or VRAM plus RAM? — is precisely the ambiguity
+    the operator is trying to resolve, and because they have
+    different advice. `tight` and `split` are the two the field
+    usually collapses into "won't fit", and they are the two worth
+    naming.
+
+    """
+
+    fits = 'fits'
+    tight = 'tight'
+    split = 'split'
+    no = 'no'
+    unknown = 'unknown'
 
 
 class RetryDisposition(StrEnum):
@@ -882,6 +1296,19 @@ class ConfigValueType(StrEnum):
     to open a directory picker or an address field. UIs render it as
     an add/remove list of text fields.
 
+    `catalogue_sources` (LS4, 2026-10-09) is an ordered JSON array of
+    the library's `CatalogueSource` — `{"id", "kind", "label",
+    "enabled", "address", "token", "engine"}`: where Discover finds
+    models (library-sources-and-engines.md §4.4). Its one user is the
+    library's `catalogueSources`, which replaced the single hub
+    address and token. Like `share_credentials`, entries hold a
+    secret: an `hf_hub` entry's `token` is redacted in `GET` (as
+    `null`, with `hasToken` saying whether one is stored), accepted in
+    `PATCH`, and an entry that omits it keeps the token stored under
+    the same `id`; `""` clears it. UIs render it as rows of a source,
+    with the token a password input, and must not display a redacted
+    token as though none were stored.
+
     """
 
     string = 'string'
@@ -902,6 +1329,7 @@ class ConfigValueType(StrEnum):
     library_folders = 'library_folders'
     share_credentials = 'share_credentials'
     string_list = 'string_list'
+    catalogue_sources = 'catalogue_sources'
 
 
 class ConfigFieldStatusLevel(StrEnum):
@@ -1607,23 +2035,10 @@ class UpdateChannelSource(StrEnum):
     install's environment names (`EUGENE_PLEXUS_AGENT_DEFAULT_UPDATE_CHANNEL`,
     which the `:edge` container image sets to `edge`).
 
-    `pending`: an install from before 2026-09-30 that never saved a
-    channel, whose first update check since has not yet read the
-    release list. That check saves the channel the machine followed
-    until then -- `releases` when its commits are exactly one of the
-    recent releases, `edge` otherwise -- so updating the agent never
-    moves a machine to another channel. `channel` is absent meanwhile.
-
-    `inferred`: sent only by agents before 2026-09-30, which worked an
-    unset channel out afresh at every check. Kept so a console can
-    still read one.
-
     """
 
     setting = 'setting'
     default = 'default'
-    pending = 'pending'
-    inferred = 'inferred'
 
 
 class UpdateOutcome(StrEnum):
@@ -2052,23 +2467,6 @@ class ClientKeyPolicy(BaseModel):
     keys: list[ClientKeyPolicyEntry]
 
 
-class ClientKeyRevocations(BaseModel):
-    """
-    What the gateway polls. Ids only, and the revision at which the
-    set last changed.
-
-    """
-
-    ids: list[str] = Field(
-        ...,
-        description='`jti`s to refuse. Excludes keys whose `expiresAt` has passed:\nthose are refused by expiry, and keeping them here would\nmake this list grow forever.\n',
-    )
-    revision: int = Field(
-        ...,
-        description='Increments whenever the set changes. A reader logs on a\nchange rather than on every poll.\n',
-    )
-
-
 class AuthInitializeRequest(BaseModel):
     passphrase: SecretStr = Field(
         ...,
@@ -2477,6 +2875,14 @@ class LoadProgress(BaseModel):
     )
 
 
+class PreparedInspectRequest(BaseModel):
+    entry: str = Field(
+        ...,
+        description="The engine's entry file, as the Library spells it (a path in a\nLibrary folder); the agent reaches it through this node's path\nmappings.\n",
+        min_length=1,
+    )
+
+
 class CopyProgress(BaseModel):
     """
     How far into copying a model file to this node's own disk the
@@ -2494,10 +2900,14 @@ class CopyProgress(BaseModel):
     would make every consumer invent the distinction, and this
     project has already paid for that once.
 
-    It reports the copy of ONE model file — the file this runtime
-    points at. Several runtimes over one file (M6 replicas) copy it
-    once, so the second and third report the same copy while it runs
-    and none of them afterwards.
+    It reports the copy of one model: every file the runtime's model
+    is made of (LS7, agent#12 and #10): a GGUF with all its shards, or
+    a prepared model's set (its provenance file, the engine's
+    configuration and every file that names, the source GGUF's shards
+    included), each kept at its place relative to its Library folder.
+    `bytesCopied` and `totalBytes` count the whole set. Several runtimes
+    over one model (M6 replicas) copy it once, so the second and third
+    report the same copy while it runs and none of them afterwards.
 
     """
 
@@ -2514,7 +2924,13 @@ class CopyProgress(BaseModel):
     )
     destination: str | None = Field(
         None,
-        description='Where the copy is being written, on this host. Reported\nbecause the operator picked the directory and the commonest\nquestion about a long copy is which disk is filling up.\n\nThis is the **final** path, not the temporary name the bytes\nare actually landing in: a partial copy never carries the\nname an engine would open (§3.3 of the design), and naming\nthe temp file here would invite someone to go looking for a\nfile that exists only until the rename.\n',
+        description="Where the copy is being written, on this host. Reported\nbecause the operator picked the directory and the commonest\nquestion about a long copy is which disk is filling up.\n\nThis is the **final** path, not the temporary name the bytes\nare actually landing in: a partial copy never carries the\nname an engine would open (§3.3 of the design), and naming\nthe temp file here would invite someone to go looking for a\nfile that exists only until the rename. For a set, the file the\nruntime opens (a GGUF's first shard, a prepared model's\nprovenance file).\n",
+    )
+    files: int | None = Field(
+        None, description="How many files the model's copy is made of (LS7).", ge=1
+    )
+    filesCopied: int | None = Field(
+        None, description="How many of them are whole on this node's disk so far.", ge=0
     )
 
 
@@ -2723,6 +3139,17 @@ class AdmissionFit(StrEnum):
     call A). `no` refuses. `unknown` admits with a warning: a verdict
     from a budget that could not be measured is worse than none.
 
+    **By the engine's own fit model (LS6, `EngineDescriptor.fit`).**
+    llama.cpp as above. vLLM (`reserved_share`): it takes its share of
+    each card it uses and refuses to start when less than that is free,
+    so `tight` refuses whatever `gpuLayers` says, and there is no
+    `split`; its context is `maxModelLen`. Strata (`engine_table`): its
+    setup's answer for the model on this node (`no` and `tight`
+    refuse, its low-RAM mode is `split` and admits), and `tight` too
+    when the RAM free now is short of the experts it keeps there. An
+    engine with no fit model (MLX, Kev) is `unknown`: never another
+    engine's arithmetic in its place.
+
     """
 
     fits = 'fits'
@@ -2741,11 +3168,16 @@ class AdmissionBasis(StrEnum):
     * `file_size` — the model file's size plus a fixed allowance.
       What an agent with no library reachable can measure on its
       own, said out loud rather than dressed up.
+    * `engine_table` — the engine's own table for the model on this
+      node (Strata's setup's RAM figures, LS6), not bytes this node
+      computed. `requiredBytes` is then the card's free memory,
+      which Strata fills with its expert cache.
 
     """
 
     metadata = 'metadata'
     file_size = 'file_size'
+    engine_table = 'engine_table'
 
 
 class AdmissionBlocker(BaseModel):
@@ -3230,6 +3662,179 @@ class ComputeDevice(BaseModel):
     )
 
 
+class ModelRequirement(BaseModel):
+    """
+    One kind of model an engine loads, declared by its adapter
+    (`EngineDescriptor.accepts`) and judged by the library
+    (`POST /v1/eligibility`). Data, not code (Troy's L3, 2026-10-09):
+    a model meets a requirement when every field present matches;
+    an absent field matches anything.
+
+    An engine lists several when it loads several kinds: MLX loads
+    an MLX-quantized folder outright, and a plain Hugging Face folder
+    only if mlx-lm knows its architecture, which only a load can
+    tell (`authority: engine`).
+
+    """
+
+    format: ModelFormat
+    architectures: list[str] | None = Field(
+        None,
+        description="The model's `architecture` must be one of these: GGUF's\n`general.architecture`, or a safetensors folder's\n`architectures[0]`. Absent means any. Can be long: llama.cpp\ndeclares every architecture its installed build knows.\n",
+    )
+    quantizations: list[str] | None = Field(
+        None,
+        description='The GGUF quantization must be one of these. Absent means any.',
+    )
+    files: list[str] | None = Field(
+        None,
+        description="The model's file must have one of these names: a GGUF's first\nshard, as the hub and the disk both name it, without its\nfolder. Absent means any. For an engine that runs only the files\nit names (LS4): Strata's own setup accepts a GGUF by its name\nand refuses every other one of the same architecture, so its\nadapter fills this from its `supportedModels`, and a Flash-Next\nK-quant from another publisher is `no`, naming the list.\n",
+    )
+    mlxQuantization: MlxQuantizationRule | None = None
+    preparedFor: EngineKind | None = Field(
+        None,
+        description="For `format: prepared` only: the engine a prepared model must\nhave been prepared for (`PreparedProvenance.engine`). Absent:\nthe engine declaring this requirement. A prepared model never\nmeets a requirement of an engine it was not prepared for,\nsince its files are in that engine's own format.\n",
+    )
+    preparation: ModelPreparation | None = None
+    authority: ModelRequirementAuthority | None = None
+    preference: int | None = Field(
+        100,
+        description="Among the engines that run a model, lower is offered first and\nis what Run picks, unless the person has chosen a default\nengine for the format (Troy's L10).\n",
+    )
+    note: str | None = Field(
+        None,
+        description='Words for the person beside a match, in the engine\'s own terms:\n"vLLM checks the architecture when it loads".\n',
+    )
+
+
+class PreparedProvenance(BaseModel):
+    """
+    The file `<name>.eugene-prepared.json` that makes an engine's
+    prepared files a library model (`ModelFormat` `prepared`;
+    library-sources-and-engines.md §4.5, Troy's L6). A plain JSON
+    file in a Library folder, in the person's own layout like every
+    other model file, and the prepared model's `LibraryModel.path`.
+
+    Written by the library's `POST /v1/models/prepared` when a person
+    adopts a model prepared outside Eugene, and by a preparation job
+    (LS5). Read by the library's scan, which lists a `prepared` model
+    from it, and by the agent at every launch, which hands the engine
+    its entry file. Nothing reads the engine's own files beyond what
+    launching them needs: they stay usable without the library
+    parsing them (experimental-engines.md).
+
+    A reader keeps and ignores fields it does not know, so a newer
+    Eugene can add some; a `formatVersion` above the one it knows
+    means the file was written by a newer Eugene, and the model is
+    listed as unreadable rather than guessed at.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    formatVersion: int | None = Field(
+        None,
+        description='The layout of this file. Absent means 1, the only one so far.',
+        ge=1,
+    )
+    engine: EngineKind = Field(
+        ..., description='The engine it was prepared for. Only that engine loads it.'
+    )
+    entry: str = Field(
+        ...,
+        description="The engine's own entry file: for Strata, its JSON\nconfiguration, which names the pack, tokenizer and MTP files.\nRelative to the folder holding this file, or absolute. A\nrelative entry travels with the folder (through a node's\n`pathMappings`, like any model path); an absolute one is a\npath on the node that runs the model, used as written,\nbecause an engine's prepared files belong on that node's own\nfast drive.\n",
+        min_length=1,
+    )
+    recipe: str | None = Field(
+        None,
+        description='The preparation that made it (`ModelPreparation.recipe`, e.g.\n`strata-prepare`). Absent: it was made outside Eugene and\nadopted as it is.\n',
+    )
+    recipeVersion: str | None = Field(
+        None,
+        description="The recipe's or engine's version that made it, e.g. Strata `v0.1.39`.",
+    )
+    source: PreparedSource | None = None
+    preparedAt: AwareDatetime | None = Field(
+        None, description='When this file was written.'
+    )
+    title: str | None = Field(
+        None,
+        description="What it is, in the engine's list's words when it came from the\nlist (`SupportedModel.title`), e.g. `Qwen3.8-Flash-Next IQ2_XS`\n(LS7, B22 replaced).\n",
+    )
+    architecture: str | None = Field(
+        None,
+        description='The architecture of the model it was made from, as the hub or\nthe source file read it (`qwen4exp`): kept for when the source\nmodel is no longer in the Library.\n',
+    )
+    quantization: str | None = Field(
+        None,
+        description="The engine's name for the size it was made from, e.g. `IQ2_XS`.",
+    )
+    contextLength: int | None = Field(
+        None,
+        description="The context, in tokens, it was prepared for: an engine that fixes\nthe context when it prepares (Strata's `--max-context`).\n",
+        ge=1,
+    )
+    mode: str | None = Field(
+        None,
+        description="How the engine runs it on the node that prepared it, in the\nengine's own words (Strata: *every expert in RAM*, *a RAM budget\nof its experts, the rest from the SSD*, *the low-RAM mode*).\n",
+    )
+    files: list[PreparedFile] | None = Field(
+        None,
+        description="Every file the model is made of beside its source model and\nthis provenance file, the entry first, as the engine's adapter\nread them off its entry file: what is the model's own on disk.\nThe source model's files are its own model's, not listed.\n",
+    )
+
+
+class EngineFit(BaseModel):
+    """
+    One engine's answer to *does it fit in this node's memory*, by that
+    engine's own fit model (LS6, Troy's L11). Shown with the engine's
+    name beside it; the library's detailed arithmetic for a library
+    model is `GET /v1/models/{id}/fit` with the same `fitModel`.
+
+    """
+
+    estimated: bool = Field(
+        ...,
+        description="False: *Fit not estimated*. The engine declares no fit model, its\ntable has no row for this model, or the model's size is not known\nyet. Never counts against the model.\n",
+    )
+    verdict: FitVerdict | None = Field(None, description='Present when `estimated`.')
+    model: FitModelKind | None = None
+    reason: str = Field(
+        ...,
+        description="The answer in words, in the engine's own terms: what it needs and\nwhat this node has, or why there is no estimate.\n",
+    )
+    requiredBytes: int | None = Field(
+        None,
+        description='`spill` and `reserved_share`: the weights, the KV cache at\n`contextLength` and the overhead allowance, on the cards.\n',
+        ge=0,
+    )
+    shareBytes: int | None = Field(
+        None,
+        description="`reserved_share`: what the engine takes, its share of the cards'\ntotal memory summed.\n",
+        ge=0,
+    )
+    ramBytes: int | None = Field(
+        None,
+        description="`engine_table`: the system memory the engine's own table asks for\n(Strata's setup's `ram_gb`, in its GB of 2^30 bytes).\n",
+        ge=0,
+    )
+    contextLength: int | None = Field(
+        None,
+        description="The context this answer is for. Absent where the engine's table does not depend on it.",
+        ge=1,
+    )
+    maxContextLength: int | None = Field(
+        None,
+        description='`spill`: the longest context that fits in free memory;\n`reserved_share`: the longest the KV cache in the share holds.\n',
+        ge=0,
+    )
+    approximate: bool | None = Field(
+        False,
+        description='The KV cache was a rough share of the weights (no layer\nmetadata), or the facts were a guess: as `Fit.basis` `estimate`.\n',
+    )
+
+
 class ConfigFieldStatus(BaseModel):
     """
     One sentence about what a field's value is doing on this machine
@@ -3464,7 +4069,7 @@ class RuntimeSpec(BaseModel):
     engine: EngineKind
     modelPath: str = Field(
         ...,
-        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor `strata`, this is a prepared Strata JSON configuration\nin a Library folder on the target node. It references the\nexisting weights, pack, tokenizer and optional MTP assets.\nIt is not copied into the node's model cache. The adapter\nwrites a private launch config and preserves this original.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n\n**When the library is on another host, this is still the\nlibrary's spelling** (M11). The node resolves where the same\nfile is on its own disk through the Library folder's\n`mounts` and its own `pathMappings` overrides, at every\nspawn and never onto this field — so the declaration keeps\nlinking to its library entry (`GET /v1/models?path=` is keyed\nto the library's own path), and a changed mapping takes\neffect at the next start with nothing re-declared. What was\nactually opened is reported as `Runtime.localPath`.\n",
+        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor `strata`, this is a prepared model's provenance file\n(`<name>.eugene-prepared.json`, `PreparedProvenance`), the\n`path` of a `prepared` library model; at every launch the\nagent reads it and resolves its `entry`, Strata's JSON\nconfiguration, which references the existing weights, pack,\ntokenizer and optional MTP assets. A declaration from before\nLS3 may name that JSON configuration directly, and still\nlaunches. Neither is copied into the node's model cache. The\nadapter writes a private launch config and preserves the\noriginals.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n\n**When the library is on another host, this is still the\nlibrary's spelling** (M11). The node resolves where the same\nfile is on its own disk through the Library folder's\n`mounts` and its own `pathMappings` overrides, at every\nspawn and never onto this field — so the declaration keeps\nlinking to its library entry (`GET /v1/models?path=` is keyed\nto the library's own path), and a changed mapping takes\neffect at the next start with nothing re-declared. What was\nactually opened is reported as `Runtime.localPath`.\n",
     )
     modelAlias: str | None = Field(
         None,
@@ -4120,6 +4725,60 @@ class ChatLogprobs(BaseModel):
     refusal: list[ChatTokenLogprob] | None = None
 
 
+class EngineVerdict(BaseModel):
+    engine: EngineKind
+    verdict: EngineVerdictKind
+    available: bool
+    installable: bool | None = False
+    experimental: bool | None = False
+    reason: str = Field(
+        ..., description='The verdict in words, naming the term that decided it.'
+    )
+    preparation: ModelPreparation | None = None
+    preference: int | None = Field(
+        None, description='From the requirement that matched; absent on `no`.'
+    )
+    fit: EngineFit | None = Field(
+        None,
+        description="This engine's fit on the node, by its own fit model (LS6).\nPresent when the request carried `fit` and the verdict is not\n`no`.\n",
+    )
+
+
+class ModelEligibility(BaseModel):
+    modelId: str = Field(
+        ..., description="A library model's id, or an `EligibilityCandidate`'s `id`."
+    )
+    level: EligibilityLevel
+    approximate: bool | None = Field(
+        False,
+        description='The facts were a guess (`EligibilityCandidate.approximate`), or\na term could not be checked. Said beside the dot, never hidden.\n',
+    )
+    engines: list[EngineVerdict] = Field(
+        ...,
+        description='Every engine sent, best first: available before not, then\n`runs`, `may_run`, `after_preparation`, `no`, then\n`preference`. The first available `runs` or `may_run` is what\nRun would pick when the person has set no default.\n',
+    )
+
+
+class EligibilityList(BaseModel):
+    models: list[ModelEligibility]
+
+
+class EngineTableFit(BaseModel):
+    """
+    One row of an engine's own fit table, as its adapter applied it to one node.
+    """
+
+    file: str = Field(
+        ...,
+        description="The model's file as `ModelRequirement.files` names it: a GGUF's\nfirst shard, without its folder, compared ignoring case. A\nprepared model is matched by the file it was made from\n(`PreparedSource.file`).\n",
+        min_length=1,
+    )
+    supportedModel: str | None = Field(
+        None, description='The `SupportedModel.id` this row is for.'
+    )
+    fit: EngineFit
+
+
 class ConfigField(BaseModel):
     """
     UI-renderable description of a single editable config field.
@@ -4322,10 +4981,7 @@ class NodeUpdate(BaseModel):
     """
 
     enabled: bool
-    channel: UpdateChannel | None = Field(
-        None,
-        description='The channel this machine follows. Absent only while\n`channelSource` is `pending`: which one it follows has not been\ndecided yet, and a value here would be a guess.\n',
-    )
+    channel: UpdateChannel = Field(..., description='The channel this machine follows.')
     channelSource: UpdateChannelSource
     checkedAt: AwareDatetime | None = None
     error: str | None = Field(
@@ -4420,49 +5076,6 @@ class NodeReachResult(BaseModel):
     )
 
 
-class EngineDescriptor(BaseModel):
-    """
-    One engine adapter, plus what the agent found on this host.
-
-    """
-
-    engine: EngineKind
-    available: bool = Field(
-        ...,
-        description='True iff a usable binary was found and successfully\nversion-probed. When false, `error` says why and runtimes\nfor this engine will fail to spawn.\n',
-    )
-    modelFormats: list[ModelFormat] = Field(
-        ...,
-        description="On-disk model formats this adapter's engine can load. A\nproperty of the engine, not of this host — it does not\nchange with `available`.\n\nThis is the engine half of a join the UI performs: the\nlibrary reports what format each model *is*, and this\nreports what each engine can *load*. `llama_cpp` lists\n`gguf`; `vllm` lists `safetensors`. Between them the UI can\ngrey out a launch button and name the missing engine instead\nof offering one that fails.\n\n`strata` lists no catalogue model formats: it requires a\nprepared JSON configuration and is offered through the\nexperimental prepared-model form, not arbitrary GGUF launch.\n\n`vllm` does **not** list `gguf`, though upstream has a path\nfor it. That path is documented as highly experimental and\nunder-optimized, and it needs a second `--tokenizer` model\nbecause converting a GGUF tokenizer is unstable — so\nclaiming the format would light up a launch button across\nthe whole GGUF population llama.cpp already serves properly.\n\nA format match is a *first* filter and not a promise. It says\nthe engine can load this kind of file, not that it can load\nthis model: vLLM's model registry is the authority on\narchitectures and it answers only at spawn. The second\nfilter is therefore the engine's own failure, surfaced\nverbatim through `Runtime.lastError`. No architecture list is\ncopied in here, for the same reason the formats are not\ncopied into the library.\n\nIt lives here because engine knowledge lives here. Putting\nformat support on the library would give the library a copy\nof it, and the copy would be the one that went stale.\n",
-    )
-    experimental: bool | None = Field(
-        False,
-        description='Limited integration and support, including niche engines\nwhose capabilities and upstream interfaces change quickly.\nIndependent of hardware test status: a successful hardware\ntest does not automatically remove this designation.\nExperimental engines remain visible on supported hosts.\n',
-    )
-    binaryPath: str | None = Field(
-        None, description='Absolute path to the binary the adapter would spawn.'
-    )
-    version: str | None = Field(
-        None,
-        description="What is running, so an operator can tell what they actually\nhave and so a flag that stopped working after an upgrade is\ndiagnosable. For llama.cpp, the build number as the binary\nreports it.\n\n**Not necessarily obtained by running the engine.** For a\nPython-package engine the version is read from the installed\ndistribution's metadata instead: vLLM exposes it through a\nCLI flag whose module import chain loads PyTorch first, and\npaying that to render a settings panel is not acceptable.\nSame trade the managed store already makes for llama.cpp,\nwhere the recorded build number is returned rather than\nre-probed.\n",
-    )
-    origin: Origin | None = Field(
-        None,
-        description="Where the binary came from. Discovery precedence is an\nexplicit `binary` on the runtime, then `configured`, then\n`managed`, then `PATH`.\n\n* `managed` — fetched and verified by us. Only ever set for\n  an engine with `acquisition.policy: managed`.\n* `configured` — an explicit path the operator set. Two\n  sources: a `binary` on one runtime, for someone who builds\n  llama.cpp themselves or wants a specific build for one\n  model; or an install-wide path in the agent's own\n  config, which is how an engine we never manage becomes\n  discoverable at all. Without the second, an operator with\n  a perfectly good vLLM venv would read as unavailable\n  unless they put it on `PATH` or repeated the path on every\n  runtime.\n* `path` — found on `PATH`.\n",
-    )
-    flagSchema: ConfigSchema | None = Field(
-        None,
-        description='The **curated** flag surface for this engine, as a standard\n`ConfigSchema` so the generic config editor renders it with\nno engine-specific UI code.\n\nCurated, not complete: `llama-server` has hundreds of flags\nand exposing them wholesale would produce a form nobody can\nuse. What is here is what a person actually turns —\ncontext size, GPU layers, batch size, parallel slots, flash\nattention. Anything omitted is still reachable through\n`RuntimeSpec.extraArgs`.\n',
-    )
-    error: str | None = Field(None, description='Populated when `available: false`.')
-    managed: ManagedEngine | None = None
-    acquisition: EngineAcquisition | None = None
-    python: PythonEngine | None = Field(
-        None,
-        description='Present when this engine is a Python package rather than a\nself-contained binary, describing the environment it lives\nin. Absent for llama.cpp.\n',
-    )
-
-
 class RuntimeList(BaseModel):
     runtimes: list[Runtime]
 
@@ -4491,6 +5104,30 @@ class LibraryFolderReach(BaseModel):
         description='Why the library could not be read on this call, when\n`libraryConsulted` is false, in the words of what failed: the\ninstall lookup (for instance a control host registered at a\nloopback address), the library\'s own refusal, or the\nconnection. Absent when the library answered.\n\nOn the wire because the failure is otherwise silent where it\nmatters: a worker that cannot read the folders applies no\nfolder\'s mount, and its launch is refused as "nothing exists\nat" the Library\'s own path — the mount the operator already\nset is never mentioned (2026-09-27, the live install).\n',
     )
     folders: list[LibraryFolderStatus]
+
+
+class EngineFitModel(BaseModel):
+    """
+    How one engine uses memory, declared by its adapter beside `accepts`
+    (`EngineDescriptor.fit`; LS6, Troy's L11: data where it can be). The
+    library applies it (`POST /v1/eligibility` with `fit`,
+    `GET /v1/models/{id}/fit` with `fitModel`). An engine that declares
+    none has its fit *not estimated*, never another engine's number in
+    its place.
+
+    """
+
+    kind: FitModelKind
+    gpuMemoryUtilization: float | None = Field(
+        None,
+        description="`reserved_share`: the share of each card's total memory the\nengine takes when a launch sets none, its own default (vLLM's is\n0.92 on upstream main; it was 0.9 before).\n",
+        gt=0.0,
+        le=1.0,
+    )
+    table: list[EngineTableFit] | None = Field(
+        None,
+        description="`engine_table`: the engine's answer for each model it runs, on\nthe node that reported it.\n",
+    )
 
 
 class NodeIdentity(BaseModel):
@@ -4595,8 +5232,59 @@ class UnenrollResult(BaseModel):
     )
 
 
-class EngineList(BaseModel):
-    engines: list[EngineDescriptor]
+class EngineDescriptor(BaseModel):
+    """
+    One engine adapter, plus what the agent found on this host.
+
+    """
+
+    engine: EngineKind
+    available: bool = Field(
+        ...,
+        description='True iff a usable binary was found and successfully\nversion-probed. When false, `error` says why and runtimes\nfor this engine will fail to spawn.\n',
+    )
+    modelFormats: list[ModelFormat] = Field(
+        ...,
+        description="On-disk model formats this adapter's engine can load. A\nproperty of the engine, not of this host — it does not\nchange with `available`.\n\nThis is the engine half of a join the UI performs: the\nlibrary reports what format each model *is*, and this\nreports what each engine can *load*. `llama_cpp` lists\n`gguf`; `vllm` lists `safetensors`. Between them the UI can\ngrey out a launch button and name the missing engine instead\nof offering one that fails.\n\n`strata` lists only `prepared`: it loads models it prepared,\nnever an arbitrary GGUF, so a console that knows no\n`prepared` model offers it for none.\n\n`vllm` does **not** list `gguf`, though upstream has a path\nfor it. That path is documented as highly experimental and\nunder-optimized, and it needs a second `--tokenizer` model\nbecause converting a GGUF tokenizer is unstable — so\nclaiming the format would light up a launch button across\nthe whole GGUF population llama.cpp already serves properly.\n\nA format match is a *first* filter and not a promise. It says\nthe engine can load this kind of file, not that it can load\nthis model: vLLM's model registry is the authority on\narchitectures and it answers only at spawn. The second\nfilter is therefore the engine's own failure, surfaced\nverbatim through `Runtime.lastError`. No architecture list is\ncopied in here, for the same reason the formats are not\ncopied into the library.\n\nIt lives here because engine knowledge lives here. Putting\nformat support on the library would give the library a copy\nof it, and the copy would be the one that went stale.\n\nIt is the formats of the requirements in `accepts` that need\nno preparation, a summary for a page that only says which\nformats run here (Home); what a model needs is judged from\n`accepts` (LS1).\n",
+    )
+    accepts: list[ModelRequirement] | None = Field(
+        None,
+        description="What this engine loads, as data the library judges\n(`POST /v1/eligibility`; library-sources-and-engines.md, LS1).\nFiner than `modelFormats`: the MLX marker, architectures, a\npreparation step, and whether only the engine can tell. A\nproperty of the engine, and for llama.cpp of its build: the\narchitectures its installed build knows, read from upstream's\nsource at that build's tag once and kept; until then, or for\na build not installed, the list Eugene ships with *may run*\nfor the rest (LS2).\n",
+    )
+    supportedModels: list[SupportedModel] | None = Field(
+        None,
+        description="The models this adapter publishes as supported (LS4,\nlibrary-sources-and-engines.md §4.4): each names its files on a\nhub at a pinned revision, and the preparation they need. A\nproperty of the adapter, not of this host: listed whether or\nnot the engine is installed, so Discover can show what an\nengine would run before it is. Read off the engine's own setup\nat the version the adapter pins (Strata v0.1.39: nine choices).\nEmpty for an engine that loads whatever its requirements\naccept. The console sends it to the library's search\n(`POST /v1/catalogue/search`), which lists it as a source.\n",
+    )
+    fit: EngineFitModel | None = Field(
+        None,
+        description="How this engine uses memory (LS6, Troy's L11), beside `accepts`:\nllama.cpp `spill`, vLLM `reserved_share` with its default share,\nStrata `engine_table` with its setup's answer for each model on\nthis node's RAM and card. The console sends it to the library's\njudge (`EligibilityEngine.fit`), and admission measures a launch\nby it. Absent (MLX, Kev): the engine has no fit model, its fit is\n*not estimated*, and admission admits on faith.\n",
+    )
+    experimental: bool | None = Field(
+        False,
+        description='Limited integration and support, including niche engines\nwhose capabilities and upstream interfaces change quickly.\nIndependent of hardware test status: a successful hardware\ntest does not automatically remove this designation.\nExperimental engines remain visible on supported hosts.\n',
+    )
+    binaryPath: str | None = Field(
+        None, description='Absolute path to the binary the adapter would spawn.'
+    )
+    version: str | None = Field(
+        None,
+        description="What is running, so an operator can tell what they actually\nhave and so a flag that stopped working after an upgrade is\ndiagnosable. For llama.cpp, the build number as the binary\nreports it.\n\n**Not necessarily obtained by running the engine.** For a\nPython-package engine the version is read from the installed\ndistribution's metadata instead: vLLM exposes it through a\nCLI flag whose module import chain loads PyTorch first, and\npaying that to render a settings panel is not acceptable.\nSame trade the managed store already makes for llama.cpp,\nwhere the recorded build number is returned rather than\nre-probed.\n",
+    )
+    origin: Origin | None = Field(
+        None,
+        description="Where the binary came from. Discovery precedence is an\nexplicit `binary` on the runtime, then `configured`, then\n`managed`, then `PATH`.\n\n* `managed` — fetched and verified by us. Only ever set for\n  an engine with `acquisition.policy: managed`.\n* `configured` — an explicit path the operator set. Two\n  sources: a `binary` on one runtime, for someone who builds\n  llama.cpp themselves or wants a specific build for one\n  model; or an install-wide path in the agent's own\n  config, which is how an engine we never manage becomes\n  discoverable at all. Without the second, an operator with\n  a perfectly good vLLM venv would read as unavailable\n  unless they put it on `PATH` or repeated the path on every\n  runtime.\n* `path` — found on `PATH`.\n",
+    )
+    flagSchema: ConfigSchema | None = Field(
+        None,
+        description='The **curated** flag surface for this engine, as a standard\n`ConfigSchema` so the generic config editor renders it with\nno engine-specific UI code.\n\nCurated, not complete: `llama-server` has hundreds of flags\nand exposing them wholesale would produce a form nobody can\nuse. What is here is what a person actually turns —\ncontext size, GPU layers, batch size, parallel slots, flash\nattention. Anything omitted is still reachable through\n`RuntimeSpec.extraArgs`.\n',
+    )
+    error: str | None = Field(None, description='Populated when `available: false`.')
+    managed: ManagedEngine | None = None
+    acquisition: EngineAcquisition | None = None
+    python: PythonEngine | None = Field(
+        None,
+        description='Present when this engine is a Python package rather than a\nself-contained binary, describing the environment it lives\nin. Absent for llama.cpp.\n',
+    )
 
 
 class MessageContent1(
@@ -4613,6 +5301,49 @@ class MessageContent1(
         description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
         min_length=1,
     )
+
+
+class EligibilityEngine(BaseModel):
+    """
+    One engine as a node reported it, sent to the library to be judged
+    against. The caller sends what it holds (the console the picked
+    node's `GET /v1/engines`, the agent its own) so the library needs
+    no call to any agent.
+
+    """
+
+    engine: EngineKind
+    available: bool = Field(..., description='Installed and usable on that node now.')
+    installable: bool | None = Field(
+        False,
+        description='Not available, but this node could have it: Eugene can install\nit here, or the agent wrote an install command for this\nhardware. False for an engine that cannot run on this hardware.\n',
+    )
+    experimental: bool | None = False
+    accepts: list[ModelRequirement]
+    fit: EngineFitModel | None = Field(
+        None,
+        description='How this engine uses memory, as the node reported it\n(`EngineDescriptor.fit`, LS6). Absent: the engine has no fit\nmodel, and its fit is *not estimated*.\n',
+    )
+
+
+class EligibilityRequest(BaseModel):
+    models: list[str] | None = Field(
+        None,
+        description='Library model ids to judge. Absent means every model, unless\n`candidates` are sent: then none.\n',
+    )
+    candidates: list[EligibilityCandidate] | None = Field(
+        None,
+        description='Models not in the library yet, judged by their facts (LS2).\nAnswered after `models`, in the order sent.\n',
+    )
+    engines: list[EligibilityEngine]
+    fit: FitQuestion | None = Field(
+        None,
+        description="Ask for each engine's fit too (LS6): every verdict but `no`\nthen carries its engine's `fit`, and a model that fits no engine\nthat would run it is `not_here`. Absent: no fit is computed, and\nthe level is about engines alone, as before LS6.\n",
+    )
+
+
+class EngineList(BaseModel):
+    engines: list[EngineDescriptor]
 
 
 class Message(BaseModel):
