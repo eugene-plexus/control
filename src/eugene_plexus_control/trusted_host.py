@@ -157,9 +157,7 @@ def require_trusted_host(request: Request) -> None:
         status.HTTP_403_FORBIDDEN,
         "Unrecognized address",
         f"This request was addressed to {shown!r}, which is not an IP address, a local "
-        "network name or this machine's own name, so first-run setup and sign-in will not "
-        "answer it. That is what stops a web page somewhere else from renaming itself to "
-        "reach this machine. If you reach this install through a name of your own, add it "
-        f"to {ALLOWED_HOSTS_ENV} (comma-separated) on the machine running the control root "
-        "and restart it -- or open the install through its agent, which needs no list.",
+        "network name or this machine's own name. If you reach this install through a "
+        f"name of your own, add it to {ALLOWED_HOSTS_ENV} (comma-separated) on the machine "
+        "running the control root and restart it, or open the install through its agent.",
     )

@@ -300,14 +300,10 @@ async def announce_node_address(
         raise problem(
             status.HTTP_409_CONFLICT,
             "Address puts this node on the open internet",
-            f"Node {name!r} is enrolled at {record.url}, which is "
-            f"{node_address.classify(record.url)}, and announced {normalized}, which is "
-            f"{node_address.classify(normalized)}. Moving between loopback and the LAN "
-            "is ordinary -- that is the Reach switch, and a new LAN address after a "
-            "reboot -- but a node may not put itself on the open internet, because "
-            "nothing here could tell that apart from a leaked signing key doing it. "
-            "Re-enroll the node to confirm the new address; its model files and "
-            "runtimes are untouched by that.",
+            f"Node {name!r} is enrolled at {record.url} ({node_address.classify(record.url)}) "
+            f"and announced {normalized} ({node_address.classify(normalized)}). A node may "
+            "not move itself onto the open internet. Re-enroll the node to confirm the new "
+            "address; its model files and runtimes are untouched.",
         )
 
     if int(body.sequence) <= record.advertiseSequence:

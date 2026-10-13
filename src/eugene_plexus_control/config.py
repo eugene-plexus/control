@@ -73,36 +73,19 @@ FIELDS: list[ConfigField] = [
         key="securityMode",
         label="Security mode",
         description=(
-            "How this host keeps its master encryption key between "
-            "restarts. 'Prompt on startup' keeps it in process memory "
-            "only, so a restart needs the passphrase again. 'OS keyring' "
-            "stores it in this machine's Credential Manager, Keychain or "
-            "Secret Service for auto-unlock.\n\n"
-            "'Passphrase file' reads it from a file you mount, for hosts "
-            "that have no keyring at all — which is every container.\n\n"
-            "Worth knowing before you pick: **OS keyring is host-bound.** "
-            "The key lives in *this* machine's store, so a standby "
-            "control root on another host cannot inherit auto-unlock and "
-            "will ask for the passphrase when you promote it. That is "
-            "consistent with promotion being something a person does "
-            "anyway — but it is better read here than discovered during "
-            "a failover. **A passphrase file is not host-bound**: mount "
-            "the same secret on the standby and a failover needs nobody "
-            "either.\n\n"
-            "'Passphrase file' also needs "
-            "`EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE` set to the path, "
-            "because the root has to find it before it is unlocked. "
-            "Selecting this mode without that variable leaves the root "
-            "locked and says so in the log.\n\n"
-            "Both auto-unlock modes trade the same thing away: whoever "
-            "can read the store — this machine's keyring, or that file — "
-            "can unlock the install without knowing the passphrase. "
-            "They buy an install that comes back from a power cut with "
-            "nobody present, which is why they exist and why neither is "
-            "the default.\n\n"
-            "Nothing restarts when you change it: the keyring entry is "
-            "stored or removed when you save, and the next start unlocks "
-            "accordingly."
+            "How this control root keeps its master encryption key between "
+            "restarts.\n\n"
+            "- **Prompt on startup**: every restart asks for the passphrase.\n"
+            "- **OS keyring**: unlocks from this machine's keyring. It is "
+            "host-bound, so a standby on another host asks for the passphrase when "
+            "promoted.\n"
+            "- **Passphrase file**: unlocks from a file you mount, for hosts with "
+            "no keyring (every container). Set "
+            "`EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE` to its path, or the root "
+            "stays locked. Mount the same file on a standby and it unlocks too.\n\n"
+            "Either auto-unlock mode lets anyone who can read the keyring or the file "
+            "unlock this install without the passphrase. A change applies at the next "
+            "start."
         ),
         category="security",
         valueType=ConfigValueType.enum,
@@ -205,13 +188,14 @@ FIELDS: list[ConfigField] = [
         key="installMode",
         label="Install mode",
         description=(
-            "Production restricts Eugene's owner: a job site's folders, who may use "
-            "them and what its tools returned are its owner's alone, and the owner's "
-            "reading of other people's chats stops at the first job-site result. Dev "
-            "mode is for developing Eugene: the owner sees all tool information, job-site "
-            "results included, and may give themselves a job site's folders. Every "
-            "person is told the mode and when it changes. Results made in production "
-            "stay hidden after a switch to dev."
+            "Production restricts what Eugene's owner sees of job sites; Dev shows "
+            "the owner all tool information.\n\n"
+            "In Production a job site's folders, who may use them and what its tools "
+            "returned belong to the site's owner alone, and Eugene's owner reads other "
+            "people's chats only up to the first job-site result. In Dev the owner "
+            "also sees job-site results and may give themselves a job site's folders. "
+            "Everyone is told the mode and when it changes. Results made in Production "
+            "stay hidden after a switch to Dev."
         ),
         category="security",
         valueType=ConfigValueType.enum,
@@ -223,10 +207,10 @@ FIELDS: list[ConfigField] = [
         key="peopleMayAddJobSites",
         label="People may add job sites",
         description=(
-            "Whether a person may add a machine of their own as a job site, from "
-            "Workbench, unless their own permissions on the People page say "
-            "otherwise. Turning it off changes everyone left on the default; a "
-            "person given their own permissions keeps them."
+            "Lets people add a machine of their own as a job site from Workbench.\n\n"
+            "A person's own permissions on the People page override this. Turning it "
+            "off changes everyone left on the default; people given their own "
+            "permissions keep them."
         ),
         category="security",
         valueType=ConfigValueType.boolean,
@@ -236,11 +220,11 @@ FIELDS: list[ConfigField] = [
         key="peopleMayUseJobSites",
         label="People may use job sites as themselves",
         description=(
-            "Whether a person may link their own account on a job site's machine "
-            "and keep workspaces of their own there, unless their own permissions "
-            "on the People page say otherwise. A folder a site's owner shares "
-            "with them works either way. Turning it off leaves links inert, not "
-            "removed."
+            "Lets people link their own account on a job site's machine and keep "
+            "workspaces of their own there.\n\n"
+            "A person's own permissions on the People page override this. A folder a "
+            "site's owner shares with them works either way. Turning it off leaves "
+            "links inert, not removed."
         ),
         category="security",
         valueType=ConfigValueType.boolean,
@@ -250,11 +234,11 @@ FIELDS: list[ConfigField] = [
         key="siteJoinUrl",
         label="Address machines join through",
         description=(
-            "Where a machine on this network reaches this root when it joins as "
-            "a job site and polls from then on -- for example "
-            "http://192.168.1.5:8083. Workbench puts it in the join command "
-            "a person runs on their machine. The entry point's name for "
-            "machines, when it has one, is used instead."
+            "The address a machine on this network uses to reach this root as a "
+            "job site.\n\n"
+            "For example `http://192.168.1.5:8083`. Workbench puts it in the join "
+            "command a person runs. The entry point's name for machines, when it has "
+            "one, is used instead."
         ),
         category="security",
         valueType=ConfigValueType.url,
