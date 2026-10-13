@@ -92,6 +92,12 @@ OP_PUT_CLIENT_ADMISSION = "putClientAdmission"
 OP_REVOKE_SESSION = "revokeSession"
 # Signing in with Eugene (C2, docs/design/sign-in-with-eugene.md).
 OP_PUT_PERSON = "putPerson"
+# **Retired, and read here for v0.2 only.** Between v0.1.0 and v0.2 these were
+# retired: `putNodeHelper`, an `enrollNode` with the grant `files` (a Job Site
+# that joined as a node), a person's `helperGrants` and a snapshot's
+# `nodeHelpers`. A root that still holds any of them converts them once at start
+# (`retired_conversion`), and nothing of those kinds is on its disk after. v0.3
+# deletes these handlers, `is_retired_site` and that module together.
 OP_PUT_NODE_HELPER = "putNodeHelper"
 OP_SET_PERSON_PASSWORD = "setPersonPassword"
 OP_DELETE_PERSON = "deletePerson"
@@ -505,7 +511,8 @@ _NODE_GRANTS = frozenset({"node", "gateway", "files", GRANT_STANDBY})
 
 def is_retired_site(record: NodeRecord | None) -> bool:
     """A Job Site that joined as a node before slice 2b.1 (J19, J20). It
-    replays, and is in no listing and no trust bundle."""
+    replays, and is in no listing and no trust bundle. `retired_conversion`
+    revokes each at start; kept for v0.2, deleted in v0.3."""
     return record is not None and "files" in record.grants
 
 
@@ -913,7 +920,8 @@ def _person_record(raw: Any) -> dict[str, Any]:
         raise ApplyError("invalid person disabled")
     # Folder grants on nodes retired with the node folders (J20). Old
     # entries still carry them; they are checked as they always were and
-    # then dropped, so they grant nothing and reach no snapshot.
+    # then dropped, so they grant nothing and reach no snapshot. Kept for
+    # v0.2, deleted in v0.3 (see `OP_PUT_NODE_HELPER`).
     grants = raw.get("helperGrants", [])
     if not isinstance(grants, list) or len(grants) > 256:
         raise ApplyError("invalid helper grants")
@@ -1071,7 +1079,9 @@ def _apply_put_node_helper(
     state: AppliedState, payload: dict[str, Any], index: int
 ) -> AppliedState:
     """Read and ignored: the operator-managed node folders retired (J20).
-    Old logs hold these entries, so they must still apply."""
+    A log from a build before that holds these entries, so they still apply
+    until `retired_conversion` has folded them away; kept for v0.2, deleted in
+    v0.3."""
     if not isinstance(payload.get("helper"), dict):
         raise ApplyError(f"entry {index}: a node helper entry holds an object")
     return state

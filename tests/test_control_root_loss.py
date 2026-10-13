@@ -175,6 +175,56 @@ def test_a_gap_on_disk_is_corruption(tmp_path: Path) -> None:
         StateMachine(LogStore(tmp_path / "state")).load()
 
 
+def test_a_kill_between_a_snapshot_and_its_compaction_leaves_a_root_that_starts(
+    tmp_path: Path,
+) -> None:
+    """The snapshot is renamed into place and the log compacted after it, so a
+    kill between the two leaves both files good: a snapshot at N beside a log
+    that still starts at 1. `write_snapshot` promises that store replays
+    harmlessly. It did not: replaying entry 1 onto state N is the
+    out-of-order error, and the root could not start.
+
+    Constructed rather than raced for, as the torn tail is: the first half of
+    `snapshot_now`, then a restart."""
+    directory = tmp_path / "state"
+    machine = machine_at(directory)
+    for theme in ("dark", "light", "auto"):
+        machine.append(OP_PATCH_CONFIG, {"values": {"uiTheme": theme}})
+    LogStore(directory).write_snapshot(machine.snapshot_document(), compact_through=None)
+    assert [e["index"] for e in LogStore(directory).load().entries] == [1, 2, 3]
+
+    recovered = machine_at(directory)
+
+    assert recovered.state.index == 3
+    assert recovered.canonical() == machine.canonical()
+    # It carries on from there: the next entry is 4, the log stays gapless,
+    # and the next compaction drops what the snapshot covers.
+    recovered.append(OP_PATCH_CONFIG, {"values": {"uiTheme": "dark"}})
+    assert machine_at(directory).state.index == 4
+    recovered.snapshot_now()
+    assert recovered.first_available_index() == 5
+
+
+def test_a_standby_killed_between_installing_a_snapshot_and_compacting_starts_too(
+    tmp_path: Path,
+) -> None:
+    """The same window on the other path that writes a snapshot: a standby
+    that held entries 1 and 2 installs one at 5, and is killed before the log
+    drops them."""
+    active = machine_at(tmp_path / "active")
+    for theme in ("dark", "light", "auto", "dark", "light"):
+        active.append(OP_PATCH_CONFIG, {"values": {"uiTheme": theme}})
+    standby = standby_at(tmp_path / "standby")
+    for entry in active.read_page(0, 2):
+        standby.accept_replicated(entry)
+    LogStore(tmp_path / "standby").write_snapshot(active.snapshot_document(), compact_through=None)
+
+    recovered = standby_at(tmp_path / "standby")
+
+    assert recovered.state.index == 5
+    assert recovered.canonical() == active.canonical()
+
+
 # --------------------------------------------------------------------------- #
 # Promotion, from a passphrase and nothing else
 # --------------------------------------------------------------------------- #

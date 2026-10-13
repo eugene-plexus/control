@@ -196,8 +196,9 @@ class LogStore:
         Order matters and is the reverse of what feels natural: the
         snapshot is durable *before* any entry is dropped, so a crash
         between the two leaves a store with both a good snapshot and
-        entries it will replay harmlessly. Doing it the other way round
-        would open a window where neither file holds the state.
+        entries it already covers, which `StateMachine.load` skips and
+        the next compaction drops. Doing it the other way round would
+        open a window where neither file holds the state.
         """
         self._dir.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False)

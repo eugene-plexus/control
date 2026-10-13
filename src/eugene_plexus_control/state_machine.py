@@ -122,8 +122,16 @@ class StateMachine:
             base = (
                 from_canonical(result.snapshot) if result.snapshot is not None else AppliedState()
             )
-            self._state = apply_all(base, result.entries)
-            self._entries_since_snapshot = len(result.entries)
+            # **Entries the snapshot already holds are not replayed.** A kill
+            # between a snapshot's rename and the compaction after it leaves a
+            # snapshot at N beside a log that still starts at 1: both files are
+            # good, and `LogStore.write_snapshot` promises that store "will replay
+            # harmlessly". Replaying entry 1 onto state N is the out-of-order
+            # error, and a root that cannot start is not harmless. They are
+            # dropped from the file by the next compaction.
+            pending = [e for e in result.entries if int(e["index"]) > base.index]
+            self._state = apply_all(base, pending)
+            self._entries_since_snapshot = len(pending)
             log.info(
                 "loaded control state: index %d, epoch %d, %d node(s), role %s",
                 self._state.index,

@@ -21,7 +21,7 @@ async def healthz(request: Request) -> Health:
     and lag are `GET /v1/control/status`; this answers only whether the
     process is alive.
 
-    Two things do make it `degraded`, and both are conditions an
+    Three things do make it `degraded`, and all are conditions an
     operator has to act on rather than transient states:
 
     * **Not initialized.** No passphrase, so nothing but setup works.
@@ -31,6 +31,9 @@ async def healthz(request: Request) -> Health:
       was killed uncleanly. Nothing was lost that a caller had been
       promised, but an operator should learn it from the dashboard
       rather than from the logs of a process that has since restarted.
+    * **Retired data could not be converted at boot** (`retired_conversion`).
+      The root serves what it has and tries again at the next start; the
+      cause is `details.conversionFailed`, in the words of whatever failed.
 
     Safe mode is reported too, and note what it does *not* skip: the
     log. Applied state is the install, not a preference — a control root
@@ -60,7 +63,11 @@ async def healthz(request: Request) -> Health:
     if dropped:
         details["discardedTornTailLines"] = dropped
 
-    degraded = safe_mode or not initialized or bool(dropped)
+    conversion_failure = getattr(request.app.state, "conversion_failure", None)
+    if conversion_failure:
+        details["conversionFailed"] = conversion_failure
+
+    degraded = safe_mode or not initialized or bool(dropped) or bool(conversion_failure)
     return Health(
         status=Status.degraded if degraded else Status.ok,
         version=__version__,

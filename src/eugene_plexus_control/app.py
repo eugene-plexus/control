@@ -7,7 +7,8 @@ Startup order matters and reads oddly, so it is spelled out:
    control root that came up ignoring its own node registry would hand
    out wrong answers rather than degraded ones, and safe mode exists to
    let an operator repair *config*, not to make the install forget
-   itself.
+   itself. A root that ran a build between v0.1.0 and v0.2 then converts
+   what that build retired, once (`retired_conversion`).
 2. Auth state is built empty. This component is the trust root, so it
    receives no key from the agent that spawns it — it holds the signing
    key sealed in applied state and opens it at login.
@@ -29,7 +30,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
-from . import __version__, keyring_store, passphrase_file, security
+from . import __version__, keyring_store, passphrase_file, retired_conversion, security
 from . import config as config_module
 from .admission_worker import AdmissionWorker
 from .applied import normalize_url
@@ -86,8 +87,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.safe_mode = settings.safe_mode
 
     role = ROLE_STANDBY if settings.role.strip().lower() == "standby" else ROLE_ACTIVE
-    machine = StateMachine(LogStore(settings.state_dir), role=role)
+    store = LogStore(settings.state_dir)
+    machine = StateMachine(store, role=role)
     machine.load()
+    # What a build between v0.1.0 and v0.2 retired is converted once, here, and
+    # only the current form is read after it. Never fatal: a root that cannot
+    # convert serves what it has, says why on /healthz, and tries again at the
+    # next start. Deleted, with its module, in v0.3.
+    app.state.conversion_failure = retired_conversion.run(store, machine)
     app.state.machine = machine
     app.state.admission_worker = AdmissionWorker()
 
