@@ -16,12 +16,24 @@ synchronous and fsync'd inside the writer's lock, and it is deliberately
 component, and concurrency here would buy nothing but a second writer.
 
 **A torn tail is expected and handled.** A process killed between
-`write` and `fsync` can leave a partial final line. `load` stops at the
-first line it cannot parse and reports how many it dropped, which is the
-correct reading: an entry that was not durable was never acknowledged,
-so discarding it loses nothing a caller was promised. A parse failure in
+`write` and `fsync` can leave a partial final line. `load` leaves out a
+final line it cannot parse and reports that it did, which is the correct
+reading: an entry that was not durable was never acknowledged, so
+discarding it loses nothing a caller was promised. A parse failure in
 the *middle* of the file is a different thing entirely — that is
 corruption, and it raises.
+
+**And it is cut off the file, not only out of memory.** The next
+`append` writes at the end of the file, so bytes left there would be
+glued to the front of the next entry: that entry, acknowledged to its
+caller, would read back as the torn one and be dropped at the following
+start, and with a second append the glued line would be in the middle,
+which is corruption, and the root would not start. So `load` truncates
+the file to the end of its last whole line (or, for a final line that
+reads as a whole entry but has lost its newline, writes the newline) and
+makes that durable, file and directory, before it returns, which is
+before anything can append. Every role loads through here, so the active
+root and a standby's own copy are repaired alike.
 
 Reading a page scans the file rather than seeking an offset index. That
 is deliberate at this scale: control state is kilobytes of topology and
@@ -67,7 +79,8 @@ class LoadResult:
     dropped_tail_lines: int
     """Partial lines discarded from the end. Non-zero means this process
     was killed uncleanly last time; the entries were never acknowledged
-    to a caller, so nothing was lost."""
+    to a caller, so nothing was lost. They are cut off the file as well,
+    so only the `load` that found one reports it."""
 
 
 class LogStore:
@@ -98,7 +111,12 @@ class LogStore:
     # ----- reading ----------------------------------------------------
 
     def load(self) -> LoadResult:
-        """Read the snapshot and every entry after it."""
+        """Read the snapshot and every entry after it.
+
+        Also leaves the log file ending on a whole line, which is what
+        lets the next `append` follow it: a torn final line is cut off the
+        file, not only left out of the result (see the module docstring).
+        """
         snapshot: dict[str, Any] | None = None
         if self._snapshot_path.exists():
             try:
@@ -112,34 +130,66 @@ class LogStore:
         entries: list[dict[str, Any]] = []
         dropped = 0
         if self._log_path.exists():
-            lines = self._log_path.read_text(encoding="utf-8").splitlines()
-            for position, line in enumerate(lines):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    parsed = json.loads(stripped)
-                except ValueError as exc:
-                    is_last = position == len(lines) - 1
-                    if is_last:
-                        # Torn tail: killed between write and fsync. The
-                        # caller was never told this one succeeded.
-                        dropped = 1
-                        log.warning(
-                            "discarding a partial final line in %s — this process was killed "
-                            "uncleanly, and the entry was never acknowledged",
-                            self._log_path,
-                        )
-                        break
-                    raise LogCorruption(
-                        f"{self._log_path} line {position + 1} is not valid JSON: {exc}"
-                    ) from exc
-                if not isinstance(parsed, dict):
-                    raise LogCorruption(f"{self._log_path} line {position + 1} is not an object")
-                entries.append(parsed)
+            scan = _scan_log(self._log_path.read_bytes(), self._log_path)
+            entries = scan.entries
+            dropped = scan.dropped
+            # Checked before the file is touched: a log that is about to be
+            # refused as corrupt is left exactly as it was found.
+            _assert_gapless(entries, self._log_path)
+            self._repair_tail(scan)
 
-        _assert_gapless(entries, self._log_path)
         return LoadResult(snapshot=snapshot, entries=entries, dropped_tail_lines=dropped)
+
+    def _repair_tail(self, scan: _Scan) -> None:
+        """Leave the file ending where its last good line does.
+
+        Two ways the end of the file is wrong, and `append` writes straight
+        after either:
+
+          * the final line was left out (torn, or not readable): the file is
+            truncated to the end of the line before it;
+          * the final line was kept but has no newline, as when a power cut
+            took the last byte of an append and nothing else: the newline is
+            written, because the entry reads as whole and is kept.
+
+        Then `fsync` on the file and on the directory, the same barrier
+        `append` uses, so a second cut cannot bring the torn bytes back.
+        Raises `OSError` naming the file if it cannot: an unrepaired log
+        that an append is allowed to follow is the corruption this exists
+        to prevent, so the root does not carry on over it.
+        """
+        try:
+            if scan.keep < scan.size:
+                log.warning(
+                    "discarding a partial final line in %s (%d byte(s)) — this process was "
+                    "killed uncleanly, and the entry was never acknowledged. The file is cut "
+                    "back to its last whole line so the next entry does not start in the "
+                    "middle of it",
+                    self._log_path,
+                    scan.size - scan.keep,
+                )
+                with open(self._log_path, "r+b") as handle:
+                    handle.truncate(scan.keep)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            elif scan.unterminated:
+                log.warning(
+                    "the final line of %s has no newline — this process was killed uncleanly "
+                    "after the entry was written. It reads as a whole entry and is kept; the "
+                    "newline is added so the next entry starts on its own line",
+                    self._log_path,
+                )
+                with _private_files.open_private_append(self._log_path) as handle:
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            else:
+                return
+            _fsync_directory(self._dir)
+        except OSError as exc:
+            raise OSError(
+                f"could not repair the end of {self._log_path} after an unclean stop: {exc}"
+            ) from exc
 
     def read_after(self, after: int, limit: int) -> list[dict[str, Any]]:
         """Entries with `index` strictly greater than `after`.
@@ -181,6 +231,11 @@ class LogStore:
         Opened `0600`: the log carries the salt and the passphrase
         verifier, which together are an offline attack on the passphrase.
         See `_private_files` for why that is set at creation.
+
+        Written after the end of the file, which is where the last whole
+        line ends only because `load` has already cut a torn tail off it.
+        A caller appends to a store it has loaded; one that has not would
+        glue this line onto the fragment.
         """
         self._dir.mkdir(parents=True, exist_ok=True)
         line = json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -281,6 +336,72 @@ class LogStore:
             len(result.entries) - len(keep),
             len(keep),
         )
+
+
+@dataclass(frozen=True)
+class _Scan:
+    """What one pass over the bytes of the log found."""
+
+    entries: list[dict[str, Any]]
+    dropped: int
+    """1 when the final line could not be read and was left out, else 0."""
+    size: int
+    """Bytes in the file, as read."""
+    keep: int
+    """Bytes of it that are the log: `size`, or less when the final line was
+    left out, in which case it is where that line starts."""
+    unterminated: bool
+    """The final line was kept (or is blank) and the file does not end in a
+    newline."""
+
+
+def _scan_log(raw: bytes, path: Path) -> _Scan:
+    """Read the bytes of the log as entries, and find where its good part ends.
+
+    A line is what lies between newlines, and only newlines. The writer ends
+    every entry with exactly one and JSON escapes every other control
+    character, so a newline in this file is always the end of an entry. That is
+    not what `str.splitlines` does, which this used to call: it also splits on
+    U+0085, U+2028 and U+2029, which JSON writes as they are inside a string,
+    so an entry with one of them in a name was cut in two and the root could
+    not start.
+
+    One line may be left out, and only the last: a line that is not JSON (or
+    not UTF-8, which is what a cut inside a multi-byte character leaves)
+    because the process was killed part-way through writing it. Anywhere else
+    that is corruption, and raises.
+    """
+    lines = raw.split(b"\n")
+    if not lines[-1]:
+        # The file ends on a newline, or is empty: nothing follows the last one.
+        lines.pop()
+
+    entries: list[dict[str, Any]] = []
+    next_start = 0
+    for position, line in enumerate(lines):
+        start, next_start = next_start, next_start + len(line) + 1
+        try:
+            text = line.decode("utf-8").strip()
+            if not text:
+                continue
+            parsed = json.loads(text)
+        except ValueError as exc:
+            if position == len(lines) - 1:
+                # Torn tail: killed between write and fsync. The caller was
+                # never told this one succeeded.
+                return _Scan(entries, dropped=1, size=len(raw), keep=start, unterminated=False)
+            raise LogCorruption(f"{path} line {position + 1} is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise LogCorruption(f"{path} line {position + 1} is not an object")
+        entries.append(parsed)
+
+    return _Scan(
+        entries,
+        dropped=0,
+        size=len(raw),
+        keep=len(raw),
+        unterminated=bool(raw) and not raw.endswith(b"\n"),
+    )
 
 
 def _assert_gapless(entries: list[dict[str, Any]], path: Path) -> None:
