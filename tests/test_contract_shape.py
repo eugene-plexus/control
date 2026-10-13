@@ -44,7 +44,7 @@ def _active(tmp_path: Path) -> tuple[TestClient, dict[str, str]]:
         {
             "name": "shed",
             "role": "agent",
-            "url": "http://10.0.0.11:8079",
+            "url": "http://192.0.2.11:59079",
             "publicKey": "c2hlZC1wdWJsaWMta2V5LWJ5dGVzLTMyLWNoYXJz",
             "enrolledAt": "2026-09-09T12:00:00+00:00",
         },
@@ -55,7 +55,7 @@ def _active(tmp_path: Path) -> tuple[TestClient, dict[str, str]]:
             "node": "shed",
             "name": "right",
             "kind": "inference-driver",
-            "url": "http://10.0.0.11:8081",
+            "url": "http://192.0.2.11:59081",
         },
     )
     machine.append(

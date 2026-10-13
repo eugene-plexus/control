@@ -286,7 +286,7 @@ def test_a_locked_root_does_not_probe_its_nodes(
                 "publicKey": "0" * 43 + "=",
                 "signingPublicKey": "1" * 43 + "=",
                 "tokenPublicKey": tokens.public_b64(tokens.generate_private_key()),
-                "url": "http://192.0.2.10:8079",
+                "url": "http://192.0.2.10:59079",
             },
         )
         assert enrolled.status_code in (200, 201), enrolled.text

@@ -145,7 +145,7 @@ def test_the_issuer_is_the_roots_own_address_when_nothing_says_otherwise(
 def test_a_forwarded_host_is_believed_only_beside_an_agents_token(
     active_client: TestClient,
 ) -> None:
-    forwarded = {oidc.FORWARDED_HOST_HEADER: "192.168.1.5:8079"}
+    forwarded = {oidc.FORWARDED_HOST_HEADER: "192.0.2.5:59079"}
     ignored = active_client.get("/oidc/.well-known/openid-configuration", headers=forwarded)
     assert ignored.json()["issuer"] == "http://testserver/oidc"
 
@@ -163,7 +163,7 @@ def test_a_forwarded_host_is_believed_only_beside_an_agents_token(
         "/oidc/.well-known/openid-configuration",
         headers={**forwarded, oidc.NODE_TOKEN_HEADER: token},
     )
-    assert believed.json()["issuer"] == "http://192.168.1.5:8079/oidc"
+    assert believed.json()["issuer"] == "http://192.0.2.5:59079/oidc"
 
     forged, _ = keys.token.mint(
         typ=tokens.TYP_SERVICE, sub="gateway", aud=[tokens.RECIPIENT_CONTROL], ttl_seconds=300

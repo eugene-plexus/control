@@ -261,7 +261,7 @@ def test_a_replicating_standby_is_promotable_from_the_passphrase_alone(tmp_path:
             {
                 "name": "attic",
                 "role": "standby",
-                "url": "http://127.0.0.1:8079",
+                "url": "http://127.0.0.1:59079",
                 "publicKey": "cHVibGljLWtleS1ieXRlcy0zMi1jaGFyYWN0ZXJzLWs=",
                 "enrolledAt": "2026-09-09T10:00:00+00:00",
             },

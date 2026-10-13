@@ -707,11 +707,11 @@ def test_a_lan_only_install_invites_through_the_address_its_owner_set(
     assert (
         c.post("/oidc/job-sites/invite", auth=auth(app), json={"refreshToken": ada_token})
     ).status_code == 409
-    assert c.patch("/v1/config", json={"siteJoinUrl": "http://192.168.1.5:8083"}).status_code == 200
+    assert c.patch("/v1/config", json={"siteJoinUrl": "http://192.0.2.5:59083"}).status_code == 200
     listed = c.post("/oidc/job-sites", auth=auth(app), json={"refreshToken": ada_token})
     assert listed.json()["canInvite"] is True
     made = c.post("/oidc/job-sites/invite", auth=auth(app), json={"refreshToken": ada_token})
-    assert made.status_code == 200 and made.json()["joinUrl"] == "http://192.168.1.5:8083"
+    assert made.status_code == 200 and made.json()["joinUrl"] == "http://192.0.2.5:59083"
 
 
 # --------------------------------------------------------------------------- old logs

@@ -163,7 +163,7 @@ def test_permissions_follow_the_defaults_until_a_person_has_their_own(root: Test
 def test_without_add_job_sites_a_person_adds_no_machine(root: TestClient) -> None:
     c = root
     a = ada_with_a_workspace(c)
-    assert c.patch("/v1/config", json={"siteJoinUrl": "http://192.168.1.5:8083"}).status_code == 200
+    assert c.patch("/v1/config", json={"siteJoinUrl": "http://192.0.2.5:59083"}).status_code == 200
     c.patch(f"/v1/people/{a.person['id']}", json={"permissions": ["use-job-sites"]})
     refused = c.post(
         "/oidc/job-sites/invite",

@@ -74,7 +74,7 @@ def _announce(client: TestClient, name: str, *, url: str, sequence: int, private
         "http://0.0.0.0:8079",  # the bind wildcard, not an address
         "http://224.0.0.1:8079",  # multicast
         "file:///etc/shadow",
-        "gopher://10.0.0.1:8079",
+        "gopher://192.0.2.1:59079",
     ],
 )
 def test_a_node_cannot_name_an_address_that_is_never_a_node(
@@ -88,14 +88,14 @@ def test_a_node_cannot_name_an_address_that_is_never_a_node(
     """
     private, public = _keypair()
     assert (
-        _enroll(active_client, "gpu-box", url="http://10.0.0.7:8079", public=public).status_code
+        _enroll(active_client, "gpu-box", url="http://192.0.2.7:59079", public=public).status_code
         == 201
     )
 
     response = _announce(active_client, "gpu-box", url=url, sequence=1, private=private)
     assert response.status_code == 400, response.text
     assert (
-        active_client.get("/v1/nodes/gpu-box").json()["url"].rstrip("/") == "http://10.0.0.7:8079"
+        active_client.get("/v1/nodes/gpu-box").json()["url"].rstrip("/") == "http://192.0.2.7:59079"
     )
 
 
@@ -140,7 +140,7 @@ def test_a_refused_enrollment_does_not_burn_the_join_token(active_client: TestCl
             "token": token,
             "name": "gpu-box",
             "publicKey": NODE_PUBLIC,
-            "url": "http://10.0.0.7:8079",
+            "url": "http://192.0.2.7:59079",
             "signingPublicKey": public,
             "tokenPublicKey": tokens.public_b64(tokens.generate_private_key()),
         },
@@ -159,7 +159,7 @@ def test_a_node_cannot_move_itself_onto_the_open_internet(active_client: TestCli
     """
     private, public = _keypair()
     assert (
-        _enroll(active_client, "gpu-box", url="http://10.0.0.7:8079", public=public).status_code
+        _enroll(active_client, "gpu-box", url="http://192.0.2.7:59079", public=public).status_code
         == 201
     )
 
@@ -170,7 +170,7 @@ def test_a_node_cannot_move_itself_onto_the_open_internet(active_client: TestCli
     detail = response.json()["detail"]["detail"].lower()
     assert "re-enroll" in detail
     assert (
-        active_client.get("/v1/nodes/gpu-box").json()["url"].rstrip("/") == "http://10.0.0.7:8079"
+        active_client.get("/v1/nodes/gpu-box").json()["url"].rstrip("/") == "http://192.0.2.7:59079"
     )
 
     # A hostname is public too: this root cannot know who resolves it.
@@ -197,16 +197,16 @@ def test_the_announcements_every_install_actually_makes_still_work(
     the open internet — Troy's GPUs in another building — stays there.
     """
     private, public = _keypair()
-    _enroll(active_client, "solo", url="http://127.0.0.1:8079", public=public)
+    _enroll(active_client, "solo", url="http://127.0.0.1:59079", public=public)
     assert (
         _announce(
-            active_client, "solo", url="http://192.168.16.75:8079", sequence=1, private=private
+            active_client, "solo", url="http://192.0.2.75:59079", sequence=1, private=private
         ).status_code
         == 200
     )
     assert (
         _announce(
-            active_client, "solo", url="http://192.168.16.90:8079", sequence=2, private=private
+            active_client, "solo", url="http://192.0.2.90:59079", sequence=2, private=private
         ).status_code
         == 200
     )
@@ -232,7 +232,7 @@ def test_the_announcements_every_install_actually_makes_still_work(
     # move an attacker gains anything from.
     assert (
         _announce(
-            active_client, "remote", url="http://10.0.0.4:8079", sequence=2, private=private2
+            active_client, "remote", url="http://192.0.2.4:59079", sequence=2, private=private2
         ).status_code
         == 200
     )
@@ -256,7 +256,7 @@ def test_the_classes_are_built_from_reachability_not_from_is_private() -> None:
     assert node_address.classify("http://100.64.0.7:8079") == node_address.CLASS_PRIVATE
     assert node_address.classify("http://127.0.0.1:8079") == node_address.CLASS_LOOPBACK
     assert node_address.classify("http://localhost:8079") == node_address.CLASS_LOOPBACK
-    assert node_address.classify("http://10.0.0.1:8079") == node_address.CLASS_PRIVATE
+    assert node_address.classify("http://10.0.0.1:59079") == node_address.CLASS_PRIVATE
     assert node_address.classify("http://[fd00::1]:8079") == node_address.CLASS_PRIVATE
     assert node_address.classify("http://8.8.8.8:8079") == node_address.CLASS_PUBLIC
     assert node_address.classify("http://amish-station:8079") == node_address.CLASS_PUBLIC

@@ -404,7 +404,7 @@ class FakeNodes:
 
 def _hosted(root: TestClient, a: Ada) -> FakeNodes:
     """Node `amish`, with an address, hosting Ada's site."""
-    keys, made = enroll(root, "amish", url="http://192.0.2.10:8079")
+    keys, made = enroll(root, "amish", url="http://192.0.2.10:59079")
     assert made.status_code == 201, made.text
     said = root.put(
         "/v1/nodes/amish/hosted-sites",
@@ -438,7 +438,7 @@ def test_a_person_removes_their_own_link_through_the_hosting_agent(root: TestCli
     done = _remove(root, a, bo_token)
     assert done.status_code == 204, done.text
     ((url, path, token),) = fake.calls
-    assert url.rstrip("/") == "http://192.0.2.10:8079" and path == f"/v1/site/links/{bo['id']}"
+    assert url.rstrip("/") == "http://192.0.2.10:59079" and path == f"/v1/site/links/{bo['id']}"
     assert token  # the root's own, addressed to that node
     # Naming themselves is the same as naming nobody.
     assert _remove(root, a, bo_token, person=bo["id"]).status_code == 204

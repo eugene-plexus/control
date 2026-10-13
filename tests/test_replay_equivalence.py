@@ -188,7 +188,7 @@ def _write_history(machine: StateMachine) -> bytes:
         {
             "name": "gpu-büro",
             "role": "agent",
-            "url": "http://10.0.0.7:8079",
+            "url": "http://192.0.2.7:59079",
             "publicKey": "bm9kZS1wdWJsaWMta2V5LWJ5dGVzLTMyLWxvbmc=",
             "signingPublicKey": "bm9kZS1zaWduaW5nLXB1YmxpYy1rZXktMzItbG9uZw==",
             "agentVersion": "0.1.0",
@@ -228,7 +228,7 @@ def _write_history(machine: StateMachine) -> bytes:
         {
             "name": "attic",
             "role": "control",
-            "url": "http://10.0.0.2:8079",
+            "url": "http://192.0.2.2:59079",
             "publicKey": "YW5vdGhlci1ub2RlLXB1YmxpYy1rZXktMzItbG9uZw==",
             "tokenPublicKey": tokens.public_b64(tokens.generate_private_key()),
             "grants": ["gateway", "node"],
@@ -242,7 +242,7 @@ def _write_history(machine: StateMachine) -> bytes:
         {
             "name": "shed",
             "role": "agent",
-            "url": "http://10.0.0.8:8079",
+            "url": "http://192.0.2.8:59079",
             "publicKey": "c2hlZC1ub2RlLXB1YmxpYy1rZXktYnl0ZXMtMzItbG9uZw==",
             "os": "linux",
             "arch": "arm64",
@@ -298,7 +298,7 @@ def _write_history(machine: StateMachine) -> bytes:
     )
     machine.append(
         OP_PUT_COMPONENT,
-        {"node": "attic", "name": "gateway", "kind": "gateway", "url": "http://10.0.0.2:8080"},
+        {"node": "attic", "name": "gateway", "kind": "gateway", "url": "http://192.0.2.2:59080"},
     )
     machine.append(
         OP_PUT_COMPONENT,
@@ -306,7 +306,7 @@ def _write_history(machine: StateMachine) -> bytes:
             "node": "gpu-büro",
             "name": "left",
             "kind": "inference-driver",
-            "url": "http://10.0.0.7:8081",
+            "url": "http://192.0.2.7:59081",
         },
     )
     machine.append(
@@ -334,12 +334,12 @@ def _write_history(machine: StateMachine) -> bytes:
     # URL with no path, so the trailing-slash normalization is exercised
     # on the update path and not only on enrollment.
     machine.append(
-        OP_UPDATE_NODE, {"name": "gpu-büro", "url": "http://10.0.0.11:8079/", "sequence": 3}
+        OP_UPDATE_NODE, {"name": "gpu-büro", "url": "http://192.0.2.11:59079/", "sequence": 3}
     )
     machine.append(OP_PATCH_CONFIG, {"values": {"uiTheme": "dark", "nodePollIntervalSeconds": 30}})
     machine.append(
         OP_PATCH_CONFIG,
-        {"values": {"uiTheme": "light", "standbyUrls": ["http://10.0.0.9:8083/"]}},
+        {"values": {"uiTheme": "light", "standbyUrls": ["http://192.0.2.9:59083/"]}},
     )
     machine.append(OP_DELETE_RUNTIME, {"node": "attic", "name": "small"})
     machine.append(OP_DELETE_COMPONENT, {"node": "attic", "name": "gateway"})

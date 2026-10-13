@@ -115,7 +115,7 @@ def agent_a() -> Iterator[_Server]:
             {
                 "name": "left",
                 "kind": "inference-driver",
-                "url": "http://10.0.0.7:8081",
+                "url": "http://192.0.2.7:59081",
                 "status": "ready",
             }
         ],
@@ -196,7 +196,7 @@ def test_a_declared_component_a_node_does_not_report_is_still_shown(
     machine = active_client.app.state.machine  # type: ignore[attr-defined]
     machine.append(
         "putComponent",
-        {"node": "gpu-box", "name": "ghost", "kind": "gateway", "url": "http://10.0.0.7:8080"},
+        {"node": "gpu-box", "name": "ghost", "kind": "gateway", "url": "http://192.0.2.7:59080"},
     )
 
     body = active_client.get("/v1/components").json()
@@ -284,8 +284,8 @@ def test_a_search_account_is_a_component_and_an_unknown_kind_leaves_the_view_who
     app = _fake_agent(
         runtimes=[],
         components=[
-            {"name": "left", "kind": "inference-driver", "url": "http://10.0.0.7:8081"},
-            {"name": "searx", "kind": "tool-driver", "url": "http://10.0.0.7:8190"},
+            {"name": "left", "kind": "inference-driver", "url": "http://192.0.2.7:59081"},
+            {"name": "searx", "kind": "tool-driver", "url": "http://192.0.2.7:59190"},
             {"name": "future", "kind": "some-later-kind", "url": "http://10.0.0.7:8300"},
         ],
     )

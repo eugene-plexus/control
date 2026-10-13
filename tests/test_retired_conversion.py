@@ -136,7 +136,7 @@ def gpu_box() -> dict[str, Any]:
         "role": "agent",
         "signingPublicKey": ph("gpu-box-signing"),
         "tokenPublicKey": ph("gpu-box-token"),
-        "url": "http://10.0.0.7:8079/",
+        "url": "http://192.0.2.7:59079/",
     }
 
 
@@ -242,7 +242,7 @@ COMPONENT = {
     "kind": "inference-driver",
     "name": "left",
     "node": "gpu-box",
-    "url": "http://10.0.0.7:8081/",
+    "url": "http://192.0.2.7:59081/",
 }
 
 
@@ -367,7 +367,7 @@ def first_build_node() -> dict[str, Any]:
         "role": "agent",
         "signingPublicKey": ph("gpu-box-signing"),
         "tokenPublicKey": ph("gpu-box-token"),
-        "url": "http://10.0.0.7:8079/",
+        "url": "http://192.0.2.7:59079/",
     }
 
 
@@ -627,7 +627,7 @@ def test_every_retired_node_is_revoked_and_no_other_node_is(tmp_path: Path) -> N
             "name": "attic",
             "role": "agent",
             "grants": ["gateway", "node"],
-            "url": "http://10.0.0.2:8079/",
+            "url": "http://192.0.2.2:59079/",
             "enrolledAt": WHEN,
         },
     )
@@ -693,7 +693,7 @@ def test_a_root_with_nothing_retired_is_left_alone(tmp_path: Path) -> None:
     machine.seed_identity(placeholder_identity())
     machine.append(
         "enrollNode",
-        {"name": "gpu-box", "role": "agent", "url": "http://10.0.0.7:8079/", "enrolledAt": WHEN},
+        {"name": "gpu-box", "role": "agent", "url": "http://192.0.2.7:59079/", "enrolledAt": WHEN},
     )
     machine.append("putComponent", {**COMPONENT})
     machine.snapshot_now()
