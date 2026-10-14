@@ -16,11 +16,23 @@ from __future__ import annotations
 import base64
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from eugene_plexus_control import node_address, sealing, tokens
 
 NODE_PUBLIC = base64.b64encode(b"x" * 32).decode("ascii")
+
+
+@pytest.fixture(autouse=True)
+def _no_node_polling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These address-policy fixtures include real public hosts; never dial them."""
+    from eugene_plexus_control import app
+
+    async def no_poll(application: FastAPI) -> None:
+        pass
+
+    monkeypatch.setattr(app, "_poll_nodes", no_poll)
 
 
 def _keypair() -> tuple[str, str]:

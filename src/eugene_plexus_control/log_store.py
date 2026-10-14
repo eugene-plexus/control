@@ -95,6 +95,14 @@ class LogStore:
         self._dir = directory
         self._log_path = directory / LOG_FILENAME
         self._snapshot_path = directory / SNAPSHOT_FILENAME
+        self._append_error: str | None = None
+
+    def _require_usable(self) -> None:
+        if self._append_error is not None:
+            raise OSError(
+                f"{self._log_path} requires a restart after a failed append rollback: "
+                f"{self._append_error}"
+            )
 
     @property
     def directory(self) -> Path:
@@ -117,6 +125,7 @@ class LogStore:
         lets the next `append` follow it: a torn final line is cut off the
         file, not only left out of the result (see the module docstring).
         """
+        self._require_usable()
         snapshot: dict[str, Any] | None = None
         if self._snapshot_path.exists():
             try:
@@ -237,13 +246,36 @@ class LogStore:
         A caller appends to a store it has loaded; one that has not would
         glue this line onto the fragment.
         """
+        self._require_usable()
         self._dir.mkdir(parents=True, exist_ok=True)
         line = json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        with _private_files.open_private_append(self._log_path) as handle:
-            handle.write(line + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        _fsync_directory(self._dir)
+        try:
+            before = self._log_path.stat().st_size
+        except FileNotFoundError:
+            before = 0
+        try:
+            with _private_files.open_private_append(self._log_path) as handle:
+                handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            _fsync_directory(self._dir)
+        except BaseException as exc:
+            # The caller has not applied this entry. Remove even a complete
+            # line whose sync failed: leaving it would reuse its index on the
+            # next append. Close the writer first so it cannot flush buffered
+            # bytes after the truncate. A failed rollback poisons this store,
+            # including replication reads and snapshot writes, until restart.
+            try:
+                if self._log_path.exists():
+                    with open(self._log_path, "r+b") as rollback:
+                        rollback.truncate(before)
+                        rollback.flush()
+                        os.fsync(rollback.fileno())
+                    _fsync_directory(self._dir)
+            except BaseException as rollback_error:
+                self._append_error = f"append: {exc}; rollback: {rollback_error}"
+                log.error("%s requires a restart: %s", self._log_path, self._append_error)
+            raise
 
     def write_snapshot(self, snapshot: dict[str, Any], *, compact_through: int | None) -> None:
         """Replace the snapshot atomically, then optionally compact.
@@ -255,6 +287,7 @@ class LogStore:
         the next compaction drops. Doing it the other way round would
         open a window where neither file holds the state.
         """
+        self._require_usable()
         self._dir.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
