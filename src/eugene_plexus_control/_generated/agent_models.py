@@ -411,8 +411,13 @@ class ReasoningEffort(StrEnum):
     How much a reasoning model thinks before it answers: OpenAI's
     `reasoning_effort` (P2c, 2026-09-28). Measured on
     `openai/gpt-oss-20b` through OpenRouter: 17 reasoning tokens at
-    `low`, 275 at `high`. A setting, so it routes only to a model
-    that lists it (A2). `max` was added 2026-10-03: GPT-6 and
+    `low`, 275 at `high`. Since 2026-10-15 this is a best-effort
+    preference, not a routing constraint: forwarded where supported,
+    otherwise omitted and named in the ignored-settings header, without
+    refusing the request. An omitted value leaves the backend's default
+    in effect, including when the caller requested `none`.
+    Strata supports it through its template effort controls.
+    `max` was added 2026-10-03: GPT-6 and
     OpenRouter accept it, and a caller sending it was refused here.
 
     """
@@ -2071,6 +2076,87 @@ class LogPage(BaseModel):
     )
 
 
+class UpdateAllRunState(StrEnum):
+    """
+    Complete means every item updated or was current; attention includes manual or failed items.
+    """
+
+    running = 'running'
+    complete = 'complete'
+    attention = 'attention'
+
+
+class UpdateAllItemState(StrEnum):
+    """
+    Per-machine or per-app progress, retained through restarts.
+    """
+
+    pending = 'pending'
+    checking = 'checking'
+    updating = 'updating'
+    updated = 'updated'
+    current = 'current'
+    manual = 'manual'
+    failed = 'failed'
+    skipped = 'skipped'
+
+
+class UpdateAllItemKind(StrEnum):
+    """
+    A machine's Eugene installation or an installed catalogue app.
+    """
+
+    node = 'node'
+    app = 'app'
+
+
+class UpdateAllItem(BaseModel):
+    """
+    One machine or installed app in the update job.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    node: str = Field(..., description='Enrolled machine name.')
+    kind: UpdateAllItemKind
+    app: str | None = Field(None, description='Catalogue app id for an app item.')
+    state: UpdateAllItemState
+    detail: str = Field(..., description='What happened or what to do next.')
+    target: str | None = Field(
+        None, description='Verified node ref or app version being installed.'
+    )
+    startedAt: AwareDatetime | None = Field(
+        None, description='When this item began applying.'
+    )
+    components: dict[str, str] | None = Field(
+        None,
+        description="Expected installed component stamps used to verify a node's return.",
+    )
+
+
+class UpdateAllRun(BaseModel):
+    """
+    Durable progress of one operator-requested Update all job.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., description='Unique job identifier.')
+    root: str = Field(..., description='Control root machine updated first.')
+    startedAt: AwareDatetime = Field(..., description='When the job was accepted.')
+    expiresAt: AwareDatetime = Field(
+        ..., description='Latest time further work may start.'
+    )
+    finishedAt: AwareDatetime | None = Field(None, description='When all work stopped.')
+    state: UpdateAllRunState
+    items: list[UpdateAllItem] = Field(
+        ...,
+        description='Root first, then workers, with installed apps added after each node returns.',
+    )
+
+
 class UpdateRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -2812,6 +2898,50 @@ class RuntimeProfile(BaseModel):
     )
 
 
+class RuntimeMode(StrEnum):
+    """
+    What an engine is started to do with its model. A *search model*
+    is one that answers `POST /v1/embeddings` (`embedding`) or scores
+    passages against a question (`reranking`); everything else chats.
+    A runtime that does not say is `auto`.
+
+    * `auto` — the agent decides from the file's own header, read
+      when it launches the runtime. A pooling type of 4 (`rank`), or
+      classifier output labels, is `reranking`; any other pooling
+      type, or attention that is not causal, is `embedding`;
+      anything else is `chat`. A file whose header cannot be read is
+      `chat`, as it was before this field existed.
+    * `chat` — text generation, whatever the header says. The
+      command line is exactly the one a chat model had before this
+      field existed: nothing is added to it.
+    * `embedding` — llama.cpp gets `--embeddings`, and `--pooling`
+      only when the header names none (`mean` for a model that is not
+      causal, `last` for one that is). Unless the declaration's
+      `flags` set them, it also gets a 4,096-token context shared by
+      four requests (`contextSize`, `parallelSlots`), so one input may
+      hold 1,024 tokens, and 2,048-token batches (`batchSize`,
+      `ubatchSize`): a model that is not causal embeds no more tokens
+      at once than one physical batch holds, and llama-server
+      refuses a longer input. `extraArgs` still come last.
+    * `reranking` — llama.cpp gets `--reranking` (it sets the
+      pooling itself) and the same four defaults.
+
+    **Measured on b10948 and b11552 (2026-10-11):** a model started
+    without these flags answers neither `POST /v1/embeddings` (501)
+    nor, for an encoder, chat (500), and the gateway listed it as a
+    chat model. With `--embeddings` an encoder answers embeddings and
+    chat is a 500; a causal embedder such as Qwen3-Embedding still
+    produces chat text, which is meaningless. The gateway lists a
+    runtime by what its driver finds it answers, not by this field.
+
+    """
+
+    auto = 'auto'
+    chat = 'chat'
+    embedding = 'embedding'
+    reranking = 'reranking'
+
+
 class Source(StrEnum):
     """
     Which counter answered. On the wire so that "this host cannot
@@ -3074,7 +3204,12 @@ class RuntimeCapabilities(BaseModel):
         ge=1,
     )
     embeddings: bool | None = Field(
-        None, description='Whether this runtime was started in embedding mode.'
+        None,
+        description='Whether this runtime was started as an embedding model: it\nanswers `POST /v1/embeddings`. For llama.cpp it is set from\nthe command line the agent launched the engine with\n(`--embeddings`, or `LLAMA_ARG_EMBEDDINGS`), however the\nruntime came to carry it (`mode`, or `extraArgs`), so it is\n`false` for a chat model and for a reranker, and never a\nguess from the declaration. It is not read back from the\nengine because the engine has nothing to read: `/props` and\n`/v1/models` carry no pooling or embedding field (b11552).\nAbsent for an engine that does not report it.\n',
+    )
+    reranking: bool | None = Field(
+        None,
+        description='Whether this runtime was started to rerank: it answers\n`POST /rerank` (`--reranking`, or `LLAMA_ARG_RERANKING`),\non the same basis as `embeddings`. A reranking runtime also\nanswers `POST /v1/embeddings`, with zeros and gaps where\nnumbers should be (measured on b11552), so `embeddings` is\n`false` for it. Absent for an engine that does not report\nit.\n',
     )
     vision: bool | None = Field(
         None, description='Whether the loaded runtime explicitly reports image input.'
@@ -3084,9 +3219,24 @@ class RuntimeCapabilities(BaseModel):
     )
 
 
+class RuntimeAutoStart(BaseModel):
+    """
+    Body for `PUT /v1/runtimes/{name}/auto-start`.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    autoStart: bool = Field(
+        ..., description='Whether this runtime starts when the agent starts.'
+    )
+
+
 class StopReason(StrEnum):
     """
     * `operator` — an explicit stop, from the UI or the API.
+      Remembered across agent restarts: the runtime stays stopped,
+      whatever its `autoStart`, until something starts it.
     * `idle` — the gateway unloaded it after `idleUnloadSeconds`
       passed with no request for its model. It comes back on the
       next request if `startOnDemand` is set.
@@ -3930,6 +4080,14 @@ class UpdateRun(BaseModel):
     )
 
 
+class UpdateAllStatus(BaseModel):
+    """
+    The latest install-wide update started from this console.
+    """
+
+    run: UpdateAllRun | None = None
+
+
 class HostFirewall(BaseModel):
     """
     What the host firewall says about the ports this install
@@ -4075,6 +4233,10 @@ class RuntimeSpec(BaseModel):
         None,
         description="The model id this runtime serves under, and therefore what a\nclient asks the gateway for. Defaults to the model\nfilename with its extension stripped — plainly-named files\nmean the obvious name is already the right one, so this is\nan override, not a requirement.\n\n**The resolved value is always passed to the engine\nexplicitly, never left to the engine's own default.** vLLM's\ndefault served name is the `--model` argument verbatim, and\nwe launch models by absolute path because the user's files\nstay theirs — so leaving it unset would publish\n`/home/you/models/Qwen3-8B` as an OpenAI model id. That\nleaks the operator's directory layout to every API client\nand, worse, makes the routing key differ per host for the\nsame model, which breaks both multi-host placement and any\nfailover priority list that names a model. llama.cpp derives\nits default from the filename and would have been fine,\nwhich is exactly why this was invisible until a second\nengine existed.\n",
     )
+    mode: RuntimeMode | None = Field(
+        None,
+        description="What the engine is started to do with this model. Absent is\n`auto`: the agent reads the file's own header when it launches\nthe runtime and decides (see `RuntimeMode`).\n\n**A runtime has to say, because the engine will not guess.**\n`llama-server` embeds or reranks only when it is told to at\nlaunch, and a model started the other way does neither: an\nembedding GGUF started as chat answers `POST /v1/embeddings`\nwith a 501 and chat with a 500 (measured on b10948 and b11552,\n2026-10-11), and it was listed as a chat model.\n\n**A search model is meant to stay up.** For `embedding` and\n`reranking` the gateway never unloads the runtime for being\nidle and never starts it on demand (its embeddings door does\nnot wake a stopped runtime), so `idleUnloadSeconds` and\n`startOnDemand` are not acted on, and `Runtime` reports them\nabsent. It starts with the agent like any runtime: `autoStart`\nis true unless the declaration says not.\n\nOnly llama.cpp acts on `embedding` and `reranking`. Any other\nengine accepts `auto` and `chat` and refuses the rest with a\n400: starting vLLM, MLX or Strata one way and reporting\nanother is the lie this field exists to end.\n",
+    )
     host: str | None = Field(
         '127.0.0.1',
         description="Address the engine binds. Defaults to loopback: an engine\nhas no auth of its own, so it must not be exposed directly.\nReaching a model from another machine is the gateway's job,\nand the gateway has auth.\n",
@@ -4087,7 +4249,7 @@ class RuntimeSpec(BaseModel):
     )
     autoStart: bool | None = Field(
         True,
-        description='Whether the agent spawns this runtime at startup and\nrespawns it on exit. False leaves it declared but\n`stopped`, which is how a rarely-used large model stays\nconfigured without holding VRAM.\n',
+        description='Whether the agent spawns this runtime at startup and\nrespawns it on exit. False leaves it declared but\n`stopped`, which is how a rarely-used large model stays\nconfigured without holding VRAM. A runtime someone stopped\nstays stopped at startup whatever this says\n(`StopReason.operator`). `PUT /v1/runtimes/{name}/auto-start`\nchanges it without restarting the engine.\n',
     )
     autoDriver: bool | None = Field(
         True,
@@ -4095,12 +4257,12 @@ class RuntimeSpec(BaseModel):
     )
     idleUnloadSeconds: int | None = Field(
         None,
-        description="Stop the engine after this many seconds with no request for\nits model through the gateway, releasing its GPU memory.\nAbsent or 0 means never, which is every existing\ndeclaration's behaviour unchanged.\n\n**The gateway decides; this agent executes.** Only the\ngateway sees demand, so it tracks the last request per\nruntime and calls `POST .../stop` with `reason: idle` when\nthis expires. A runtime with a request in flight is never\nstopped. Setting this also **opts the runtime into\neviction**: when a `startOnDemand` model will not fit, the\ngateway may stop the most-idle runtimes that carry a timeout\nto make room. A model that must stay resident sets none.\n",
+        description="Stop the engine after this many seconds with no request for\nits model through the gateway, releasing its GPU memory.\nAbsent or 0 means never, which is every existing\ndeclaration's behaviour unchanged.\n\n**The gateway decides; this agent executes.** Only the\ngateway sees demand, so it tracks the last request per\nruntime and calls `POST .../stop` with `reason: idle` when\nthis expires. A runtime with a request in flight is never\nstopped. Setting this also **opts the runtime into\neviction**: when a `startOnDemand` model will not fit, the\ngateway may stop the most-idle runtimes that carry a timeout\nto make room. A model that must stay resident sets none.\n\n**Never for a search model** (`mode`): the embeddings door\ndoes not wake a stopped runtime, so an unloaded embedder\nwould simply stop answering. The agent reports this field\nabsent on a running one, whatever was declared, so the\ngateway neither unloads it nor counts it evictable.\n",
         ge=0,
     )
     startOnDemand: bool | None = Field(
         False,
-        description="Start this runtime when a request arrives for its model and\nit is `stopped`. The gateway calls `POST .../start`, waits\nfor `ready` (bounded by its `swapWaitSeconds`), and serves\nthe request; the response says it did (`swapped_in`). With\n`autoStart: false` and `idleUnloadSeconds` set, this is\nllama-swap's model: declare five, load none, serve whichever\nis asked for, unload it when it goes quiet — several at\nonce when they fit.\n\nFalse by default so that a hand-pressed Stop stays stopped.\n",
+        description="Start this runtime when a request arrives for its model and\nit is `stopped`. The gateway calls `POST .../start`, waits\nfor `ready` (bounded by its `swapWaitSeconds`), and serves\nthe request; the response says it did (`swapped_in`). With\n`autoStart: false` and `idleUnloadSeconds` set, this is\nllama-swap's model: declare five, load none, serve whichever\nis asked for, unload it when it goes quiet — several at\nonce when they fit.\n\nFalse by default so that a hand-pressed Stop stays stopped.\nChat doors only: a search model (`mode`) is never started on\ndemand.\n",
     )
     flags: dict[str, Any] | None = Field(
         None,
@@ -4154,14 +4316,24 @@ class Runtime(BaseModel):
         None,
         description='Resolved alias — the declared value, or the derived filename.',
     )
+    mode: RuntimeMode | None = Field(
+        None,
+        description='As declared (`RuntimeSpec.mode`). `auto` is what was asked,\nnot what the file turned out to be: `capabilities.embeddings`\nand `capabilities.reranking` say what is running.\n',
+    )
     host: str | None = None
     port: int | None = Field(
         None, description='Resolved port, including one assigned by the agent.'
     )
     autoStart: bool | None = None
     autoDriver: bool | None = None
-    idleUnloadSeconds: int | None = None
-    startOnDemand: bool | None = None
+    idleUnloadSeconds: int | None = Field(
+        None,
+        description='What is in effect, which is what the gateway reads: the\ndeclared value, or absent for a running search model\n(`RuntimeSpec.mode`), which is never unloaded for being idle.\n',
+    )
+    startOnDemand: bool | None = Field(
+        None,
+        description='What is in effect: the declared value, or absent for a\nrunning search model, which is never started on demand.\n',
+    )
     flags: dict[str, Any] | None = None
     extraArgs: list[str] | None = None
     env: dict[str, str] | None = None
@@ -4520,7 +4692,7 @@ class AppManifest(BaseModel):
         dict[constr(pattern=r'^[A-Za-z_][A-Za-z0-9_]{0,127}$'), Environment] | None
     ) = Field(
         None,
-        description="The app's own variables, for an app that is not ours and reads\nits settings from names of its own (C4). Each value is literal\ntext with placeholders filled in at every start:\n\n* `{bindHost}`, `{port}` — where to listen;\n* `{dataDir}` — its private data directory;\n* `{gatewayUrl}` — the gateway, as `EUGENE_PLEXUS_APP_GATEWAY_URL`;\n* `{appUrl}` — the address the console opens it at;\n* `{oidcIssuer}`, `{oidcClientId}` — with `signIn`;\n* `{clientKey}`, `{oidcClientSecret}`, `{appSecret}` — secrets.\n  `{appSecret}` is a random value made at its first start and\n  kept in its data directory.\n\n**Secrets are filled in by the launcher inside the app's own\naccount**, from the files it is given, so they never appear in\nthe spec the agent writes, its logs or the service definition.\nThey are in the app's process environment, as a program that\nreads no files needs them. A name beginning `EUGENE_PLEXUS_` is\nrefused: those are ours.\n",
+        description="The app's own variables, for an app that is not ours and reads\nits settings from names of its own (C4). Each value is literal\ntext with placeholders filled in at every start:\n\n* `{bindHost}`, `{port}` — where to listen;\n* `{dataDir}` — its private data directory;\n* `{gatewayUrl}` — the gateway, as `EUGENE_PLEXUS_APP_GATEWAY_URL`;\n* `{appUrl}` — the address the console opens it at;\n* `{oidcIssuer}`, `{oidcClientId}` — with `signIn`;\n* `{embeddingModel}`, `{rerankModel}` — the install's search\n  model and result sorter as the app's own key sees them (MR6):\n  the first model `GET /v1/models` lists, with that key, whose\n  `x_eugene_plexus.surfaces` include `embeddings` (or `rerank`)\n  and whose `x_eugene_plexus.locality` is `local`, the field\n  Workbench's own chooser reads. Never an outside model, nor\n  one whose locality is `unknown` or absent: documents would\n  leave the install unasked. (Until 2026-10-12 this said\n  `owned_by` is `local`; the gateway lists a runtime's model\n  with its driver's provider there, `openai_compat_custom`,\n  so that rule matched no local model.) A running one\n  (`x_eugene_plexus.ready_backends` above 0, or the field\n  absent) before one that is listed and stopped; a stopped one\n  is still chosen when it is all there is, and the start's\n  notes say it is not running, because an app that keeps what\n  its first start saw is better off with the install's model\n  than with its own default. Read by the launcher at every\n  start; when the gateway lists none, or does not answer\n  within a few seconds, the variable is left unset and the\n  notes say which. A change of model is not a change of\n  connection (`resetOnConnectionChange`): an app's stored\n  vectors belong to the model that made them;\n* `{clientKey}`, `{oidcClientSecret}`, `{appSecret}` — secrets.\n  `{appSecret}` is a random value made at its first start and\n  kept in its data directory.\n\n**A manifest that names `{gatewayUrl}` is not started while\nthe gateway's address is unknown** (MR6, 2026-10-12). Every\nother placeholder with no value leaves its variable unset, but\nan app without the gateway's address uses its own default, and\nOpen WebUI's is `https://api.openai.com/v1`: documents and\nspeech would go there. The start is refused, naming why, and\nis tried again as any refused start is.\n\n**Secrets are filled in by the launcher inside the app's own\naccount**, from the files it is given, so they never appear in\nthe spec the agent writes, its logs or the service definition.\nThey are in the app's process environment, as a program that\nreads no files needs them. A name beginning `EUGENE_PLEXUS_` is\nrefused: those are ours.\n",
         max_length=64,
     )
     healthPath: str | None = Field(
@@ -4530,7 +4702,7 @@ class AppManifest(BaseModel):
     )
     resetOnConnectionChange: str | None = Field(
         None,
-        description="A variable set to `true` for one start, when the gateway's\naddress or the app's key differs from the last start's. For an\napp that copies its settings into its own database at its first\nstart and ignores the environment afterwards (Open WebUI's\n`RESET_CONFIG_ON_START`), so a rotated key is not silently\nignored. That start also clears what its admin set in it, and\nthe agent's log says why.\n",
+        description="A variable set to `true` for one start, when the gateway's\naddress, the app's key, or the manifest's `environment` as\nwritten (its placeholders unfilled) differs from the last\nstart's. For an app that copies its settings into its own\ndatabase at its first start and ignores the environment\nafterwards (Open WebUI's `RESET_CONFIG_ON_START`), so a\nrotated key, or a setting Eugene corrects, is not silently\nignored. That start also clears what its admin set in it, and\nthe agent's log says why. A filled-in value that changes\n(`{embeddingModel}`) is not a change.\n\nThe environment joined on 2026-10-12 (MR6): Open WebUI 0.11.4\npoints every address it does not get (documents' embeddings,\nspeech, images) at `https://api.openai.com/v1`, so since C4\nan uploaded document's text was sent there (and refused, for\nwant of a key). The corrected entry names the gateway for\neach, and reaches an install that already started by this\nreset, once.\n",
         pattern='^[A-Za-z_][A-Za-z0-9_]{0,127}$',
     )
     licenseUrl: AnyUrl | None = Field(
