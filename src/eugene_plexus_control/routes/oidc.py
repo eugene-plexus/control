@@ -398,7 +398,7 @@ async def sign_in(request: Request) -> Response:
     if (
         person is not None
         and not client.get("builtin")
-        and not oidc.may_use(person, client["clientId"])
+        and not oidc.may_use(machine.state, person, client["clientId"])
     ):
         return _page(
             403,
@@ -496,13 +496,28 @@ async def token(request: Request) -> JSONResponse:
                 or not oidc.pkce_matches(str(form.get("code_verifier") or ""), issued.challenge)
             ):
                 return _oauth_error(400, "invalid_grant", "The code is invalid, used or expired.")
+            code_subject = issued.subject
+            if not builtin:
+                # Group membership can change after approval but before the app
+                # exchanges its code. Recheck the current policy at this boundary.
+                current = oidc.still_valid(
+                    machine.state,
+                    {
+                        "sub": code_subject.sub,
+                        "eugene_auth_at": issued.auth_at,
+                    },
+                    client["clientId"],
+                )
+                if current is None:
+                    return _oauth_error(400, "invalid_grant", "This sign-in no longer has access.")
+                code_subject = current
             answer = oidc.token_response(
                 provider,
                 machine,
                 auth,
                 issuer=issued.issuer,
                 client_id=client["clientId"],
-                subject=issued.subject,
+                subject=code_subject,
                 scope=issued.scope,
                 auth_at=issued.auth_at,
                 sid=secrets.token_urlsafe(16),

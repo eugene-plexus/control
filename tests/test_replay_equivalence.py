@@ -43,6 +43,7 @@ from eugene_plexus_control.applied import (
     ALL_OPS,
     OP_DELETE_COMPONENT,
     OP_DELETE_OIDC_CLIENT,
+    OP_DELETE_PERMISSION_GROUP,
     OP_DELETE_PERSON,
     OP_DELETE_RUNTIME,
     OP_ENROLL_NODE,
@@ -55,6 +56,7 @@ from eugene_plexus_control.applied import (
     OP_PUT_NODE_HELPER,
     OP_PUT_OIDC_CLIENT,
     OP_PUT_OIDC_KEY,
+    OP_PUT_PERMISSION_GROUP,
     OP_PUT_PERSON,
     OP_PUT_RUNTIME,
     OP_REMOVE_SITE,
@@ -108,6 +110,8 @@ EXERCISED_OPS = {
     OP_REVOKE_SESSION,
     OP_PROMOTE,
     OP_PUT_PERSON,
+    OP_PUT_PERMISSION_GROUP,
+    OP_DELETE_PERMISSION_GROUP,
     OP_SET_PERSON_PASSWORD,
     OP_DELETE_PERSON,
     OP_PUT_OIDC_CLIENT,
@@ -396,6 +400,22 @@ def _write_history(machine: StateMachine) -> bytes:
             }
         },
     )
+    for group_id in ("retained-group", "deleted-group"):
+        machine.append(
+            OP_PUT_PERMISSION_GROUP,
+            {
+                "group": {
+                    "id": group_id,
+                    "name": group_id,
+                    "description": "Replay coverage",
+                    "apps": ["app-one"],
+                    "permissions": ["use-job-sites"],
+                    "createdAt": when,
+                    "updatedAt": when,
+                }
+            },
+        )
+    machine.append(OP_DELETE_PERMISSION_GROUP, {"id": "deleted-group"})
     machine.append(
         OP_SET_OIDC_CLIENT_REDIRECTS,
         {"clientId": "app-two", "redirectUris": ["https://two.home.arpa/callback"]},

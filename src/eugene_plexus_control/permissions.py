@@ -38,6 +38,9 @@ def default_on(state: Any, permission: str) -> bool:
 
 def in_effect(state: Any, person: dict[str, Any]) -> list[str]:
     """What applies to `person` now: their own list, or the defaults."""
+    if person.get("groups") is not None:
+        granted = {p for group in _groups(state, person) for p in group["permissions"]}
+        return [p for p in DEFAULTS if p in granted]
     chosen = person.get("permissions")
     if chosen is None:
         return [p for p in DEFAULTS if default_on(state, p)]
@@ -48,7 +51,9 @@ def has(state: Any, subject: str, permission: str) -> bool:
     """Whether person `subject` holds `permission`. Eugene's owner and
     anyone not on the People list hold none."""
     person = state.people.get(subject)
-    return person is not None and permission in in_effect(state, person)
+    return (
+        person is not None and not person.get("disabled") and permission in in_effect(state, person)
+    )
 
 
 def refusal(permission: str) -> str:
@@ -59,3 +64,23 @@ def refusal(permission: str) -> str:
         "Eugene's owner has not let you use job sites as yourself. They can, on Eugene's "
         "People page. A folder a site's owner shares with you still works."
     )
+
+
+def _groups(state: Any, person: dict[str, Any]) -> list[dict[str, Any]]:
+    # Fail closed if corrupt/older state ever refers to an absent group.
+    return [
+        state.permission_groups[g]
+        for g in person.get("groups") or []
+        if g in state.permission_groups
+    ]
+
+
+def apps_in_effect(state: Any, person: dict[str, Any]) -> list[str] | None:
+    """Null grants every app; an explicit empty group selection grants none."""
+    if person.get("groups") is None:
+        apps: list[str] | None = person.get("apps")
+        return apps
+    groups = _groups(state, person)
+    if any(g["apps"] is None for g in groups):
+        return None
+    return sorted({a for g in groups for a in g["apps"]})

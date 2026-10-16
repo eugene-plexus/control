@@ -92,6 +92,8 @@ OP_PUT_CLIENT_ADMISSION = "putClientAdmission"
 OP_REVOKE_SESSION = "revokeSession"
 # Signing in with Eugene (C2, docs/design/sign-in-with-eugene.md).
 OP_PUT_PERSON = "putPerson"
+OP_PUT_PERMISSION_GROUP = "putPermissionGroup"
+OP_DELETE_PERMISSION_GROUP = "deletePermissionGroup"
 # **Retired, and read here for v0.2 only.** Between v0.1.0 and v0.2 these were
 # retired: `putNodeHelper`, an `enrollNode` with the grant `files` (a Job Site
 # that joined as a node), a person's `helperGrants` and a snapshot's
@@ -139,6 +141,8 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_PUT_CLIENT_ADMISSION,
         OP_REVOKE_SESSION,
         OP_PUT_PERSON,
+        OP_PUT_PERMISSION_GROUP,
+        OP_DELETE_PERMISSION_GROUP,
         OP_PUT_NODE_HELPER,
         OP_SET_PERSON_PASSWORD,
         OP_DELETE_PERSON,
@@ -394,6 +398,7 @@ class AppliedState:
     against is built from applied state: a sign-out a standby had not
     seen would be a session a promotion brought back."""
     people: dict[str, dict[str, Any]] = field(default_factory=dict)
+    permission_groups: dict[str, dict[str, Any]] = field(default_factory=dict)
     """People who may sign in to apps (C2), by id, as `SnapshotPerson`:
     their Argon2id verifiers included, for the reason `passphraseVerifier`
     is replicated -- a promoted standby signs them in."""
@@ -871,6 +876,81 @@ def _timestamp(raw: dict[str, Any], key: str, what: str, *, optional: bool = Fal
 PERSON_PERMISSIONS = frozenset({"add-job-sites", "use-job-sites"})
 
 
+def _string_list(raw: Any, label: str, *, limit: int, item_limit: int | None = None) -> None:
+    if (
+        not isinstance(raw, list)
+        or len(raw) > limit
+        or any(
+            not isinstance(v, str) or not v or (item_limit is not None and len(v) > item_limit)
+            for v in raw
+        )
+        or len(set(raw)) != len(raw)
+    ):
+        raise ApplyError(f"invalid {label}")
+
+
+def _permission_group_record(raw: Any) -> dict[str, Any]:
+    required = {"id", "name", "description", "apps", "permissions", "createdAt", "updatedAt"}
+    if not isinstance(raw, dict) or set(raw) != required:
+        raise ApplyError("invalid permission group properties")
+    for key, limit in (("id", 64), ("name", 80), ("description", 500)):
+        value = raw[key]
+        if (
+            not isinstance(value, str)
+            or len(value) > limit
+            or (key != "description" and not value.strip())
+        ):
+            raise ApplyError(f"invalid permission group {key}")
+    if raw["name"] != raw["name"].strip():
+        raise ApplyError("permission group name must be trimmed")
+    if raw["apps"] is not None:
+        _string_list(raw["apps"], "permission group apps", limit=256)
+    _string_list(raw["permissions"], "permission group permissions", limit=16)
+    if any(p not in PERSON_PERMISSIONS for p in raw["permissions"]):
+        raise ApplyError("unknown permission group permission")
+    _timestamp(raw, "createdAt", "permission group")
+    _timestamp(raw, "updatedAt", "permission group")
+    return dict(raw)
+
+
+def _check_group_memberships(groups: dict[str, dict[str, Any]], person: dict[str, Any]) -> None:
+    if any(g not in groups for g in person.get("groups") or []):
+        raise ApplyError("unknown permission group membership")
+
+
+def _apply_put_permission_group(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    record = _permission_group_record(payload.get("group"))
+    if any(
+        g["id"] != record["id"] and g["name"].casefold() == record["name"].casefold()
+        for g in state.permission_groups.values()
+    ):
+        raise ApplyError(f"entry {index}: permission group name is taken")
+    if any(a not in state.oidc_clients for a in record["apps"] or []):
+        raise ApplyError(f"entry {index}: unknown permission group app")
+    return replace(state, permission_groups={**state.permission_groups, record["id"]: record})
+
+
+def _apply_delete_permission_group(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    group_id = payload.get("id")
+    if not isinstance(group_id, str) or group_id not in state.permission_groups:
+        raise ApplyError(f"entry {index}: unknown permission group")
+    people = {
+        key: {**person, "groups": [g for g in person["groups"] if g != group_id]}
+        if person.get("groups") is not None
+        else person
+        for key, person in state.people.items()
+    }
+    return replace(
+        state,
+        people=people,
+        permission_groups={k: v for k, v in state.permission_groups.items() if k != group_id},
+    )
+
+
 def _person_record(raw: Any) -> dict[str, Any]:
     """One `SnapshotPerson`, checked as a client-key record is: exactly the
     fields the schema has, so nothing else can ride into the log."""
@@ -884,6 +964,7 @@ def _person_record(raw: Any) -> dict[str, Any]:
         "passwordVerifier",
         "apps",
         "permissions",
+        "groups",
         "helperGrants",
         "disabled",
         "createdAt",
@@ -912,10 +993,13 @@ def _person_record(raw: Any) -> dict[str, Any]:
     if permissions is not None and (
         not isinstance(permissions, list)
         or len(permissions) > 16
+        or any(not isinstance(p, str) or p not in PERSON_PERMISSIONS for p in permissions)
         or len(set(permissions)) != len(permissions)
-        or any(p not in PERSON_PERMISSIONS for p in permissions)
     ):
         raise ApplyError("invalid person permissions")
+    groups = raw.get("groups")
+    if groups is not None:
+        _string_list(groups, "person groups", limit=64, item_limit=64)
     if not isinstance(raw.get("disabled"), bool):
         raise ApplyError("invalid person disabled")
     # Folder grants on nodes retired with the node folders (J20). Old
@@ -948,6 +1032,7 @@ def _person_record(raw: Any) -> dict[str, Any]:
 def _apply_put_person(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
     """Add a person or replace one, by id. A name is unique, case-folded."""
     record = _person_record(payload.get("person"))
+    _check_group_memberships(state.permission_groups, record)
     folded = record["name"].casefold()
     for other in state.people.values():
         if other["id"] != record["id"] and other["name"].casefold() == folded:
@@ -1038,7 +1123,13 @@ def _apply_delete_oidc_client(
         for key, person in state.people.items()
     }
     clients = {k: v for k, v in state.oidc_clients.items() if k != client_id}
-    return replace(state, oidc_clients=clients, people=people)
+    groups = {
+        key: {**group, "apps": [a for a in group["apps"] if a != client_id]}
+        if group["apps"] is not None
+        else group
+        for key, group in state.permission_groups.items()
+    }
+    return replace(state, oidc_clients=clients, people=people, permission_groups=groups)
 
 
 def _oidc_key_record(raw: Any) -> dict[str, Any]:
@@ -1218,6 +1309,8 @@ _HANDLERS: dict[str, _Handler] = {
     OP_PUT_CLIENT_ADMISSION: _apply_put_client_admission,
     OP_REVOKE_SESSION: _apply_revoke_session,
     OP_PUT_PERSON: _apply_put_person,
+    OP_PUT_PERMISSION_GROUP: _apply_put_permission_group,
+    OP_DELETE_PERMISSION_GROUP: _apply_delete_permission_group,
     OP_PUT_NODE_HELPER: _apply_put_node_helper,
     OP_SET_PERSON_PASSWORD: _apply_set_person_password,
     OP_DELETE_PERSON: _apply_delete_person,
@@ -1304,6 +1397,9 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
         "sealedRecoveryKey": identity.sealedRecoveryKey,
         "signingKeyId": identity.signingKeyId,
         "people": [state.people[key] for key in sorted(state.people)],
+        "permissionGroups": [
+            state.permission_groups[key] for key in sorted(state.permission_groups)
+        ],
         "sites": [_site_canonical(state.sites[key]) for key in sorted(state.sites)],
         # Declared by `Snapshot` for old snapshots, and always empty now (J20).
         "nodeHelpers": [],
@@ -1350,7 +1446,19 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         name = str(spec.get("name") or "")
         runtimes[f"{node}/{name}"] = RuntimeRecord(node=node, spec=spec)
 
+    groups: dict[str, dict[str, Any]] = {}
+    for item in raw.get("permissionGroups") or []:
+        group = _permission_group_record(item)
+        if group["id"] in groups or any(
+            g["name"].casefold() == group["name"].casefold() for g in groups.values()
+        ):
+            raise ApplyError("duplicate permission group")
+        groups[group["id"]] = group
+    people = {(p := _person_record(item))["id"]: p for item in raw.get("people") or []}
+    for person in people.values():
+        _check_group_memberships(groups, person)
     return AppliedState(
+        permission_groups=groups,
         index=int(raw.get("index") or 0),
         epoch=int(raw.get("epoch") or 1),
         nodes={
@@ -1386,7 +1494,7 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         client_admission=validate_ledger(raw.get("clientAdmission")),
         client_keys=_key_records(raw.get("clientKeys", [])),
         revoked_sessions={str(r["jti"]): int(r["exp"]) for r in raw.get("revokedSessions") or []},
-        people={(p := _person_record(item))["id"]: p for item in raw.get("people") or []},
+        people=people,
         sites={(s := _site_from_canonical(item)).id: s for item in raw.get("sites") or []},
         oidc_clients={
             (c := _oidc_client_record(item))["clientId"]: c for item in raw.get("oidcClients") or []

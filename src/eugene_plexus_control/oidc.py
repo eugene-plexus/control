@@ -208,8 +208,10 @@ def redirect_allowed(client: dict[str, Any], uri: str) -> bool:
     return uri in client["redirectUris"]
 
 
-def may_use(person: dict[str, Any], client_id: str) -> bool:
-    apps = person.get("apps")
+def may_use(state: Any, person: dict[str, Any], client_id: str) -> bool:
+    from .permissions import apps_in_effect
+
+    apps = apps_in_effect(state, person)
     return apps is None or client_id in apps
 
 
@@ -434,7 +436,7 @@ def still_valid(state: Any, claims: dict[str, Any], client_id: str) -> Subject |
     if sub == OPERATOR_NAME:
         return OWNER
     person = state.people.get(sub)
-    if person is None or person.get("disabled") or not may_use(person, client_id):
+    if person is None or person.get("disabled") or not may_use(state, person, client_id):
         return None
     auth_at = claims.get("eugene_auth_at")
     if isinstance(auth_at, (int, float)) and iso_to_epoch(person["passwordChangedAt"]) > auth_at:

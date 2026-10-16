@@ -2852,6 +2852,8 @@ class LogOp(StrEnum):
     revokeSession = 'revokeSession'
     promote = 'promote'
     putPerson = 'putPerson'
+    putPermissionGroup = 'putPermissionGroup'
+    deletePermissionGroup = 'deletePermissionGroup'
     putNodeHelper = 'putNodeHelper'
     setPersonPassword = 'setPersonPassword'
     deletePerson = 'deletePerson'
@@ -2867,7 +2869,16 @@ class LogOp(StrEnum):
     setStandby = 'setStandby'
 
 
+class Group(RootModel[str]):
+    root: str = Field(..., max_length=64, min_length=1)
+
+
 class SnapshotPerson(BaseModel):
+    groups: list[Group] | None = Field(
+        None,
+        description='Null or absent keeps individual access. A list uses only the union of these groups; an empty list grants no access. Individual app/permission settings are retained but inactive in group mode.',
+        max_length=64,
+    )
     helperGrants: list[dict[str, Any]] | None = Field(
         None,
         deprecated=True,
@@ -2936,6 +2947,11 @@ class PersonCreateRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
+    groups: list[Group] | None = Field(
+        None,
+        description='Null or absent keeps individual access. A list uses only the union of these groups; an empty list grants no access. Individual app/permission settings are retained but inactive in group mode.',
+        max_length=64,
+    )
     name: str = Field(
         ..., max_length=64, min_length=1, pattern='^[^\\s@][^@]*[^\\s@]$|^[^\\s@]$'
     )
@@ -2953,6 +2969,11 @@ class PersonCreateRequest(BaseModel):
 class PersonUpdateRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
+    )
+    groups: list[Group] | None = Field(
+        None,
+        description='Null or absent keeps individual access. A list uses only the union of these groups; an empty list grants no access. Individual app/permission settings are retained but inactive in group mode.',
+        max_length=64,
     )
     displayName: str | None = Field(None, max_length=120)
     email: str | None = Field(
@@ -3209,6 +3230,59 @@ class AuthInitializeRequest(BaseModel):
         description="Hashed with Argon2id and used to derive the master key that\nat-rest secrets are sealed under. Losing it means losing\nevery stored credential — including the recovery recipient\nthat would otherwise reach a dead node's secrets. There is no\nrecovery path, by design.\n",
         min_length=1,
     )
+
+
+class OwnerAccount(BaseModel):
+    """
+    Protected root owner, listed beside people without changing the existing operator subject or passphrase recovery. Not editable through person/group APIs.
+    """
+
+    id: str
+    name: str
+    displayName: str
+
+
+class PermissionGroup(BaseModel):
+    """
+    A shared collection of app and job-site grants.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(..., max_length=80, min_length=1)
+    description: str = Field(..., max_length=500)
+    apps: list[str] | None = Field(
+        ...,
+        description='Explicit app client IDs; null deliberately grants all apps.',
+        max_length=256,
+    )
+    permissions: list[PersonPermission] = Field(..., max_length=16)
+    createdAt: AwareDatetime
+    updatedAt: AwareDatetime
+
+
+class PermissionGroupWrite(BaseModel):
+    """
+    Complete replacement policy; omitted grants default to no access.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=80, min_length=1)
+    description: str | None = Field('', max_length=500)
+    apps: list[str] | None = Field([], max_length=256)
+    permissions: list[PersonPermission] | None = Field([], max_length=16)
+
+
+class PermissionGroupList(BaseModel):
+    """
+    All permission groups in the central directory.
+    """
+
+    groups: list[PermissionGroup]
 
 
 class SitePersonLink(BaseModel):
@@ -4219,6 +4293,11 @@ class Person(BaseModel):
 
     """
 
+    groups: list[Group] | None = Field(
+        None,
+        description='Null or absent keeps individual access. A list uses only the union of these groups; an empty list grants no access. Individual app/permission settings are retained but inactive in group mode.',
+        max_length=64,
+    )
     id: str = Field(..., description='Stable; the `sub` in their ID tokens.')
     name: str = Field(
         ..., description='What they sign in with. Unique, compared case-folded.'
@@ -4227,6 +4306,10 @@ class Person(BaseModel):
     email: str | None = Field(
         None,
         description='Optional, and unique compared case-folded. Given to an app that\nasks for the `email` scope, with `email_verified: false`: Eugene\nsends no mail and has proved nothing about it. Some apps (Open\nWebUI) identify people by it (C4).\n',
+    )
+    appsInEffect: list[str] | None = Field(
+        None,
+        description='Effective app grants, calculated from groups or individual access. Null means every app; an empty list means none.',
     )
     apps: list[str] | None = Field(
         None,
@@ -4239,7 +4322,7 @@ class Person(BaseModel):
     )
     permissionsInEffect: list[PersonPermission] | None = Field(
         None,
-        description="What applies now, from `permissions` or, when it is null, the install's defaults.",
+        description='Effective permissions from selected groups, or individual permissions/install defaults when groups is null.',
     )
     disabled: bool
     createdAt: AwareDatetime
@@ -4247,6 +4330,7 @@ class Person(BaseModel):
 
 
 class PersonList(BaseModel):
+    owner: OwnerAccount | None = None
     people: list[Person]
     operatorName: str | None = Field(
         None,
@@ -4900,6 +4984,10 @@ class Snapshot(BaseModel):
     controlPublicKey: str | None = Field(
         None,
         description='The public half of the above, carried in the clear so a\nstandby can report the identity it would assume without\nholding the passphrase.\n',
+    )
+    permissionGroups: list[PermissionGroup] | None = Field(
+        None,
+        description='Central access groups. Absent in old snapshots means no groups.',
     )
     people: list[SnapshotPerson] | None = Field(
         None,

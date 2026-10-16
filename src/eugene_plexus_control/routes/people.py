@@ -29,6 +29,10 @@ from .._generated.models import (
     OidcClientCreateRequest,
     OidcClientList,
     OidcClientRedirectsRequest,
+    OwnerAccount,
+    PermissionGroup,
+    PermissionGroupList,
+    PermissionGroupWrite,
     Person,
     PersonCreateRequest,
     PersonList,
@@ -37,8 +41,10 @@ from .._generated.models import (
 )
 from ..applied import (
     OP_DELETE_OIDC_CLIENT,
+    OP_DELETE_PERMISSION_GROUP,
     OP_DELETE_PERSON,
     OP_PUT_OIDC_CLIENT,
+    OP_PUT_PERMISSION_GROUP,
     OP_PUT_PERSON,
     OP_SET_OIDC_CLIENT_REDIRECTS,
     OP_SET_PERSON_PASSWORD,
@@ -74,6 +80,7 @@ def _view(machine: StateMachine, record: dict[str, Any]) -> Person:
         {
             **{k: v for k, v in record.items() if k != "passwordVerifier"},
             "permissionsInEffect": permissions.in_effect(machine.state, record),
+            "appsInEffect": permissions.apps_in_effect(machine.state, record),
         }
     )
 
@@ -139,11 +146,89 @@ def _permissions(chosen: list[Any] | None) -> list[str] | None:
     return [p for p in permissions.DEFAULTS if p in named]
 
 
+def _check_groups(machine: StateMachine, groups: list[str] | None) -> list[str] | None:
+    if groups is not None:
+        if any(g not in machine.state.permission_groups for g in groups):
+            raise problem(422, "Unknown group", "Choose groups from the current directory.")
+        if len(set(groups)) != len(groups):
+            raise problem(422, "Repeated group", "Choose each group once.")
+    return groups
+
+
+def _group(machine: StateMachine, group_id: str) -> dict[str, Any]:
+    group = machine.state.permission_groups.get(group_id)
+    if group is None:
+        raise problem(404, "No such group", "That permission group no longer exists.")
+    return group
+
+
+def _group_write(
+    machine: StateMachine, body: PermissionGroupWrite, group_id: str
+) -> dict[str, Any]:
+    name = body.name.strip()
+    if not name:
+        raise problem(422, "Name required", "Give the group a name.")
+    if any(
+        g["id"] != group_id and g["name"].casefold() == name.casefold()
+        for g in machine.state.permission_groups.values()
+    ):
+        raise problem(409, "Group name taken", "Another group already has that name.")
+    when = oidc.utcnow_iso()
+    existing = machine.state.permission_groups.get(group_id)
+    return {
+        "id": group_id,
+        "name": name,
+        "description": (body.description or "").strip(),
+        "apps": _check_apps(machine, body.apps),
+        "permissions": _permissions(body.permissions) or [],
+        "createdAt": existing["createdAt"] if existing else when,
+        "updatedAt": when,
+    }
+
+
+@router.get("/v1/permission-groups", response_model=PermissionGroupList)
+async def list_groups(request: Request) -> PermissionGroupList:
+    machine = _active(request)
+    groups = sorted(machine.state.permission_groups.values(), key=lambda g: g["name"].casefold())
+    return PermissionGroupList(groups=[PermissionGroup.model_validate(g) for g in groups])
+
+
+@router.post("/v1/permission-groups", response_model=PermissionGroup, status_code=201)
+async def create_group(request: Request, body: PermissionGroupWrite) -> PermissionGroup:
+    machine = _active(request)
+    record = _group_write(machine, body, uuid.uuid4().hex)
+    machine.append(OP_PUT_PERMISSION_GROUP, {"group": record})
+    return PermissionGroup.model_validate(record)
+
+
+@router.put("/v1/permission-groups/{group_id}", response_model=PermissionGroup)
+async def replace_group(
+    request: Request, group_id: str, body: PermissionGroupWrite
+) -> PermissionGroup:
+    machine = _active(request)
+    _group(machine, group_id)
+    record = _group_write(machine, body, group_id)
+    machine.append(OP_PUT_PERMISSION_GROUP, {"group": record})
+    return PermissionGroup.model_validate(record)
+
+
+@router.delete("/v1/permission-groups/{group_id}", status_code=204)
+async def delete_group(request: Request, group_id: str) -> Response:
+    machine = _active(request)
+    _group(machine, group_id)
+    machine.append(OP_DELETE_PERMISSION_GROUP, {"id": group_id})
+    return Response(status_code=204)
+
+
 @router.get("/v1/people", response_model=PersonList, response_model_exclude_none=True)
 async def list_people(request: Request) -> PersonList:
     machine = _active(request)
     people = sorted(machine.state.people.values(), key=lambda p: p["name"].casefold())
-    return PersonList(people=[_view(machine, p) for p in people], operatorName=OPERATOR_NAME)
+    return PersonList(
+        people=[_view(machine, p) for p in people],
+        operatorName=OPERATOR_NAME,
+        owner=OwnerAccount(id=oidc.OWNER.sub, name=OPERATOR_NAME, displayName=oidc.OWNER.name),
+    )
 
 
 @router.post("/v1/people", response_model=Person, status_code=201, response_model_exclude_none=True)
@@ -156,6 +241,7 @@ async def create_person(request: Request, body: PersonCreateRequest) -> Person:
         "name": name,
         "passwordVerifier": security.hash_passphrase(body.password),
         "apps": _check_apps(machine, body.apps),
+        "groups": _check_groups(machine, body.model_dump()["groups"]),
         "disabled": False,
         "createdAt": when,
         "passwordChangedAt": when,
@@ -190,6 +276,8 @@ async def update_person(request: Request, person_id: str, body: PersonUpdateRequ
             record["email"] = email
         else:
             record.pop("email", None)
+    if "groups" in changes:
+        record["groups"] = _check_groups(machine, changes["groups"])
     if "apps" in changes:
         record["apps"] = _check_apps(machine, changes["apps"])
     if "permissions" in changes:
