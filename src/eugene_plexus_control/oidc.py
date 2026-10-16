@@ -1,7 +1,7 @@
 """Eugene as an OpenID Connect provider (C2).
 
 Design: `specs/docs/design/sign-in-with-eugene.md`. The control root signs
-people in to apps: the Authorization Code flow with PKCE (RFC 9700, OAuth
+  people in to apps: the Authorization Code flow with PKCE (RFC 9700, OAuth
 2.1), confidential clients only, RS256 tokens. What lives here:
 
 * **The sign-in key.** A 3072-bit RSA key, made at first need on an
@@ -398,6 +398,7 @@ def token_response(
         "jti": secrets.token_urlsafe(12),
         "client_id": client_id,
         "scope": scope,
+        "eugene_auth_at": auth_at,
     }
     answer: dict[str, Any] = {
         "access_token": provider.mint(machine, auth, access, TYP_ACCESS),

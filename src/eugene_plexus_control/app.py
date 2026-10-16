@@ -41,6 +41,7 @@ from .nodes_client import NodesClient
 from .replication import Follower, StandbyToken
 from .root_tls import RootTls
 from .routes import admin as admin_routes
+from .routes import administration as administration_routes
 from .routes import auth as auth_routes
 from .routes import client_keys as client_key_routes
 from .routes import config as config_routes
@@ -434,6 +435,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Signing in with Eugene (C2): the provider's endpoints, and people.
     app.include_router(oidc_routes.router)
     app.include_router(people_routes.router)
+    app.include_router(administration_routes.router)
     app.include_router(people_routes.app_clients)
     from .routes import sites as site_routes
 

@@ -840,6 +840,7 @@ def _genesis(machine: StateMachine) -> dict[str, Any]:
         "oidcClients": [],
         "oidcKeys": [],
         "revokedSignIns": [],
+        "accessAudit": [],
         "signingKeyId": "1",
         "sealedSigningKey": placeholder("signing"),
     }

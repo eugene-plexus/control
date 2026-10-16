@@ -169,16 +169,36 @@ class StateMachine:
         return ReplicationPosition(applied_index=state.index, epoch=state.epoch)
 
     def admit(
-        self, *, clock: Any, key_id: str, action: str, request_id: str, model: str | None
+        self,
+        *,
+        clock: Any,
+        key_id: str,
+        action: str,
+        request_id: str,
+        model: str | None,
+        person_token: str | None = None,
+        app_metadata_only: bool = False,
     ) -> dict[str, Any]:
         """Read, decide and commit under one lock, including policy edits."""
         from .applied import OP_PUT_CLIENT_ADMISSION
         from .client_admission import decide
+        from .person_access import check
 
         with self._lock:
             if self._role != ROLE_ACTIVE:
                 raise NotActive("Contact the active control root for admission.")
             ledger = self._state.client_admission
+            # Under the same lock as policy writes and reservation commits. Release
+            # remains possible after logout or revocation, without reauthorizing work.
+            if app_metadata_only and (action != "check" or model or person_token):
+                from .client_admission import AdmissionRefusal
+
+                raise AdmissionRefusal(403, "App metadata access cannot authorize inference.")
+            identity = (
+                check(self._state, key_id, person_token)
+                if action != "release" and not app_metadata_only
+                else {}
+            )
             result, candidate = decide(
                 ledger,
                 self._state.client_keys.get(key_id),
@@ -187,6 +207,7 @@ class StateMachine:
                 request_id=request_id,
                 model=model,
                 now=clock.now(ledger["clock"]),
+                principal=identity,
             )
             if candidate is not None:
                 self.append(
@@ -197,7 +218,7 @@ class StateMachine:
                         "bucket": candidate["buckets"].get(key_id, {}),
                     },
                 )
-            return result
+            return {**result, **identity}
 
     def first_available_index(self) -> int:
         with self._lock:
@@ -237,6 +258,7 @@ class StateMachine:
         payload: dict[str, Any],
         *,
         epoch_override: int | None = None,
+        actor: str | None = None,
     ) -> dict[str, Any]:
         """Assign the next index, apply, persist, commit. Active only.
 
@@ -270,6 +292,7 @@ class StateMachine:
                 # here — once, by the writer — so replay uses this value
                 # rather than the replica's clock.
                 "at": datetime.now(UTC).isoformat(),
+                **({"actor": actor} if actor is not None else {}),
             }
 
             candidate = apply(self._state, entry)

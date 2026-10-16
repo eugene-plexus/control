@@ -129,7 +129,11 @@ async def create_key(
         expiresAt=datetime.fromtimestamp(expires, UTC),
         limits=ClientKeyLimits.model_validate(limits),
     )
-    machine.append(OP_PUT_CLIENT_KEY, {"key": key.model_dump(mode="json", exclude_none=True)})
+    machine.append(
+        OP_PUT_CLIENT_KEY,
+        {"key": key.model_dump(mode="json", exclude_none=True)},
+        actor=op.claims.sub,
+    )
     if op.node is not None:
         log.info("%s made key %r (id %s) for the operator acting on it", op.node, name, key_id)
     return ClientKeyCreated(key=key, token=token)
@@ -168,7 +172,11 @@ async def revoke_key(request: Request, id: str, op: ActingOperator) -> None:
     if not op.may_name(record.get("name")):
         raise refuse_for_node(op, "revoke keys")
     if not record.get("revokedAt"):
-        machine.append(OP_REVOKE_CLIENT_KEY, {"id": id, "revokedAt": datetime.now(UTC).isoformat()})
+        machine.append(
+            OP_REVOKE_CLIENT_KEY,
+            {"id": id, "revokedAt": datetime.now(UTC).isoformat()},
+            actor=op.claims.sub,
+        )
         if op.node is not None:
             log.info("%s revoked key %r for the operator acting on it", op.node, record.get("name"))
 
@@ -185,7 +193,7 @@ async def set_limits(request: Request, key_id: str, body: ClientKeyUpdateRequest
         raise problem(404, "No such key", "This key is not in the registry.")
     try:
         limits = validate_limits(body.limits.model_dump(exclude_none=True))
-        machine.append(OP_SET_CLIENT_KEY_LIMITS, {"id": key_id, "limits": limits})
+        machine.append(OP_SET_CLIENT_KEY_LIMITS, {"id": key_id, "limits": limits}, actor="operator")
     except ValueError as exc:
         raise problem(422, "Invalid limits", str(exc)) from exc
     return ClientKey.model_validate(machine.state.client_keys[key_id])
@@ -201,6 +209,13 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
     machine = active(request)
     try:
         ledger = machine.state.client_admission
+        purpose = getattr(body.purpose, "value", body.purpose)
+        if purpose in ("logs", "catalog") and (
+            body.action.value != "check" or body.model or body.personToken
+        ):
+            raise AdmissionRefusal(
+                403, "App metadata access only permits checking the app's grants."
+            )
         clock = getattr(request.app.state, "admission_clock", None)
         if clock is None:
             clock = AdmissionClock(ledger["clock"])
@@ -212,6 +227,8 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
                 action=body.action.value,
                 request_id=body.requestId,
                 model=body.model,
+                person_token=body.personToken,
+                app_metadata_only=purpose in ("logs", "catalog"),
             )
         )
         return ClientAdmissionResult.model_validate(result)

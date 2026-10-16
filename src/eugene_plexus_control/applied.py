@@ -392,6 +392,7 @@ class AppliedState:
     identity: InstallIdentity = field(default_factory=InstallIdentity)
     client_keys: dict[str, dict[str, Any]] = field(default_factory=dict)
     client_admission: dict[str, Any] = field(default_factory=lambda: {"clock": 0.0, "buckets": {}})
+    access_audit: list[dict[str, Any]] = field(default_factory=list)
     revoked_sessions: dict[str, int] = field(default_factory=dict)
     """Signed-out sessions, `jti -> exp`, as `revokeSession` wrote them.
     Replicated because the trust bundle every machine checks sessions
@@ -452,6 +453,9 @@ def apply(state: AppliedState, entry: dict[str, Any]) -> AppliedState:
         )
 
     mutated = _HANDLERS[op](state, payload, index)
+    from .access_audit import changed
+
+    mutated = replace(mutated, access_audit=changed(state.access_audit, entry))
     # Epoch is carried forward from the entry, never from a local clock
     # or a local guess. `promote` is the only op that raises it, and it
     # does so by stamping a higher epoch on its own entry, which is what
@@ -916,6 +920,8 @@ def _permission_group_record(raw: Any) -> dict[str, Any]:
 def _check_group_memberships(groups: dict[str, dict[str, Any]], person: dict[str, Any]) -> None:
     if any(g not in groups for g in person.get("groups") or []):
         raise ApplyError("unknown permission group membership")
+    if any(g not in groups for g in person.get("administration", {}).get("membershipGroups", [])):
+        raise ApplyError("unknown administration membership group")
 
 
 def _apply_put_permission_group(
@@ -944,6 +950,17 @@ def _apply_delete_permission_group(
         else person
         for key, person in state.people.items()
     }
+    for key, person in people.items():
+        grants = person.get("administration", {})
+        if group_id in grants.get("membershipGroups", []):
+            people[key] = {
+                **person,
+                "administration": {
+                    **grants,
+                    "membershipGroups": [g for g in grants["membershipGroups"] if g != group_id],
+                },
+                "administrationVersion": person.get("administrationVersion", 0) + 1,
+            }
     return replace(
         state,
         people=people,
@@ -969,9 +986,27 @@ def _person_record(raw: Any) -> dict[str, Any]:
         "disabled",
         "createdAt",
         "passwordChangedAt",
+        "administration",
+        "administrationVersion",
     }
     if raw.keys() - allowed:
         raise ApplyError("unexpected person property")
+    grants = raw.get("administration", {})
+    if not isinstance(grants, dict) or grants.keys() - {
+        "managePeople",
+        "manageGroups",
+        "membershipGroups",
+    }:
+        raise ApplyError("invalid administration grants")
+    for permission in ("managePeople", "manageGroups"):
+        if type(grants.get(permission, False)) is not bool:
+            raise ApplyError("invalid administration permission")
+    _string_list(
+        grants.get("membershipGroups", []), "administration scope", limit=64, item_limit=64
+    )
+    version = raw.get("administrationVersion", 0)
+    if type(version) is not int or version < 0:
+        raise ApplyError("invalid administration version")
     for key in ("id", "name", "passwordVerifier"):
         if not isinstance(raw.get(key), str) or not raw[key]:
             raise ApplyError(f"invalid person {key}")
@@ -1051,6 +1086,7 @@ def _apply_set_person_password(
             **state.people[person_id],
             "passwordVerifier": payload.get("passwordVerifier"),
             "passwordChangedAt": payload.get("passwordChangedAt"),
+            "administrationVersion": state.people[person_id].get("administrationVersion", 0) + 1,
         }
     )
     return replace(state, people={**state.people, person_id: record})
@@ -1385,6 +1421,7 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
         "config": dict(state.config),
         "clientKeys": [state.client_keys[key] for key in sorted(state.client_keys)],
         "clientAdmission": state.client_admission,
+        "accessAudit": state.access_audit,
         "salt": identity.salt,
         "passphraseVerifier": identity.passphraseVerifier,
         "sealedSigningKey": identity.sealedSigningKey,
@@ -1437,6 +1474,7 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
     snapshotted, so anything this drops is a divergence waiting for a
     promotion to reveal it.
     """
+    from .access_audit import validate as validate_audit
     from .client_admission import validate_ledger
 
     runtimes: dict[str, RuntimeRecord] = {}
@@ -1492,6 +1530,7 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         runtimes=runtimes,
         config=dict(raw.get("config") or {}),
         client_admission=validate_ledger(raw.get("clientAdmission")),
+        access_audit=validate_audit(raw.get("accessAudit", [])),
         client_keys=_key_records(raw.get("clientKeys", [])),
         revoked_sessions={str(r["jti"]): int(r["exp"]) for r in raw.get("revokedSessions") or []},
         people=people,

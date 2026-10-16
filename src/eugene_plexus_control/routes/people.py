@@ -1,4 +1,4 @@
-"""People, and the apps that sign in with Eugene (C2). Operator only.
+"""People and app sign-in registrations, with scoped directory administration.
 
 Design: `specs/docs/design/sign-in-with-eugene.md` §2-§4. A person is an
 account the owner adds so someone can sign in to the apps they are given;
@@ -24,6 +24,7 @@ from fastapi.responses import Response
 
 from .. import oidc, permissions, security
 from .._generated.models import (
+    AdministrationGrants,
     OidcClient,
     OidcClientCreated,
     OidcClientCreateRequest,
@@ -39,6 +40,7 @@ from .._generated.models import (
     PersonPasswordRequest,
     PersonUpdateRequest,
 )
+from ..administration import DirectoryAdministrator, require_administrator
 from ..applied import (
     OP_DELETE_OIDC_CLIENT,
     OP_DELETE_PERMISSION_GROUP,
@@ -59,7 +61,7 @@ from ..dependencies import (
 )
 from ..state_machine import StateMachine
 
-router = APIRouter(tags=["people"], dependencies=[Depends(require_operator)])
+router = APIRouter(tags=["people"], dependencies=[Depends(require_administrator)])
 # Registering and removing an app's sign-in is also what installing an app on
 # another machine does, so these two take a node acting for the operator as
 # well, confined to that node's own apps (`require_operator_or_acting_node`).
@@ -194,29 +196,37 @@ async def list_groups(request: Request) -> PermissionGroupList:
 
 
 @router.post("/v1/permission-groups", response_model=PermissionGroup, status_code=201)
-async def create_group(request: Request, body: PermissionGroupWrite) -> PermissionGroup:
+async def create_group(
+    request: Request, body: PermissionGroupWrite, admin: DirectoryAdministrator
+) -> PermissionGroup:
+    admin.require("manageGroups")
     machine = _active(request)
     record = _group_write(machine, body, uuid.uuid4().hex)
-    machine.append(OP_PUT_PERMISSION_GROUP, {"group": record})
+    machine.append(OP_PUT_PERMISSION_GROUP, {"group": record}, actor=admin.claims.sub)
+    admin.audit("create-group", record["id"])
     return PermissionGroup.model_validate(record)
 
 
 @router.put("/v1/permission-groups/{group_id}", response_model=PermissionGroup)
 async def replace_group(
-    request: Request, group_id: str, body: PermissionGroupWrite
+    request: Request, group_id: str, body: PermissionGroupWrite, admin: DirectoryAdministrator
 ) -> PermissionGroup:
+    admin.require("manageGroups")
     machine = _active(request)
     _group(machine, group_id)
     record = _group_write(machine, body, group_id)
-    machine.append(OP_PUT_PERMISSION_GROUP, {"group": record})
+    machine.append(OP_PUT_PERMISSION_GROUP, {"group": record}, actor=admin.claims.sub)
+    admin.audit("edit-group", group_id)
     return PermissionGroup.model_validate(record)
 
 
 @router.delete("/v1/permission-groups/{group_id}", status_code=204)
-async def delete_group(request: Request, group_id: str) -> Response:
+async def delete_group(request: Request, group_id: str, admin: DirectoryAdministrator) -> Response:
+    admin.require("manageGroups")
     machine = _active(request)
     _group(machine, group_id)
-    machine.append(OP_DELETE_PERMISSION_GROUP, {"id": group_id})
+    machine.append(OP_DELETE_PERMISSION_GROUP, {"id": group_id}, actor=admin.claims.sub)
+    admin.audit("delete-group", group_id)
     return Response(status_code=204)
 
 
@@ -232,7 +242,17 @@ async def list_people(request: Request) -> PersonList:
 
 
 @router.post("/v1/people", response_model=Person, status_code=201, response_model_exclude_none=True)
-async def create_person(request: Request, body: PersonCreateRequest) -> Person:
+async def create_person(
+    request: Request, body: PersonCreateRequest, admin: DirectoryAdministrator
+) -> Person:
+    admin.require("managePeople")
+    if not admin.owner and body.model_fields_set & {"apps", "permissions", "groups", "email"}:
+        raise problem(
+            403,
+            "Owner required",
+            "New delegated accounts start without access or email. "
+            "Assign permitted group memberships separately.",
+        )
     machine = _active(request)
     name = _check_name(machine, body.name)
     when = oidc.utcnow_iso()
@@ -241,7 +261,7 @@ async def create_person(request: Request, body: PersonCreateRequest) -> Person:
         "name": name,
         "passwordVerifier": security.hash_passphrase(body.password),
         "apps": _check_apps(machine, body.apps),
-        "groups": _check_groups(machine, body.model_dump()["groups"]),
+        "groups": _check_groups(machine, body.model_dump()["groups"]) if admin.owner else [],
         "disabled": False,
         "createdAt": when,
         "passwordChangedAt": when,
@@ -255,15 +275,30 @@ async def create_person(request: Request, body: PersonCreateRequest) -> Person:
     email = _check_email(machine, body.email)
     if email:
         record["email"] = email
-    machine.append(OP_PUT_PERSON, {"person": record})
+    machine.append(OP_PUT_PERSON, {"person": record}, actor=admin.claims.sub)
+    admin.audit("create-person", record["id"])
     return _view(machine, machine.state.people[record["id"]])
 
 
 @router.patch("/v1/people/{person_id}", response_model=Person, response_model_exclude_none=True)
-async def update_person(request: Request, person_id: str, body: PersonUpdateRequest) -> Person:
+async def update_person(
+    request: Request, person_id: str, body: PersonUpdateRequest, admin: DirectoryAdministrator
+) -> Person:
     machine = _active(request)
     record = dict(_person(machine, person_id))
     changes = body.model_dump(exclude_unset=True)
+    admin.ordinary_account(record)
+    if not admin.owner:
+        if changes.keys() & {"apps", "permissions", "email"}:
+            raise problem(
+                403,
+                "Owner required",
+                "Only the owner can change individual access or an account's email identity.",
+            )
+        if changes.keys() & {"displayName", "disabled"}:
+            admin.require("managePeople")
+        if "groups" in changes:
+            admin.memberships(record.get("groups"), changes["groups"])
     if "displayName" in changes:
         display = (changes["displayName"] or "").strip()
         if display:
@@ -287,17 +322,24 @@ async def update_person(request: Request, person_id: str, body: PersonUpdateRequ
         else:
             record["permissions"] = chosen
     if "disabled" in changes and changes["disabled"] is not None:
+        if bool(changes["disabled"]) != record["disabled"]:
+            record["administrationVersion"] = record.get("administrationVersion", 0) + 1
         record["disabled"] = bool(changes["disabled"])
-    machine.append(OP_PUT_PERSON, {"person": record})
+    machine.append(OP_PUT_PERSON, {"person": record}, actor=admin.claims.sub)
+    admin.audit("edit-person", person_id)
     return _view(machine, machine.state.people[person_id])
 
 
 @router.delete("/v1/people/{person_id}", status_code=204)
-async def delete_person(request: Request, person_id: str) -> Response:
+async def delete_person(
+    request: Request, person_id: str, admin: DirectoryAdministrator
+) -> Response:
+    admin.require("managePeople")
     machine = _active(request)
-    _person(machine, person_id)
+    admin.ordinary_account(_person(machine, person_id))
     owned = [s for s, record in machine.state.sites.items() if record.owner == person_id]
-    machine.append(OP_DELETE_PERSON, {"id": person_id})
+    machine.append(OP_DELETE_PERSON, {"id": person_id}, actor=admin.claims.sub)
+    admin.audit("delete-person", person_id)
     # Their sites went with them (J19): end what was queued for those sites
     # now, as removing a site does, rather than leave it to time out.
     from .. import sites
@@ -308,7 +350,9 @@ async def delete_person(request: Request, person_id: str) -> Response:
     return Response(status_code=204)
 
 
-@router.put("/v1/people/{person_id}/password", status_code=204)
+@router.put(
+    "/v1/people/{person_id}/password", status_code=204, dependencies=[Depends(require_operator)]
+)
 async def set_password(request: Request, person_id: str, body: PersonPasswordRequest) -> Response:
     machine = _active(request)
     _person(machine, person_id)
@@ -319,8 +363,30 @@ async def set_password(request: Request, person_id: str, body: PersonPasswordReq
             "passwordVerifier": security.hash_passphrase(body.password),
             "passwordChangedAt": oidc.utcnow_iso(),
         },
+        actor="operator",
     )
     return Response(status_code=204)
+
+
+@router.put(
+    "/v1/people/{person_id}/administration",
+    response_model=Person,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_operator)],
+)
+async def set_administration(
+    request: Request, person_id: str, body: AdministrationGrants, admin: DirectoryAdministrator
+) -> Person:
+    machine = _active(request)
+    record = dict(_person(machine, person_id))
+    grants = body.model_dump()
+    _check_groups(machine, grants["membershipGroups"])
+    if record.get("administration", {}) != grants:
+        record["administration"] = grants
+        record["administrationVersion"] = record.get("administrationVersion", 0) + 1
+        machine.append(OP_PUT_PERSON, {"person": record}, actor=admin.claims.sub)
+        admin.audit("delegate-administration", person_id)
+    return _view(machine, machine.state.people[person_id])
 
 
 # --------------------------------------------------------------------------- #
@@ -386,7 +452,7 @@ async def create_client(
     }
     if body.owner:
         record["owner"] = body.owner
-    machine.append(OP_PUT_OIDC_CLIENT, {"client": record})
+    machine.append(OP_PUT_OIDC_CLIENT, {"client": record}, actor=op.claims.sub)
     return OidcClientCreated(client=_client_view(record), clientSecret=secret)
 
 
@@ -421,7 +487,11 @@ async def set_client_redirects(
     redirects = _check_redirects([uri.root for uri in body.redirectUris])
     if redirects == record.get("redirectUris"):
         return _client_view(record)
-    machine.append(OP_SET_OIDC_CLIENT_REDIRECTS, {"clientId": client_id, "redirectUris": redirects})
+    machine.append(
+        OP_SET_OIDC_CLIENT_REDIRECTS,
+        {"clientId": client_id, "redirectUris": redirects},
+        actor=op.claims.sub,
+    )
     return _client_view(machine.state.oidc_clients[client_id])
 
 
@@ -433,5 +503,5 @@ async def delete_client(request: Request, client_id: str, op: ActingOperator) ->
         raise problem(404, "No such app", "No app that signs in with Eugene has that id.")
     if not op.may_name(record.get("owner")):
         raise refuse_for_node(op, "remove sign-in")
-    machine.append(OP_DELETE_OIDC_CLIENT, {"clientId": client_id})
+    machine.append(OP_DELETE_OIDC_CLIENT, {"clientId": client_id}, actor=op.claims.sub)
     return Response(status_code=204)

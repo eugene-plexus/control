@@ -897,6 +897,16 @@ class Action(StrEnum):
     release = 'release'
 
 
+class Purpose(StrEnum):
+    """
+    Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.
+    """
+
+    inference = 'inference'
+    logs = 'logs'
+    catalog = 'catalog'
+
+
 class ClientAdmissionRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -904,7 +914,17 @@ class ClientAdmissionRequest(BaseModel):
     action: Action
     keyId: str = Field(..., max_length=128, min_length=1)
     requestId: str = Field(..., max_length=128, min_length=1)
+    purpose: Purpose | None = Field(
+        'inference',
+        description='Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.',
+    )
     model: str | None = Field(None, max_length=256, min_length=1)
+    personToken: str | None = Field(
+        None,
+        description='Root-issued OIDC access token carried alongside the app key in\nX-Eugene-Person-Token. The root checks its signature, session,\ncurrent person access and exact registered app owner on every check,\nacquisition and renewal. Required for app:workbench@ keys. Never\npersist or log this token. A standalone authority refuses it.\n',
+        max_length=16384,
+        min_length=1,
+    )
 
 
 class ClientAdmissionResult(BaseModel):
@@ -913,6 +933,10 @@ class ClientAdmissionResult(BaseModel):
     )
     keyId: str
     keyName: str
+    personId: str | None = Field(
+        None, description='Stable subject verified by the root'
+    )
+    appClientId: str | None = None
     limits: ClientKeyLimits | None = None
     leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
 
@@ -2783,6 +2807,21 @@ class StandbyStatus(BaseModel):
     )
 
 
+class AccessAuditEvent(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    index: int = Field(..., ge=1)
+    at: str
+    actor: str = Field(..., max_length=256, min_length=1)
+    action: str = Field(..., max_length=128, min_length=1)
+    target: str = Field(..., max_length=256, min_length=1)
+
+
+class AccessAudit(BaseModel):
+    events: list[AccessAuditEvent] = Field(..., max_length=1000)
+
+
 class LogOp(StrEnum):
     """
     **`setStandby` (2026-10-08)** gives one node the `standby` grant
@@ -2873,34 +2912,6 @@ class Group(RootModel[str]):
     root: str = Field(..., max_length=64, min_length=1)
 
 
-class SnapshotPerson(BaseModel):
-    groups: list[Group] | None = Field(
-        None,
-        description='Null or absent keeps individual access. A list uses only the union of these groups; an empty list grants no access. Individual app/permission settings are retained but inactive in group mode.',
-        max_length=64,
-    )
-    helperGrants: list[dict[str, Any]] | None = Field(
-        None,
-        deprecated=True,
-        description='Read from snapshots written before slice 2b.1, and ignored (J20).',
-    )
-    id: str
-    name: str
-    displayName: str | None = None
-    email: str | None = None
-    passwordVerifier: str = Field(
-        ..., description="Argon2id, the passphrase's parameters."
-    )
-    apps: list[str] | None = None
-    permissions: list[str] | None = Field(
-        None,
-        description="Since 2b.3b (J77). Absent in a snapshot written before then, which reads as null, the install's defaults.",
-    )
-    disabled: bool
-    createdAt: AwareDatetime
-    passwordChangedAt: AwareDatetime
-
-
 class SnapshotOidcClient(BaseModel):
     clientId: str
     name: str
@@ -2917,6 +2928,55 @@ class SnapshotOidcKey(BaseModel):
     sealedKey: str
     publicJwk: dict[str, Any]
     createdAt: AwareDatetime
+
+
+class MembershipGroup(RootModel[str]):
+    root: str = Field(..., max_length=64, min_length=1)
+
+
+class AdministrationGrants(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    managePeople: bool | None = Field(
+        False,
+        description='Create accounts with no access, edit display names, disable/enable or delete ordinary accounts. No password resets, email changes, individual access edits, self edits or changes to other administrators.',
+    )
+    manageGroups: bool | None = Field(
+        False,
+        description='Define groups and their app/job-site grants. Does not assign memberships or administration rights. May change access for existing members of these groups.',
+    )
+    membershipGroups: list[MembershipGroup] | None = Field(
+        [],
+        description='May add/remove ordinary accounts in exactly these groups. Preserve memberships outside this scope. May not change individual-access mode, self or other administrators.',
+        max_length=64,
+        validate_default=True,
+    )
+
+
+class AdministrationLoginRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=64, min_length=1)
+    password: str = Field(..., max_length=1024, min_length=1)
+
+
+class AdministrationSession(BaseModel):
+    """
+    When owner is true, authority is unrestricted and the membershipGroups scope is not applicable. The owner's session uses the existing owner logout endpoint.
+    """
+
+    personId: str
+    name: str
+    owner: bool
+    grants: AdministrationGrants
+
+
+class AdministrationLoginResponse(BaseModel):
+    sessionToken: str
+    expiresAt: AwareDatetime
+    session: AdministrationSession
 
 
 class PersonPermission(StrEnum):
@@ -4250,6 +4310,11 @@ class LogEntry(BaseModel):
         description='The control-root generation that appended this entry. A\nstandby rejects entries from an epoch below the highest it\nhas seen, which fences a superseded root out of the log as\nwell as out of the agents.\n',
     )
     op: LogOp
+    actor: str | None = Field(
+        None,
+        description='Verified actor of an access change. Absent on legacy records; never inferred as owner.',
+        max_length=256,
+    )
     payload: dict[str, Any] | None = Field(
         None, description='Operation-specific. Shape follows `op`.'
     )
@@ -4286,13 +4351,48 @@ class SnapshotSite(BaseModel):
     devGrants: list[SiteDevGrant] | None = Field(None, max_length=64)
 
 
+class SnapshotPerson(BaseModel):
+    administration: AdministrationGrants | None = None
+    administrationVersion: int | None = Field(
+        None,
+        description='Absent is zero. Increased on delegation, disable/enable and password changes to invalidate administration sessions.',
+        ge=0,
+    )
+    groups: list[Group] | None = Field(
+        None,
+        description='Null or absent keeps individual access. A list uses only the union of these groups; an empty list grants no access. Individual app/permission settings are retained but inactive in group mode.',
+        max_length=64,
+    )
+    helperGrants: list[dict[str, Any]] | None = Field(
+        None,
+        deprecated=True,
+        description='Read from snapshots written before slice 2b.1, and ignored (J20).',
+    )
+    id: str
+    name: str
+    displayName: str | None = None
+    email: str | None = None
+    passwordVerifier: str = Field(
+        ..., description="Argon2id, the passphrase's parameters."
+    )
+    apps: list[str] | None = None
+    permissions: list[str] | None = Field(
+        None,
+        description="Since 2b.3b (J77). Absent in a snapshot written before then, which reads as null, the install's defaults.",
+    )
+    disabled: bool
+    createdAt: AwareDatetime
+    passwordChangedAt: AwareDatetime
+
+
 class Person(BaseModel):
     """
-    Someone the operator lets sign in to apps (C2). Not an operator:
-    a person's sign-in opens their apps and nothing in the hub.
+    A stable account for apps. Explicit owner-granted administration may also
+    open directory management; it never grants owner or private-chat access.
 
     """
 
+    administration: AdministrationGrants | None = None
     groups: list[Group] | None = Field(
         None,
         description='Null or absent keeps individual access. A list uses only the union of these groups; an empty list grants no access. Individual app/permission settings are retained but inactive in group mode.',
@@ -4936,6 +5036,7 @@ class Snapshot(BaseModel):
         None,
         description='Durable logical clock and per-key admission buckets; replayed verbatim with leases and rolling-window charges.',
     )
+    accessAudit: list[AccessAuditEvent] | None = Field(None, max_length=1000)
     clientKeys: list[ClientKey] | None = None
     index: int
     epoch: int

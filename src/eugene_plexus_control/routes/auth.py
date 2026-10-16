@@ -353,6 +353,7 @@ async def logout(request: Request) -> None:
                 # Stamped by this writer, once, so replay prunes the same entries.
                 "prunedBefore": int(time.time()) - tokens.LEEWAY_SECONDS,
             },
+            actor=claims.sub,
         )
     except NotActive as exc:
         raise problem(

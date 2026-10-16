@@ -237,6 +237,30 @@ def test_without_use_job_sites_ones_own_workspaces_are_left_out_and_refused(
 # --- a linked person's own (J67, J68, J76) -----------------------------------------------
 
 
+@pytest.mark.parametrize("withdraw", ["group", "membership"])
+def test_group_withdrawal_blocks_existing_job_site_credentials(root: TestClient, withdraw: str):
+    a, bo, token = people_site(root)
+    made = root.post(
+        "/v1/permission-groups",
+        json={"name": "Site users", "apps": None, "permissions": ["use-job-sites"]},
+    )
+    assert made.status_code == 201, made.text
+    group_id = made.json()["id"]
+    assert root.patch(f"/v1/people/{bo['id']}", json={"groups": [group_id]}).status_code == 200
+    assert call_through(root, a, token, "Mine")["subject"] == bo["id"]
+    if withdraw == "group":
+        assert (
+            root.put(
+                f"/v1/permission-groups/{group_id}",
+                json={"name": "Site users", "apps": None, "permissions": []},
+            ).status_code
+            == 200
+        )
+    else:
+        assert root.patch(f"/v1/people/{bo['id']}", json={"groups": []}).status_code == 200
+    assert call(root, a, token, "Mine").status_code == 403
+
+
 def test_a_linked_person_adds_a_workspace_held_for_their_own_key(root: TestClient) -> None:
     c = root
     a, bo, bo_token = people_site(c)

@@ -435,6 +435,7 @@ async def sign_in(request: Request) -> Response:
                 "passwordVerifier": security.hash_passphrase(new_password),
                 "passwordChangedAt": oidc.utcnow_iso(),
             },
+            actor=subject.sub,
         )
         log.info("%s changed their password", person["name"])
     provider.close_request(ident)
@@ -611,5 +612,6 @@ async def revoke(request: Request) -> Response:
         machine.append(
             OP_REVOKE_SIGN_IN,
             {"sid": claims["sid"], "exp": int(claims["exp"]), "prunedBefore": oidc.now()},
+            actor=claims["sub"],
         )
     return Response(status_code=200, headers=_NO_STORE)
