@@ -69,7 +69,10 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any
+
+from . import sign_in_state
 
 # Op names, matching `LogOp` in control.yaml. Duplicated as constants
 # rather than imported from the generated enum so this module stays free
@@ -124,7 +127,8 @@ OPERATOR_NAME = "operator"
 OIDC_KEYS_KEPT = 2
 
 ALL_OPS: frozenset[str] = frozenset(
-    {
+    set(sign_in_state.OPS)
+    | {
         OP_ENROLL_NODE,
         OP_UPDATE_NODE,
         OP_REVOKE_NODE,
@@ -393,6 +397,11 @@ class AppliedState:
     client_keys: dict[str, dict[str, Any]] = field(default_factory=dict)
     client_admission: dict[str, Any] = field(default_factory=lambda: {"clock": 0.0, "buckets": {}})
     access_audit: list[dict[str, Any]] = field(default_factory=list)
+    browser_sign_in: dict[str, Any] = field(
+        default_factory=lambda: {
+            k: {} for k in ("providers", "identities", "invitations", "sessions")
+        }
+    )
     revoked_sessions: dict[str, int] = field(default_factory=dict)
     """Signed-out sessions, `jti -> exp`, as `revokeSession` wrote them.
     Replicated because the trust bundle every machine checks sessions
@@ -1101,6 +1110,7 @@ def _apply_delete_person(state: AppliedState, payload: dict[str, Any], index: in
     return replace(
         state,
         people={k: v for k, v in state.people.items() if k != person_id},
+        browser_sign_in=sign_in_state.without_person(state.browser_sign_in, person_id),
         sites={k: v for k, v in state.sites.items() if v.owner != person_id},
     )
 
@@ -1360,6 +1370,7 @@ _HANDLERS: dict[str, _Handler] = {
     OP_SET_SITE_HOST: _apply_set_site_host,
     OP_SET_SITE_DEV_GRANTS: _apply_set_site_dev_grants,
     OP_SET_STANDBY: _apply_set_standby,
+    **{op: partial(sign_in_state.apply, op=op) for op in sign_in_state.OPS},
 }
 
 
@@ -1422,6 +1433,7 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
         "clientKeys": [state.client_keys[key] for key in sorted(state.client_keys)],
         "clientAdmission": state.client_admission,
         "accessAudit": state.access_audit,
+        "browserSignIn": state.browser_sign_in,
         "salt": identity.salt,
         "passphraseVerifier": identity.passphraseVerifier,
         "sealedSigningKey": identity.sealedSigningKey,
@@ -1534,6 +1546,7 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         client_keys=_key_records(raw.get("clientKeys", [])),
         revoked_sessions={str(r["jti"]): int(r["exp"]) for r in raw.get("revokedSessions") or []},
         people=people,
+        browser_sign_in=sign_in_state.validate(raw.get("browserSignIn", {}), people),
         sites={(s := _site_from_canonical(item)).id: s for item in raw.get("sites") or []},
         oidc_clients={
             (c := _oidc_client_record(item))["clientId"]: c for item in raw.get("oidcClients") or []

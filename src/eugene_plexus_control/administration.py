@@ -108,6 +108,12 @@ async def require_administrator(
                 ),
             ),
         )
+    from .external_sign_in import valid_session
+
+    if claims.browser_session and not valid_session(
+        machine.state, claims.browser_session, claims.sub
+    ):
+        raise problem(401, "Sign-in ended", "Your shared sign-in ended. Sign in again.")
     person = machine.state.people.get(claims.sub)
     if (
         person is None

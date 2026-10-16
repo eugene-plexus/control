@@ -46,6 +46,7 @@ from .routes import auth as auth_routes
 from .routes import client_keys as client_key_routes
 from .routes import config as config_routes
 from .routes import control as control_routes
+from .routes import external_sign_in as external_sign_in_routes
 from .routes import health as health_routes
 from .routes import nodes as node_routes
 from .routes import oidc as oidc_routes
@@ -434,6 +435,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(admin_routes.router)
     # Signing in with Eugene (C2): the provider's endpoints, and people.
     app.include_router(oidc_routes.router)
+    app.include_router(external_sign_in_routes.router)
+    app.include_router(external_sign_in_routes.management)
     app.include_router(people_routes.router)
     app.include_router(administration_routes.router)
     app.include_router(people_routes.app_clients)

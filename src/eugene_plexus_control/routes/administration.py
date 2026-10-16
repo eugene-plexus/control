@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
 
@@ -73,14 +74,23 @@ async def login(
             "Check your name and password, and that the owner has granted administration access.",
         )
     auth.clear_login_failures(remote)
-    token, expires = auth.signer().mint(
+    response.headers["Cache-Control"] = "no-store"
+    return issue_session(request, person)
+
+
+def issue_session(
+    request: Request, person: dict[str, Any], *, browser_session: str | None = None
+) -> AdministrationLoginResponse:
+    token, expires = request.app.state.auth_state.signer().mint(
         typ=tokens.TYP_ADMINISTRATION,
         sub=person["id"],
         aud=[tokens.RECIPIENT_CONTROL],
         ttl_seconds=tokens.ADMINISTRATION_TTL_SECONDS,
-        extra={"administration_version": person.get("administrationVersion", 0)},
+        extra={
+            "administration_version": person.get("administrationVersion", 0),
+            **({"eugene_browser_session": browser_session} if browser_session else {}),
+        },
     )
-    response.headers["Cache-Control"] = "no-store"
     return AdministrationLoginResponse(
         sessionToken=token,
         expiresAt=datetime.fromtimestamp(expires, UTC),

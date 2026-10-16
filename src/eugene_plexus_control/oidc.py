@@ -191,6 +191,14 @@ def is_site_link_redirect(uri: str) -> bool:
 
 def find_client(state: Any, client_id: str) -> dict[str, Any] | None:
     """A registered app, or the built-in site-link client."""
+    from .external_sign_in import ACCOUNT_CLIENT, ADMIN_CLIENT
+
+    if client_id in (ADMIN_CLIENT, ACCOUNT_CLIENT):
+        return {
+            "clientId": client_id,
+            "name": "People and access" if client_id == ADMIN_CLIENT else "Your Eugene account",
+            "builtin": True,
+        }
     if client_id == SITE_LINK_CLIENT:
         return {
             "clientId": SITE_LINK_CLIENT,
@@ -202,7 +210,15 @@ def find_client(state: Any, client_id: str) -> dict[str, Any] | None:
     return found
 
 
-def redirect_allowed(client: dict[str, Any], uri: str) -> bool:
+def redirect_allowed(client: dict[str, Any], uri: str, issuer: str | None = None) -> bool:
+    from .external_sign_in import ACCOUNT_CLIENT, ADMIN_CLIENT
+
+    if client["clientId"] in (ADMIN_CLIENT, ACCOUNT_CLIENT):
+        return issuer is not None and uri == (
+            issuer + "/account"
+            if client["clientId"] == ACCOUNT_CLIENT
+            else issuer.removesuffix("/oidc") + "/administration/"
+        )
     if client.get("builtin"):
         return is_site_link_redirect(uri)
     return uri in client["redirectUris"]
@@ -230,6 +246,7 @@ class PendingRequest:
     scope: str
     issuer: str
     expires: float
+    binding: str = ""
 
 
 @dataclass
@@ -243,6 +260,7 @@ class IssuedCode:
     subject: Subject
     auth_at: float
     expires: float
+    browser_session: str | None = None
 
 
 @dataclass
@@ -377,11 +395,14 @@ def token_response(
     nonce: str | None,
     refresh_token: str | None = None,
     with_refresh: bool = True,
+    browser_session: str | None = None,
 ) -> dict[str, Any]:
     """ID and access tokens for one sign-in, and a refresh token unless one
     is being reused (refresh tokens are not rotated; D6)."""
     issued = now()
     base = {"iss": issuer, "sub": subject.sub, "aud": client_id, "iat": issued, "sid": sid}
+    if browser_session is not None:
+        base["eugene_browser_session"] = browser_session
     id_claims = {
         **base,
         "exp": issued + ID_TOKEN_TTL_SECONDS,
@@ -429,6 +450,13 @@ def still_valid(state: Any, claims: dict[str, Any], client_id: str) -> Subject |
     None when the sign-in was revoked, the app is gone, or the person was
     deleted, disabled, taken off this app, or given a new password after
     the sign-in (D6, D9)."""
+    from .external_sign_in import valid_session
+
+    parent = claims.get("eugene_browser_session")
+    if parent is not None and (
+        not isinstance(parent, str) or not valid_session(state, parent, claims.get("sub"))
+    ):
+        return None
     if claims.get("sid") in state.revoked_sign_ins:
         return None
     if client_id not in state.oidc_clients:
@@ -485,6 +513,8 @@ def page(
     asks_name: bool = False,
     error: str | None = None,
     hint: str | None = None,
+    providers: list[dict[str, Any]] | None = None,
+    continue_name: str | None = None,
 ) -> str:
     e = html.escape
     parts = [
@@ -497,6 +527,14 @@ def page(
         parts.append(f"<p class='sub'>{e(app_name)} asks who you are. Eugene checks it.</p>")
     if error:
         parts.append(f'<p class="error" role="alert">{e(error)}</p>')
+    if continue_name and action and request_id:
+        parts.append(
+            f"<form method='post' action='{e(action)}'>"
+            f'<input type="hidden" name="request" value="{e(request_id)}">'
+            "<input type='hidden' name='use_session' value='yes'>"
+            f"<button>Continue as {e(continue_name)}</button></form>"
+            "<p class='hint'>Or sign in with another account below.</p>"
+        )
     if action and request_id:
         parts.append(f"<form method='post' action='{e(action)}'>")
         parts.append(f'<input type="hidden" name="request" value="{e(request_id)}">')
@@ -526,17 +564,32 @@ def page(
             )
             parts.append(f"<p class='hint'>At least {MIN_PASSWORD} characters.</p></details>")
         parts.append("<button type='submit'>Sign in</button></form>")
+    if providers and action and request_id:
+        issuer = action.removesuffix("/authorize")
+        parts.append("<p class='hint'>Or use a connected account</p>")
+        for provider in providers:
+            parts.append(
+                f"<form method='post' action='{e(issuer)}/external/start'>"
+                f"<input type='hidden' name='request' value='{e(request_id)}'>"
+                f"<input type='hidden' name='provider' value='{e(provider['id'])}'>"
+                f"<button>Continue with {e(provider['name'])}</button></form>"
+            )
+        parts.append(
+            f"<p class='hint'><a href='{e(issuer)}/invitation'>Have an invitation code?</a></p>"
+        )
     if hint:
         parts.append(f"<p class='hint'>{e(hint)}</p>")
     parts.append("</main></body></html>")
     return "".join(parts)
 
 
-def page_headers(redirect_uri: str | None = None) -> dict[str, str]:
+def page_headers(redirect_uri: str | None = None, *, external: bool = False) -> dict[str, str]:
     """No framing, no scripts, no caching; the form may go to this
     provider and, because Chrome applies `form-action` to the redirect
     after a post, to the app it sends the browser back to."""
     form_action = "'self'"
+    if external:
+        form_action += " https: http://127.0.0.1:* http://localhost:* http://[::1]:*"
     if redirect_uri:
         parts = urlsplit(redirect_uri)
         form_action += f" {parts.scheme}://{parts.netloc}"

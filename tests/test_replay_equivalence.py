@@ -93,6 +93,14 @@ from .conftest import (
 # Every op that changes replicated state, exercised in one history. The
 # two that are not here are absent by design and asserted so below.
 EXERCISED_OPS = {
+    "putExternalProvider",
+    "deleteExternalProvider",
+    "putSignInInvitation",
+    "deleteSignInInvitation",
+    "linkExternalIdentity",
+    "deleteExternalIdentity",
+    "putBrowserSignIn",
+    "deleteBrowserSignIn",
     OP_ENROLL_NODE,
     OP_UPDATE_NODE,
     OP_REVOKE_NODE,
@@ -152,6 +160,61 @@ def _seed_identity(machine: StateMachine) -> None:
             "signingKeyId": "1",
         }
     )
+
+
+def _write_browser_history(machine: StateMachine, when: str) -> None:
+    provider = {
+        "id": "provider",
+        "name": "Shared sign-in",
+        "kind": "oidc",
+        "issuer": "https://idp.example/",
+        "clientId": "registered-app",
+        "tokenAuthMethod": "client_secret_basic",
+        "enabled": True,
+        "revision": "revision-one",
+        "sealedSecret": placeholder("provider-secret"),
+    }
+    machine.append("putExternalProvider", {"record": provider})
+    invitation = {
+        "id": "a" * 64,
+        "personId": "p-ada",
+        "providerId": "provider",
+        "expiresAt": 2000000000,
+        "passwordChangedAt": when,
+    }
+    machine.append("putSignInInvitation", {"record": invitation})
+    machine.append("deleteSignInInvitation", {"id": invitation["id"]})
+    machine.append("putSignInInvitation", {"record": invitation})
+    identity = {
+        "id": "linked-ada",
+        "personId": "p-ada",
+        "providerId": "provider",
+        "issuer": provider["issuer"],
+        "subject": "external-ada",
+        "createdAt": 1800000000.5,
+    }
+    machine.append("linkExternalIdentity", {"record": identity, "invitationId": invitation["id"]})
+    session = {
+        "id": "b" * 64,
+        "personId": "p-ada",
+        "issuer": "https://eugene.example/oidc",
+        "authAt": 1800000000.5,
+        "expiresAt": 2000000000,
+        "label": "Browser",
+        "identityId": identity["id"],
+        "providerRevision": provider["revision"],
+    }
+    machine.append("putBrowserSignIn", {"record": session})
+    machine.append("deleteBrowserSignIn", {"id": session["id"]})
+    machine.append("putBrowserSignIn", {"record": session})
+    # Exercise cascade removal, then retain nonempty identity/session state for snapshot checks.
+    machine.append("deleteExternalIdentity", {"id": identity["id"]})
+    machine.append("deleteExternalProvider", {"id": provider["id"]})
+    machine.append("putExternalProvider", {"record": provider})
+    machine.append("putSignInInvitation", {"record": invitation})
+    machine.append("linkExternalIdentity", {"record": identity, "invitationId": invitation["id"]})
+    machine.append("putBrowserSignIn", {"record": session})
+    machine.append("putSignInInvitation", {"record": {**invitation, "id": "c" * 64}})
 
 
 def _root_key() -> tuple[bytes, str]:
@@ -376,6 +439,7 @@ def _write_history(machine: StateMachine) -> bytes:
                 }
             },
         )
+    _write_browser_history(machine, when)
     machine.append(
         OP_PUT_OIDC_CLIENT,
         {
@@ -841,6 +905,7 @@ def _genesis(machine: StateMachine) -> dict[str, Any]:
         "oidcKeys": [],
         "revokedSignIns": [],
         "accessAudit": [],
+        "browserSignIn": {},
         "signingKeyId": "1",
         "sealedSigningKey": placeholder("signing"),
     }

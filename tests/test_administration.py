@@ -277,6 +277,8 @@ def test_no_grants_no_login_and_worker_cannot_forge_or_exchange(active_client: T
         {"extra": {"administration_version": True}},
         {"extra": {"administration_version": -1}},
         {"extra": {"administration_version": 1, "sid": "other-session"}},
+        {"extra": {"administration_version": 1, "eugene_browser_session": "invalid"}},
+        {"extra": {"administration_version": 1, "eugene_browser_session": 42}},
     ],
 )
 def test_administration_token_profile_is_narrow(

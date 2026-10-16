@@ -7,6 +7,14 @@ from ._generated.models import AccessAuditEvent
 
 LIMIT = 1000
 TARGETS = {
+    "putExternalProvider": ("record", "id"),
+    "deleteExternalProvider": ("id",),
+    "putSignInInvitation": ("record", "personId"),
+    "deleteSignInInvitation": ("id",),
+    "linkExternalIdentity": ("record", "personId"),
+    "deleteExternalIdentity": ("id",),
+    "putBrowserSignIn": ("record", "personId"),
+    "deleteBrowserSignIn": ("id",),
     "putPerson": ("person", "id"),
     "deletePerson": ("id",),
     "setPersonPassword": ("id",),

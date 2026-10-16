@@ -26,6 +26,7 @@ import jwt
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from .. import external_sign_in as sso
 from .. import oidc, peer, permissions, security, tokens
 from ..applied import OP_REVOKE_SIGN_IN, OP_SET_PERSON_PASSWORD, OPERATOR_NAME
 from ..dependencies import verify_bearer
@@ -205,7 +206,9 @@ async def jwks(request: Request) -> JSONResponse:
 
 def _page(status: int, redirect_uri: str | None = None, **kwargs: Any) -> HTMLResponse:
     return HTMLResponse(
-        oidc.page(**kwargs), status_code=status, headers=oidc.page_headers(redirect_uri)
+        oidc.page(**kwargs),
+        status_code=status,
+        headers=oidc.page_headers(redirect_uri, external=bool(kwargs.get("providers"))),
     )
 
 
@@ -230,7 +233,7 @@ async def authorize(request: Request) -> Response:
             app_name=None,
             error="This app is not registered with Eugene. Ask the owner to add it.",
         )
-    if not oidc.redirect_allowed(client, redirect_uri):
+    if not oidc.redirect_allowed(client, redirect_uri, _issuer(request)):
         return _page(
             400,
             title="Wrong return address",
@@ -257,6 +260,7 @@ async def authorize(request: Request) -> Response:
         return back("invalid_request", "state and nonce are required.")
     if q.get("request") or q.get("request_uri"):
         return back("request_not_supported", "Request objects are not supported.")
+    binding = secrets.token_urlsafe(32)
     ident = _provider(request).open_request(
         oidc.PendingRequest(
             client_id=client["clientId"],
@@ -267,9 +271,19 @@ async def authorize(request: Request) -> Response:
             scope=_granted_scope(q["scope"]),
             issuer=issuer,
             expires=time.time() + oidc.REQUEST_TTL_SECONDS,
+            binding=binding,
         )
     )
-    return _page(
+    session = sso.browser_session(request, issuer)
+    if session and q.get("prompt") == "none":
+        person = state.people[session["personId"]]
+        return complete_sign_in(
+            request, ident, oidc.subject_of(person), session["authAt"], session["id"]
+        )
+    if q.get("prompt") == "none":
+        _provider(request).close_request(ident)
+        return back("login_required", "Sign in to Eugene first.")
+    response = _page(
         200,
         redirect_uri,
         title=f"Sign in to {client['name']}",
@@ -277,7 +291,86 @@ async def authorize(request: Request) -> Response:
         action=f"{issuer}/authorize",
         request_id=ident,
         asks_name=bool(state.people),
+        continue_name=state.people[session["personId"]]["name"]
+        if session and q.get("prompt") not in ("login", "select_account")
+        else None,
         hint=_hint(state),
+        providers=[p for p in state.browser_sign_in["providers"].values() if p["enabled"]],
+    )
+    sso.set_cookie(response, issuer, binding, flow=True)
+    return response
+
+
+def complete_sign_in(
+    request: Request,
+    ident: str | None,
+    subject: oidc.Subject,
+    auth_at: float,
+    browser_session: str | None = None,
+) -> Response:
+    provider = _provider(request)
+    pending = provider.pending(ident or "")
+    machine = request.app.state.machine
+    if pending is None or pending.issuer != _issuer(request):
+        return _page(
+            400,
+            title="Sign-in expired",
+            app_name=None,
+            error="Return to the app and sign in again.",
+        )
+    client = oidc.find_client(machine.state, pending.client_id)
+    person = machine.state.people.get(subject.sub)
+    allowed = client is not None
+    if pending.client_id == sso.ADMIN_CLIENT:
+        from ..administration import has_grants
+
+        allowed = person is not None and has_grants(person)
+    elif pending.client_id == sso.ACCOUNT_CLIENT:
+        allowed = person is not None
+    elif pending.client_id == oidc.SITE_LINK_CLIENT:
+        allowed = person is not None and permissions.has(
+            machine.state, subject.sub, permissions.USE_JOB_SITES
+        )
+    elif person is not None and client is not None:
+        allowed = oidc.may_use(machine.state, person, client["clientId"])
+    if person is not None and person.get("disabled"):
+        allowed = False
+    if browser_session and not sso.valid_session(machine.state, browser_session, subject.sub):
+        allowed = False
+    if not allowed:
+        return _page(
+            403,
+            title="Access not granted",
+            app_name=client["name"] if client else None,
+            error="This account may not use this app. Ask the owner to review its access.",
+        )
+    try:
+        provider.signing_key(machine, request.app.state.auth_state)
+    except oidc.Locked as exc:
+        return _page(503, title="Eugene is locked", app_name=None, error=str(exc))
+    provider.close_request(ident or "")
+    if pending.client_id == sso.ACCOUNT_CLIENT:
+        return RedirectResponse(pending.redirect_uri, status_code=303, headers=_NO_STORE)
+    code = provider.issue_code(
+        oidc.IssuedCode(
+            client_id=pending.client_id,
+            redirect_uri=pending.redirect_uri,
+            challenge=pending.challenge,
+            nonce=pending.nonce,
+            scope=pending.scope,
+            issuer=pending.issuer,
+            subject=subject,
+            auth_at=auth_at,
+            expires=time.time() + oidc.CODE_TTL_SECONDS,
+            browser_session=browser_session,
+        )
+    )
+    return RedirectResponse(
+        oidc.redirect_with(
+            pending.redirect_uri, {"code": code, "state": pending.state, "iss": pending.issuer}
+        ),
+        status_code=302,
+        headers=_NO_STORE,
     )
 
 
@@ -290,7 +383,12 @@ async def sign_in(request: Request) -> Response:
     provider = _provider(request)
     ident = str(form.get("request") or "")
     pending = provider.pending(ident)
-    if pending is None:
+    if pending is None or (
+        pending.binding
+        and not hmac.compare_digest(
+            pending.binding, request.cookies.get(sso.cookie_name(pending.issuer, flow=True), "")
+        )
+    ):
         return _page(
             400,
             title="This sign-in expired",
@@ -307,6 +405,19 @@ async def sign_in(request: Request) -> Response:
             error="This app is no longer registered with Eugene.",
         )
 
+    if form.get("use_session"):
+        session = sso.browser_session(request, pending.issuer)
+        if session is None:
+            return _page(
+                401, title="Sign-in expired", app_name=None, error="Sign in again to continue."
+            )
+        return complete_sign_in(
+            request,
+            ident,
+            oidc.subject_of(state.people[session["personId"]]),
+            session["authAt"],
+            session["id"],
+        )
     password = str(form.get("password") or "")
     name = str(form.get("name") or "").strip()
     asks_name = bool(state.people)
@@ -322,6 +433,7 @@ async def sign_in(request: Request) -> Response:
             asks_name=asks_name,
             error=error,
             hint=_hint(state),
+            providers=[p for p in state.browser_sign_in["providers"].values() if p["enabled"]],
         )
 
     caller = _caller(request)
@@ -370,7 +482,7 @@ async def sign_in(request: Request) -> Response:
         auth.clear_login_failures(bucket)
     if person is not None and person.get("disabled"):
         return again(403, "Signing in is turned off for you. Ask the owner.")
-    if client.get("builtin") and subject is oidc.OWNER:
+    if client["clientId"] == oidc.SITE_LINK_CLIENT and subject is oidc.OWNER:
         # J37: the link page is for people. Eugene's owner owns no site's links.
         return _page(
             403,
@@ -382,7 +494,7 @@ async def sign_in(request: Request) -> Response:
         )
     if (
         person is not None
-        and client.get("builtin")
+        and client["clientId"] == oidc.SITE_LINK_CLIENT
         and not permissions.has(
             request.app.state.machine.state, str(person["id"]), permissions.USE_JOB_SITES
         )
@@ -438,28 +550,19 @@ async def sign_in(request: Request) -> Response:
             actor=subject.sub,
         )
         log.info("%s changed their password", person["name"])
-    provider.close_request(ident)
-    code = provider.issue_code(
-        oidc.IssuedCode(
-            client_id=client["clientId"],
-            redirect_uri=pending.redirect_uri,
-            challenge=pending.challenge,
-            nonce=pending.nonce,
-            scope=pending.scope,
-            issuer=pending.issuer,
-            subject=subject,
-            auth_at=time.time(),
-            expires=time.time() + oidc.CODE_TTL_SECONDS,
-        )
-    )
-    log.info("%s signed in to %s", subject.preferred_username, client["name"])
-    return RedirectResponse(
-        oidc.redirect_with(
-            pending.redirect_uri, {"code": code, "state": pending.state, "iss": pending.issuer}
-        ),
-        status_code=302,
-        headers={"Cache-Control": "no-store"},
-    )
+    browser_id = None
+    browser_secret = None
+    auth_at = time.time()
+    if person is not None:
+        try:
+            browser_secret, session = sso.new_session(request, pending.issuer, person["id"])
+        except sso.Refused as exc:
+            return again(429, str(exc))
+        browser_id, auth_at = session["id"], session["authAt"]
+    response = complete_sign_in(request, ident, subject, auth_at, browser_id)
+    if browser_secret:
+        sso.set_cookie(response, pending.issuer, browser_secret)
+    return response
 
 
 # A real Argon2id verifier of nothing anyone knows, so an unknown name costs
@@ -498,6 +601,10 @@ async def token(request: Request) -> JSONResponse:
             ):
                 return _oauth_error(400, "invalid_grant", "The code is invalid, used or expired.")
             code_subject = issued.subject
+            if issued.browser_session and not sso.valid_session(
+                machine.state, issued.browser_session, code_subject.sub
+            ):
+                return _oauth_error(400, "invalid_grant", "This sign-in has ended.")
             if not builtin:
                 # Group membership can change after approval but before the app
                 # exchanges its code. Recheck the current policy at this boundary.
@@ -506,6 +613,11 @@ async def token(request: Request) -> JSONResponse:
                     {
                         "sub": code_subject.sub,
                         "eugene_auth_at": issued.auth_at,
+                        **(
+                            {"eugene_browser_session": issued.browser_session}
+                            if issued.browser_session
+                            else {}
+                        ),
                     },
                     client["clientId"],
                 )
@@ -524,6 +636,7 @@ async def token(request: Request) -> JSONResponse:
                 sid=secrets.token_urlsafe(16),
                 nonce=issued.nonce,
                 with_refresh=not builtin,
+                browser_session=issued.browser_session,
             )
             return JSONResponse(answer, headers=_NO_STORE)
         if grant == "refresh_token":
@@ -556,6 +669,7 @@ async def token(request: Request) -> JSONResponse:
                 sid=claims["sid"],
                 nonce=None,
                 refresh_token=presented,
+                browser_session=claims.get("eugene_browser_session"),
             )
             return JSONResponse(answer, headers=_NO_STORE)
     except oidc.Locked as exc:

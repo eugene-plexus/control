@@ -17,6 +17,151 @@ from pydantic import (
 )
 
 
+class ExternalProviderKind(StrEnum):
+    google = 'google'
+    microsoft = 'microsoft'
+    oidc = 'oidc'
+
+
+class ExternalTokenAuthMethod(StrEnum):
+    client_secret_basic = 'client_secret_basic'
+    client_secret_post = 'client_secret_post'
+
+
+class ExternalProvider(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(..., max_length=80, min_length=1)
+    kind: ExternalProviderKind
+    issuer: str = Field(..., max_length=2048, min_length=1)
+    clientId: str = Field(..., max_length=512, min_length=1)
+    tokenAuthMethod: ExternalTokenAuthMethod
+    enabled: bool
+    revision: str = Field(..., max_length=64, min_length=1)
+    hasSecret: bool
+    callbackUrl: str = Field(..., max_length=2048, min_length=1)
+
+
+class ExternalProviderWrite(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=80, min_length=1)
+    kind: ExternalProviderKind
+    issuer: str = Field(..., max_length=2048, min_length=1)
+    clientId: str = Field(..., max_length=512, min_length=1)
+    tokenAuthMethod: ExternalTokenAuthMethod
+    enabled: bool
+    clientSecret: str | None = Field(None, max_length=4096)
+
+
+class ExternalProviderRecord(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(..., max_length=80, min_length=1)
+    kind: ExternalProviderKind
+    issuer: str = Field(..., max_length=2048, min_length=1)
+    clientId: str = Field(..., max_length=512, min_length=1)
+    tokenAuthMethod: ExternalTokenAuthMethod
+    enabled: bool
+    revision: str = Field(..., max_length=64, min_length=1)
+    sealedSecret: str = Field(..., max_length=16384, min_length=1)
+
+
+class ExternalProviderList(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    providers: list[ExternalProvider]
+
+
+class ExternalIdentity(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    personId: str = Field(..., max_length=64, min_length=1)
+    providerId: str = Field(..., max_length=64, min_length=1)
+    issuer: str = Field(..., max_length=2048, min_length=1)
+    subject: str = Field(..., max_length=255, min_length=1)
+    createdAt: float = Field(..., ge=0.0)
+
+
+class BrowserSignIn(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    personId: str = Field(..., max_length=64, min_length=1)
+    issuer: str = Field(..., max_length=2048, min_length=1)
+    authAt: float = Field(..., ge=0.0)
+    expiresAt: int = Field(..., ge=0)
+    label: str = Field(..., max_length=200, min_length=1)
+    identityId: str | None = Field(..., max_length=64)
+    providerRevision: str | None = Field(..., max_length=64)
+
+
+class SignInInvitation(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    personId: str = Field(..., max_length=64, min_length=1)
+    providerId: str = Field(..., max_length=64, min_length=1)
+    expiresAt: int = Field(..., ge=0)
+    passwordChangedAt: str = Field(..., max_length=80, min_length=1)
+
+
+class SignInInvitationRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    providerId: str = Field(..., max_length=64, min_length=1)
+
+
+class SignInInvitationCreated(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    code: str = Field(..., max_length=128, min_length=1)
+    expiresAt: int = Field(..., ge=0)
+    url: str = Field(..., max_length=2048, min_length=1)
+
+
+class PersonSignIn(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    identities: list[ExternalIdentity]
+    sessions: list[BrowserSignIn]
+    invitations: list[SignInInvitation]
+
+
+class BrowserSignInState(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    providers: dict[str, ExternalProviderRecord] | None = Field(
+        {}, validate_default=True
+    )
+    identities: dict[str, ExternalIdentity] | None = Field({}, validate_default=True)
+    invitations: dict[str, SignInInvitation] | None = Field({}, validate_default=True)
+    sessions: dict[str, BrowserSignIn] | None = Field({}, validate_default=True)
+
+
+class AdministrationCodeRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    code: str = Field(..., max_length=512, min_length=1)
+    verifier: str = Field(..., max_length=128, min_length=1)
+    redirectUri: str = Field(..., max_length=2048, min_length=1)
+
+
 class SitePersonCheckRequest(BaseModel):
     """
     A person's Eugene sign-in, typed at the machine to link them there (J36).
@@ -934,7 +1079,7 @@ class ClientAdmissionResult(BaseModel):
     keyId: str
     keyName: str
     personId: str | None = Field(
-        None, description='Stable subject verified by the root'
+        None, description='Stable subject verified by the root, never caller supplied.'
     )
     appClientId: str | None = None
     limits: ClientKeyLimits | None = None
@@ -2906,6 +3051,14 @@ class LogOp(StrEnum):
     setSiteHost = 'setSiteHost'
     setSiteDevGrants = 'setSiteDevGrants'
     setStandby = 'setStandby'
+    putExternalProvider = 'putExternalProvider'
+    deleteExternalProvider = 'deleteExternalProvider'
+    putSignInInvitation = 'putSignInInvitation'
+    deleteSignInInvitation = 'deleteSignInInvitation'
+    linkExternalIdentity = 'linkExternalIdentity'
+    deleteExternalIdentity = 'deleteExternalIdentity'
+    putBrowserSignIn = 'putBrowserSignIn'
+    deleteBrowserSignIn = 'deleteBrowserSignIn'
 
 
 class Group(RootModel[str]):
@@ -5032,6 +5185,7 @@ class Snapshot(BaseModel):
 
     """
 
+    browserSignIn: BrowserSignInState | None = None
     clientAdmission: dict[str, Any] | None = Field(
         None,
         description='Durable logical clock and per-key admission buckets; replayed verbatim with leases and rolling-window charges.',
