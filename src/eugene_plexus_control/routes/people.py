@@ -418,7 +418,7 @@ def _check_redirects(uris: list[str]) -> list[str]:
 async def list_clients(request: Request) -> OidcClientList:
     machine = _active(request)
     clients = sorted(machine.state.oidc_clients.values(), key=lambda c: c["name"].casefold())
-    issuer = machine.state.config.get("oidcIssuer")
+    issuer = oidc.configured_issuer(machine.state.config, request.app.state.settings)
     return OidcClientList(
         clients=[_client_view(c) for c in clients],
         issuer=issuer if isinstance(issuer, str) and issuer.strip() else None,

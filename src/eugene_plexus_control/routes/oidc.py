@@ -75,9 +75,11 @@ def _forwarded(request: Request) -> tuple[str, str, str] | None:
 
 
 def _issuer(request: Request) -> str:
-    configured = request.app.state.machine.state.config.get("oidcIssuer")
-    if isinstance(configured, str) and configured.strip():
-        return configured.strip().rstrip("/")
+    configured = oidc.configured_issuer(
+        request.app.state.machine.state.config, getattr(request.app.state, "settings", None)
+    )
+    if configured:
+        return configured
     forwarded = _forwarded(request)
     if forwarded is not None:
         host, proto, _ = forwarded

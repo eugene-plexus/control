@@ -76,6 +76,14 @@ class ExternalProviderList(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
+    signInAddress: str | None = Field(
+        None,
+        description='Effective canonical sign-in address from an explicit setting or managed console origin. Absent until either is configured; never inferred from request headers.',
+    )
+    managedSignInAddress: str | None = Field(
+        None,
+        description="Sign-in address derived from the root's managed console origin. An explicit oidcIssuer overrides it.",
+    )
     providers: list[ExternalProvider]
 
 
@@ -3226,7 +3234,7 @@ class OidcClientList(BaseModel):
     clients: list[OidcClient]
     issuer: str | None = Field(
         None,
-        description='`oidcIssuer` when the operator set one; otherwise absent, and an app uses the address it reaches Eugene at, with `/oidc`.',
+        description='Explicit oidcIssuer or the managed console origin with /oidc. Otherwise absent, and an app uses the address it reaches Eugene at with /oidc.',
     )
 
 

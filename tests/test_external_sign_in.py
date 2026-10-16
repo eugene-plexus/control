@@ -21,6 +21,51 @@ PASSWORD = "a-private-local-password"
 UPSTREAM_SECRET = "upstream-only-test-secret"
 
 
+def test_managed_sign_in_address_is_canonical_and_explicit_override_survives(active_client):
+    c = active_client
+    c.app.state.settings.agent_public_origin = "https://eugene.example.org:9443"
+    expected = "https://eugene.example.org:9443/oidc"
+    reply = c.get("/v1/auth/providers").json()
+    assert reply["signInAddress"] == reply["managedSignInAddress"] == expected
+    assert c.get("/v1/oidc/clients").json()["issuer"] == expected
+    assert (
+        c.get(
+            "/oidc/.well-known/openid-configuration",
+            headers={
+                "X-Forwarded-Host": "attacker.example",
+                "X-Eugene-Plexus-Forwarded-Host": "evil.example",
+            },
+        ).json()["issuer"]
+        == expected
+    )
+    custom = "https://existing.example.org/oidc"
+    assert c.patch("/v1/config", json={"oidcIssuer": custom}).status_code == 200
+    c.app.state.settings.agent_public_origin = "https://new.example.org"
+    assert c.get("/oidc/.well-known/openid-configuration").json()["issuer"] == custom
+    assert c.get("/v1/auth/providers").json()["signInAddress"] == custom
+    assert c.patch("/v1/config", json={"oidcIssuer": None}).status_code == 200
+    assert c.get("/v1/auth/providers").json()["signInAddress"] == "https://new.example.org/oidc"
+
+
+def test_request_headers_alone_cannot_configure_external_sign_in(active_client):
+    c = active_client
+    reply = c.get("/v1/auth/providers", headers={"X-Forwarded-Host": "evil.example"}).json()
+    assert reply["signInAddress"] is None and reply["managedSignInAddress"] is None
+
+
+def test_managed_address_allows_provider_setup_without_saving_an_override(provider):
+    c, configured, _, _ = provider
+    c.app.state.settings.agent_public_origin = "https://eugene.example.org"
+    assert c.patch("/v1/config", json={"oidcIssuer": None}).status_code == 200
+    body = {
+        k: configured[k]
+        for k in ("name", "kind", "issuer", "clientId", "tokenAuthMethod", "enabled")
+    }
+    response = c.put(f"/v1/auth/providers/{configured['id']}", json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()["callbackUrl"] == "https://eugene.example.org/oidc/external/callback"
+
+
 @pytest.fixture
 def provider(active_client):
     c = active_client

@@ -252,17 +252,16 @@ FIELDS: list[ConfigField] = [
         key="oidcIssuer",
         label="Sign-in address for apps",
         description=(
-            "The one address apps that sign in with Eugene are configured "
-            "with, ending in /oidc -- for example "
-            "http://192.168.1.5:8079/oidc. Set it when apps reach Eugene at "
-            "more than one address and their tokens must all name one."
+            "Override the sign-in address chosen by Container access setup. "
+            "Use the Eugene console's HTTPS address ending in /oidc, "
+            "for example https://eugene.example.com/oidc."
         ),
         category="security",
         valueType=ConfigValueType.url,
         default=None,
         unsetMeans=(
-            "The address the app reaches Eugene at, with /oidc: an app set up "
-            "with http://192.168.1.5:8079/oidc gets that one."
+            "The managed Eugene console address with /oidc. Without Container "
+            "access setup, the address the app reaches Eugene at with /oidc."
         ),
     ),
 ]

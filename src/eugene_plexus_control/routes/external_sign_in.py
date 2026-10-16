@@ -68,10 +68,14 @@ def provider_for(request: Request, ident: str) -> dict[str, Any]:
 async def providers(request: Request, response: Response) -> ExternalProviderList:
     response.headers["Cache-Control"] = "no-store"
     return ExternalProviderList(
+        signInAddress=oidc.configured_issuer(
+            active(request).state.config, request.app.state.settings
+        ),
+        managedSignInAddress=oidc.managed_issuer(request.app.state.settings),
         providers=[
             public_provider(request, p)
             for p in active(request).state.browser_sign_in["providers"].values()
-        ]
+        ],
     )
 
 
@@ -113,7 +117,7 @@ async def write_provider(
         sso.validate_provider(record)
         # Disabling a broken provider must never depend on it being reachable.
         if record["enabled"]:
-            if not machine.state.config.get("oidcIssuer"):
+            if not oidc.configured_issuer(machine.state.config, request.app.state.settings):
                 raise sso.Refused("Save Eugene's sign-in address before enabling a provider.")
             from urllib.parse import urlsplit
 

@@ -17,8 +17,8 @@ Design: `specs/docs/design/sign-in-with-eugene.md`. The control root signs
   lives 60 seconds and is good once; a pending request lives 10 minutes. A
   root restart costs only the sign-ins in flight, which is why neither is
   replicated.
-* **The issuer**, which is `oidcIssuer` when the operator set one and
-  otherwise the address the request arrived at through an agent (D11).
+* **The issuer**, which is `oidcIssuer` when the operator set one, then the
+  managed console origin, then the address reached through an agent (D11).
 """
 
 from __future__ import annotations
@@ -69,6 +69,39 @@ SIGN_IN_WINDOW_SECONDS = 60
 
 #: A person's password: the console's passphrase rule.
 MIN_PASSWORD = 12
+
+
+def managed_issuer(settings: Any) -> str | None:
+    """Use only the root's startup configuration, never a browser's Host header."""
+    origin = getattr(settings, "agent_public_origin", None)
+    if not isinstance(origin, str) or not origin:
+        return None
+    try:
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+            or parsed.port == 0
+            or "\\" in origin
+            or any(c.isspace() for c in origin)
+        ):
+            return None
+    except ValueError:
+        return None
+    return origin.rstrip("/") + ISSUER_PATH
+
+
+def configured_issuer(values: dict[str, Any], settings: Any) -> str | None:
+    """An explicit issuer keeps precedence when migrating an existing setup."""
+    value = values.get("oidcIssuer")
+    if isinstance(value, str) and value.strip():
+        return value.strip().rstrip("/")
+    return managed_issuer(settings)
 
 
 class Locked(Exception):

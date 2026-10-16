@@ -3464,7 +3464,10 @@ class PublicEntryPoint(BaseModel):
 
     consoleUrl: AnyUrl
     workbenchUrl: AnyUrl
-    inferenceUrl: AnyUrl | None = None
+    inferenceUrl: AnyUrl | None = Field(
+        None,
+        description='Model API root, before /v1. May include /inference on the console origin; otherwise the separate inference origin.',
+    )
     nodesUrl: AnyUrl | None = None
     publicSites: bool | None = Field(
         None,
