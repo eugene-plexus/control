@@ -48,6 +48,7 @@ from eugene_plexus_control.applied import (
     OP_DELETE_RUNTIME,
     OP_ENROLL_NODE,
     OP_ENROLL_SITE,
+    OP_LABEL_NODE,
     OP_PATCH_CONFIG,
     OP_PROMOTE,
     OP_PUT_CLIENT_ADMISSION,
@@ -130,6 +131,7 @@ EXERCISED_OPS = {
     OP_SET_SITE_HOST,
     OP_SET_SITE_DEV_GRANTS,
     OP_SET_STANDBY,
+    OP_LABEL_NODE,
 }
 
 
@@ -541,6 +543,11 @@ def _write_history(machine: StateMachine) -> bytes:
     machine.append(OP_SET_STANDBY, {"node": "gpu-büro", "on": True})
     machine.append(OP_SET_STANDBY, {"node": "gpu-büro", "on": False})
     machine.append(OP_SET_STANDBY, {"node": "attic", "on": True})
+    # Labels (node-labels.md): set, cleared, and one kept through the
+    # promotion below so it is in the compared state.
+    machine.append(OP_LABEL_NODE, {"name": "gpu-büro", "label": "Büro GPU"})
+    machine.append(OP_LABEL_NODE, {"name": "gpu-büro", "label": None})
+    machine.append(OP_LABEL_NODE, {"name": "attic", "label": "The Attic"})
     machine.append(OP_REVOKE_NODE, {"name": "gpu-büro"})
     last, last_public = _root_key()
     machine.append(

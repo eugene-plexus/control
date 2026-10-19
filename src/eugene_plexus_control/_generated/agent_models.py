@@ -137,6 +137,9 @@ class ProfileBuildPhase(StrEnum):
       placement passed explicitly.
     * `confirming` — loading the recommended candidate once in
       llama-server and checking it serves.
+    * `drafting` — timing decode in llama-server on the confirmed
+      candidate with each way this model can draft (SD1). Skipped
+      for a model that has nothing to draft with.
     * `finished` — the job has ended; `state` says how.
 
     """
@@ -145,6 +148,7 @@ class ProfileBuildPhase(StrEnum):
     candidates = 'candidates'
     measuring = 'measuring'
     confirming = 'confirming'
+    drafting = 'drafting'
     finished = 'finished'
 
 
@@ -161,6 +165,10 @@ class ProfileBuildEvaluation(BaseModel):
     source: EvaluationTextSource
     sha256: str | None = None
     tokens: int | None = Field(None, ge=0)
+
+
+class DraftFile(RootModel[str]):
+    root: str = Field(..., max_length=4096)
 
 
 class CacheQuality(BaseModel):
@@ -221,6 +229,50 @@ class BuildCandidate(BaseModel):
     graphicsMemoryBytes: int | None = Field(
         None,
         description='Graphics memory used while confirming, where the node can measure it.',
+        ge=0,
+    )
+    detail: str | None = None
+
+
+class DraftWith(StrEnum):
+    """
+    What a llama.cpp runtime drafts with (the profile flag
+    `draftWith`, SD1):
+
+    * `off` — nothing; the default until a settings build has timed
+      the others on the node (S1).
+    * `mtpHead` — the model's own MTP head (`--spec-type draft-mtp`).
+    * `companion` — a companion file (`draftModelPath`) with
+      `--spec-draft-model`, as `draft-mtp` or `draft-simple` by the
+      file's own tensors.
+
+    """
+
+    off = 'off'
+    mtpHead = 'mtpHead'
+    companion = 'companion'
+
+
+class DraftTrial(BaseModel):
+    """
+    One way of drafting, timed in llama-server on the confirmed candidate, with "Reuse repeated text" off so the model's own drafting is what is timed.
+    """
+
+    draftWith: DraftWith
+    draftModelPath: str | None = Field(
+        None,
+        description='The companion file, as the Library names it. Null unless `draftWith` is `companion`.',
+    )
+    decodeTokensPerSecond: float | None = Field(
+        None,
+        description="llama-server's own decode speed for one fixed generation (`timings.predicted_per_second`). Null when it did not serve.",
+        gt=0.0,
+    )
+    draftedTokens: int | None = Field(None, ge=0)
+    acceptedTokens: int | None = Field(None, ge=0)
+    graphicsMemoryBytes: int | None = Field(
+        None,
+        description='Graphics memory used while this trial was loaded, where the node can measure it.',
         ge=0,
     )
     detail: str | None = None
@@ -746,6 +798,16 @@ class ModelRequirementAuthority(StrEnum):
     engine = 'engine'
 
 
+class PreparationVisionMode(StrEnum):
+    """
+    Where to encode images during inference; off prepares text only.
+    """
+
+    off = 'off'
+    cpu = 'cpu'
+    gpu = 'gpu'
+
+
 class Context(RootModel[int]):
     root: int = Field(..., ge=1)
 
@@ -771,6 +833,10 @@ class ModelPreparation(BaseModel):
     contexts: list[Context] | None = Field(
         None,
         description="The context sizes, in tokens, the preparation can be asked for\n(LS5): an engine that fixes the context when it prepares\noffers its own choices, and without one takes its own\nrecommendation for the node. Strata's are its setup's own.\nAbsent: the preparation takes no context.\n",
+    )
+    visionModes: list[PreparationVisionMode] | None = Field(
+        None,
+        description="Image encoder choices supported by this model's preparation. Absent:\nno image preparation is offered. Omitting the choice in a run intent\npreserves text-only preparation. Enabling images downloads an extra\nencoder and uses additional memory while serving.\n",
     )
     minEngineVersion: str | None = Field(
         None,
@@ -1946,6 +2012,171 @@ class LocalStandby(BaseModel):
     )
 
 
+class HostHistoryStep(StrEnum):
+    """
+    A resolution of host history: single samples, or minute or hour
+    rollups. Each is kept for its own retention
+    (`hostHistoryRawHours`, `hostHistoryMinuteDays`,
+    `hostHistoryHourDays`).
+
+    """
+
+    raw = 'raw'
+    minute = 'minute'
+    hour = 'hour'
+
+
+class HostHistoryStepChoice(StrEnum):
+    """
+    A resolution to ask for, or `auto` to let the agent choose.
+    """
+
+    auto = 'auto'
+    raw = 'raw'
+    minute = 'minute'
+    hour = 'hour'
+
+
+class HostMetric(StrEnum):
+    """
+    What a host-history series measures.
+
+    * `gpuMemoryUsed` is every process's use of the card, system-wide.
+      `gpuMemoryEugene` is the part of it held by this agent's own
+      runtimes (their process trees), measured per process, not
+      estimated from a reservation; the rest is everything else on
+      the machine.
+    * `gpuUtilization` is the busiest engine's percentage, the figure
+      Task Manager shows. `gpuTemperature` is the core temperature,
+      `gpuPower` the board's draw.
+    * `diskFree` and `diskTotal` are per volume, for each volume that
+      holds a model folder, the model-copy folder or the engine folder.
+    * `runtimesRunning` counts this agent's runtimes that are ready;
+      `runtimesLoading` those copying, starting or loading.
+
+    """
+
+    gpuMemoryUsed = 'gpuMemoryUsed'
+    gpuMemoryTotal = 'gpuMemoryTotal'
+    gpuMemoryEugene = 'gpuMemoryEugene'
+    gpuUtilization = 'gpuUtilization'
+    gpuTemperature = 'gpuTemperature'
+    gpuPower = 'gpuPower'
+    cpuUtilization = 'cpuUtilization'
+    ramUsed = 'ramUsed'
+    ramTotal = 'ramTotal'
+    swapUsed = 'swapUsed'
+    swapTotal = 'swapTotal'
+    diskFree = 'diskFree'
+    diskTotal = 'diskTotal'
+    runtimesRunning = 'runtimesRunning'
+    runtimesLoading = 'runtimesLoading'
+
+
+class HostUnit(StrEnum):
+    bytes = 'bytes'
+    percent = 'percent'
+    celsius = 'celsius'
+    watts = 'watts'
+    count = 'count'
+
+
+class HostBucket(BaseModel):
+    """
+    One bucket on the window's timeline.
+    """
+
+    start: AwareDatetime
+    samples: int = Field(
+        ...,
+        description='Samples recorded in this bucket. 0 is a gap: nothing was\nrecording.\n',
+        ge=0,
+    )
+    expectedSamples: int = Field(
+        ...,
+        description='How many the sample interval in force would have produced.\nFewer than this is a partial bucket: a missed sample, or the\nstart or end of a gap.\n',
+        ge=1,
+    )
+
+
+class HostSeries(BaseModel):
+    """
+    One measured quantity over the window. `min`, `mean` and `max`
+    have one entry per `HostHistory.buckets` entry, `null` where that
+    bucket holds no reading of this series. For `raw` buckets the three
+    are the same reading.
+
+    """
+
+    key: str = Field(
+        ...,
+        description='Stable across the window and across requests: `gpu:<kind>:<index>`\nplus the metric for a GPU series, `disk:<volume>` plus the metric\nfor a disk series, the metric alone for the rest.\n',
+    )
+    metric: HostMetric
+    unit: HostUnit
+    label: str = Field(
+        ...,
+        description='What to call it on a screen, e.g. `NVIDIA GeForce RTX 5090 memory used`.',
+    )
+    deviceKind: ComputeDeviceKind | None = None
+    deviceIndex: int | None = Field(
+        None,
+        description="The device's `ComputeDevice.index` in `GET /v1/node`, for a GPU series.",
+    )
+    deviceName: str | None = None
+    volume: str | None = Field(
+        None, description="The volume's mount point or drive, for a disk series."
+    )
+    holds: list[str] | None = Field(
+        None,
+        description='For a disk series, the folders on that volume it is measured\nfor: model folders, the model-copy folder, the engine folder.\n',
+    )
+    unavailable: str | None = Field(
+        None,
+        description='Why this host does not report this series, when it does not;\nevery value is then `null`. Absent when it reports.\n',
+    )
+    latest: float | None = Field(
+        None,
+        description='The newest reading, whatever the window. Absent when there is none.',
+    )
+    min: list[float | None]
+    mean: list[float | None]
+    max: list[float | None]
+
+
+class HostHistory(BaseModel):
+    """
+    What this host's hardware did over a window (`GET /v1/node/history`).
+    """
+
+    enabled: bool = Field(
+        ..., description='Whether this agent is recording now (`hostHistoryEnabled`).'
+    )
+    sampleSeconds: int = Field(
+        ..., description='The sample interval in force (`hostHistorySampleSeconds`).'
+    )
+    step: HostHistoryStep
+    stepSeconds: int
+    from_: AwareDatetime = Field(
+        ..., alias='from', description="The window's start, aligned down to the step."
+    )
+    to: AwareDatetime = Field(..., description="The window's end, exclusive.")
+    recordingSince: AwareDatetime | None = Field(
+        None,
+        description='The oldest bucket kept at this resolution. Absent when nothing\nis recorded.\n',
+    )
+    truncated: bool = Field(
+        ...,
+        description="True when `from` is older than this resolution's retention, so\nthe start of the window is gone rather than empty.\n",
+    )
+    latestAt: AwareDatetime | None = Field(
+        None, description='When the newest sample was taken. Absent when there is none.'
+    )
+    storeBytes: int | None = Field(None, description="The store's size on disk.")
+    buckets: list[HostBucket]
+    series: list[HostSeries]
+
+
 class Os(StrEnum):
     windows = 'windows'
     linux = 'linux'
@@ -2338,6 +2569,12 @@ class EnrollRequest(BaseModel):
     name: str | None = Field(
         None,
         description="Requested node name. Defaults to the host's own name, which\nis the answer an operator would have typed anyway.\n",
+    )
+    label: str | None = Field(
+        None,
+        description="The name people see for this machine, passed to the control\nroot's enrollment as `EnrollmentRequest.label` and checked there\n(`NodeLabel` in `control.yaml`). The first-run wizard sends what\nthe person typed for this machine; omitted, the machine is shown\nby its name.\n",
+        max_length=64,
+        min_length=1,
     )
 
 
@@ -2964,6 +3201,46 @@ class RuntimeMode(StrEnum):
     chat = 'chat'
     embedding = 'embedding'
     reranking = 'reranking'
+
+
+class RuntimeSpeculation(BaseModel):
+    """
+    Speculative decoding as this runtime was started with it, and how
+    much of what it drafted the model kept (SD1,
+    docs/design/speculative-decoding.md). Read from the command line
+    and from llama-server's own counters
+    (`llamacpp:spec_decode_num_draft_tokens_total` and
+    `llamacpp:spec_decode_num_accepted_tokens_total` on `/metrics`),
+    which count from the engine's last start. A fact, not advice:
+    Eugene recommends nothing from the rate (S3).
+
+    Absent when the runtime speculates with nothing, or when its
+    engine does not.
+
+    """
+
+    types: list[str] = Field(
+        ...,
+        description="llama.cpp's own names, in the order it tries them for each\nsequence, for example `[ngram-mod, draft-mtp]`.\n",
+    )
+    draftModelPath: str | None = Field(
+        None,
+        description="The companion file it drafts with (`--spec-draft-model`), as this host opens it. Null when it drafts with the model's own head or with no model.",
+    )
+    draftedTokens: int | None = Field(
+        None,
+        description='Tokens drafted since the engine started. Null until it has been read.',
+        ge=0,
+    )
+    acceptedTokens: int | None = Field(
+        None,
+        description='Drafted tokens the model kept. The acceptance rate is this over `draftedTokens`.',
+        ge=0,
+    )
+    note: str | None = Field(
+        None,
+        description='Why speculation the profile asks for is not in effect, for\nexample an engine build that does not offer it. Null when it\nis in effect as asked.\n',
+    )
 
 
 class Source(StrEnum):
@@ -4401,6 +4678,7 @@ class Runtime(BaseModel):
         description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
     )
     loadProgress: LoadProgress | None = None
+    speculation: RuntimeSpeculation | None = None
 
 
 class ModelCopyClearResult(BaseModel):
@@ -4853,6 +5131,12 @@ class ProfileBuildRequest(BaseModel):
     restartAfter: bool | None = Field(
         True, description='Same rule as `BenchmarkRequest.restartAfter`.'
     )
+    draftFiles: list[DraftFile] | None = Field(
+        [],
+        description="Companion files the Library found beside the model\n(`GgufSpeculation.draftFiles` paths), to time in the\n`drafting` phase. Each must sit in the model's own folder;\nthe agent reads each file's kind itself. The model's own MTP\nhead, if it has one, is read from the model file and needs\nnothing here.\n",
+        max_length=8,
+        validate_default=True,
+    )
 
 
 class ProfileBuild(BaseModel):
@@ -4883,6 +5167,15 @@ class ProfileBuild(BaseModel):
     modelSizeBytes: int | None = Field(None, ge=0)
     hardware: dict[str, str] | None = None
     restarts: list[MeasurementRestart]
+    draftTrials: list[DraftTrial] | None = Field(
+        None,
+        description="The `drafting` phase's trials, `off` first. Empty when the model had nothing to draft with, or for a build from before SD1.",
+    )
+    recommendedDraft: int | None = Field(
+        None,
+        description="Index into `draftTrials` of the fastest, which the saved\nprofile's `draftWith` takes (S1). A way of drafting must beat\n`off` by more than 3%, the same tolerance as `recommended`, or\n`off` is kept. Null when nothing was timed.\n",
+        ge=0,
+    )
 
 
 class ProfileBuildList(BaseModel):

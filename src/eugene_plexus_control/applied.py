@@ -114,6 +114,7 @@ OP_REMOVE_SITE = "removeSite"
 OP_SET_SITE_HOST = "setSiteHost"
 OP_SET_SITE_DEV_GRANTS = "setSiteDevGrants"
 OP_SET_STANDBY = "setStandby"
+OP_LABEL_NODE = "labelNode"
 
 #: The grant that makes a node the install's warm standby (warm-standby.md).
 GRANT_STANDBY = "standby"
@@ -157,6 +158,7 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_SET_SITE_HOST,
         OP_SET_SITE_DEV_GRANTS,
         OP_SET_STANDBY,
+        OP_LABEL_NODE,
     }
 )
 
@@ -225,6 +227,9 @@ class NodeRecord:
 
     name: str
     role: str = ROLE_AGENT
+    label: str | None = None
+    """The name people see (`labelNode`, node-labels.md). Display only:
+    never a key, never signed. `None` shows `name`."""
     url: str | None = None
     publicKey: str | None = None
     signingPublicKey: str | None = None
@@ -515,9 +520,20 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
     if not isinstance(raw_devices, list):
         raise ApplyError(f"entry {index}: devices must be a list")
 
+    # A machine that enrolls again under its name keeps its label unless
+    # the enrollment sets one: rebuilding the GPU box should not rename it.
+    previous = state.nodes.get(name)
+    if "label" in payload:
+        label = _label_value(payload.get("label"), index)
+        refusal = label_refusal(state, name, label)
+        if refusal is not None:
+            raise ApplyError(f"entry {index}: {refusal}")
+    else:
+        label = previous.label if previous is not None else None
     record = NodeRecord(
         name=name,
         role=role,
+        label=None if label == name else label,
         url=_optional_str(payload, "url"),
         publicKey=_optional_str(payload, "publicKey"),
         signingPublicKey=_optional_str(payload, "signingPublicKey"),
@@ -585,6 +601,59 @@ def _apply_update_node(state: AppliedState, payload: dict[str, Any], index: int)
             f"{record.advertiseSequence}"
         )
     updated = replace(record, url=_optional_str(payload, "url"), advertiseSequence=sequence)
+    return replace(state, nodes={**state.nodes, name: updated})
+
+
+#: `NodeLabel.maxLength` in control.yaml.
+LABEL_MAX = 64
+
+
+def clean_label(raw: str) -> str:
+    """A label as it is stored: trimmed, nothing else changed."""
+    return raw.strip()
+
+
+def label_refusal(state: AppliedState, name: str, label: str | None) -> str | None:
+    """Why `label` cannot be node `name`'s label, or None if it can.
+
+    The route asks before appending and apply asks again, because apply is
+    all a standby runs. **A label may not match another node's name or
+    label, ignoring case** (node-labels.md §1): two machines shown under one
+    name is a console that sends a click to the wrong one."""
+    if label is None:
+        return None
+    if not label or label != label.strip():
+        return "a label is trimmed and not empty"
+    if len(label) > LABEL_MAX:
+        return f"a label is at most {LABEL_MAX} characters"
+    if any(ord(c) < 0x20 or 0x7F <= ord(c) < 0xA0 for c in label):
+        return "a label cannot hold a control character"
+    folded = label.casefold()
+    for other in state.nodes.values():
+        if other.name == name:
+            continue
+        if other.name.casefold() == folded or (other.label or "").casefold() == folded:
+            return f"another machine is already called {label!r} ({other.name!r})"
+    return None
+
+
+def _label_value(raw: Any, index: int) -> str | None:
+    if raw is None or isinstance(raw, str):
+        return raw
+    raise ApplyError(f"entry {index}: 'label' must be a string or null, got {raw!r}")
+
+
+def _apply_label_node(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    """Set or clear one node's label. Nothing else about the node changes."""
+    name = _require_str(payload, "name", index)
+    record = state.nodes.get(name)
+    if record is None:
+        raise ApplyError(f"entry {index}: cannot label unknown node {name!r}")
+    label = _label_value(payload.get("label"), index)
+    refusal = label_refusal(state, name, label)
+    if refusal is not None:
+        raise ApplyError(f"entry {index}: {refusal}")
+    updated = replace(record, label=None if label == name else label)
     return replace(state, nodes={**state.nodes, name: updated})
 
 
@@ -1340,6 +1409,7 @@ _HANDLERS: dict[str, _Handler] = {
     OP_SET_SITE_HOST: _apply_set_site_host,
     OP_SET_SITE_DEV_GRANTS: _apply_set_site_dev_grants,
     OP_SET_STANDBY: _apply_set_standby,
+    OP_LABEL_NODE: _apply_label_node,
     **{op: partial(sign_in_state.apply, op=op) for op in sign_in_state.OPS},
 }
 
@@ -1375,6 +1445,7 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
             {
                 "name": n.name,
                 "role": n.role,
+                "label": n.label,
                 "url": n.url,
                 "reachable": False,
                 "publicKey": n.publicKey,
@@ -1489,6 +1560,7 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
             str(n["name"]): NodeRecord(
                 name=str(n["name"]),
                 role=str(n.get("role") or ROLE_AGENT),
+                label=n.get("label"),
                 url=n.get("url"),
                 publicKey=n.get("publicKey"),
                 signingPublicKey=n.get("signingPublicKey"),

@@ -37,6 +37,7 @@ from .._generated.models import (
     Node,
     NodeAddressAck,
     NodeAddressAnnouncement,
+    NodeLabelRequest,
     NodeList,
     Reason,
     SignedTrustBundle,
@@ -45,10 +46,13 @@ from .._generated.models import (
 )
 from ..applied import (
     OP_ENROLL_NODE,
+    OP_LABEL_NODE,
     OP_REVOKE_NODE,
     OP_SET_STANDBY,
     OP_UPDATE_NODE,
     NodeRecord,
+    clean_label,
+    label_refusal,
     normalize_url,
     standby_node,
 )
@@ -545,6 +549,8 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
             "Address cannot be a node",
             f"{body.url} cannot be this node's address: {reason}.",
         )
+    # Also before the token is spent, for the same reason.
+    label = _checked_label(machine, body.name, body.label) if body.label is not None else None
 
     try:
         grants = store.consume(body.token, node_name=body.name)
@@ -576,6 +582,10 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         # state a function of the log and nothing else.
         "enrolledAt": datetime.now(UTC).isoformat(),
     }
+    if body.label is not None:
+        # Present only when the enrollment named one: absent, a machine
+        # enrolling again keeps the label it had.
+        payload["label"] = None if label == body.name else label
 
     try:
         machine.append(OP_ENROLL_NODE, payload)
@@ -688,6 +698,7 @@ def _to_node(record: NodeRecord, probe: Any | None) -> Node:
     return Node.model_validate(
         {
             "name": record.name,
+            "label": record.label,
             "url": record.url,
             "role": record.role,
             "reachable": bool(probe.reachable) if probe is not None else False,
@@ -802,6 +813,72 @@ def _set_standby(request: Request, name: str, *, on: bool) -> TrustChange:
         standbyNode=standby_node(machine.state),
         nodesBehind=trust.nodes_behind(request.app, version),
     )
+
+
+@router.put(
+    "/v1/nodes/{name}/label",
+    response_model=Node,
+    dependencies=[Depends(capabilities.require(capabilities.MEMBERSHIP))],
+)
+async def label_node(request: Request, name: str, body: NodeLabelRequest) -> Node:
+    """Give a node the name people see (node-labels.md). One `labelNode`
+    entry; its `name`, the identity, does not move."""
+    machine: StateMachine = request.app.state.machine
+    _labelled_node(machine, name)
+    label = _checked_label(machine, name, body.label)
+    return _set_label(request, name, None if label == name else label)
+
+
+@router.delete(
+    "/v1/nodes/{name}/label",
+    response_model=Node,
+    dependencies=[Depends(capabilities.require(capabilities.MEMBERSHIP))],
+)
+async def clear_node_label(request: Request, name: str) -> Node:
+    """Show a node by its name again."""
+    machine: StateMachine = request.app.state.machine
+    _labelled_node(machine, name)
+    return _set_label(request, name, None)
+
+
+def _labelled_node(machine: StateMachine, name: str) -> NodeRecord:
+    record = machine.state.nodes.get(name)
+    if record is None:
+        raise problem(
+            status.HTTP_404_NOT_FOUND, "No such node", f"No node named {name!r} is enrolled."
+        )
+    if not machine.is_active:
+        raise _not_active(machine)
+    return record
+
+
+def _checked_label(machine: StateMachine, name: str, raw: str) -> str:
+    """The label as it will be stored, or the problem that names why not.
+    The same rule `labelNode`'s apply checks, asked first so a refusal is
+    a 400 or 409 here and never an entry a replica cannot apply."""
+    label = clean_label(raw)
+    refusal = label_refusal(machine.state, name, label)
+    if refusal is None:
+        return label
+    if refusal.startswith("another machine"):
+        raise problem(
+            status.HTTP_409_CONFLICT, "Name already in use", f"{refusal[0].upper()}{refusal[1:]}."
+        )
+    raise problem(
+        status.HTTP_400_BAD_REQUEST, "Label refused", f"{refusal[0].upper()}{refusal[1:]}."
+    )
+
+
+def _set_label(request: Request, name: str, label: str | None) -> Node:
+    machine: StateMachine = request.app.state.machine
+    if machine.state.nodes[name].label != label:
+        try:
+            machine.append(OP_LABEL_NODE, {"name": name, "label": label})
+        except NotActive as exc:
+            raise _not_active(machine) from exc
+        log.info("node %s is now shown as %r", name, label or name)
+    probes = getattr(request.app.state, "node_probes", {})
+    return _to_node(machine.state.nodes[name], probes.get(name))
 
 
 def _not_active(machine: StateMachine) -> Any:

@@ -1699,6 +1699,16 @@ class ModelRequirementAuthority(StrEnum):
     engine = 'engine'
 
 
+class PreparationVisionMode(StrEnum):
+    """
+    Where to encode images during inference; off prepares text only.
+    """
+
+    off = 'off'
+    cpu = 'cpu'
+    gpu = 'gpu'
+
+
 class Context(RootModel[int]):
     root: int = Field(..., ge=1)
 
@@ -1724,6 +1734,10 @@ class ModelPreparation(BaseModel):
     contexts: list[Context] | None = Field(
         None,
         description="The context sizes, in tokens, the preparation can be asked for\n(LS5): an engine that fixes the context when it prepares\noffers its own choices, and without one takes its own\nrecommendation for the node. Strata's are its setup's own.\nAbsent: the preparation takes no context.\n",
+    )
+    visionModes: list[PreparationVisionMode] | None = Field(
+        None,
+        description="Image encoder choices supported by this model's preparation. Absent:\nno image preparation is offered. Omitting the choice in a run intent\npreserves text-only preparation. Enabling images downloads an extra\nencoder and uses additional memory while serving.\n",
     )
     minEngineVersion: str | None = Field(
         None,
@@ -2820,6 +2834,18 @@ class NodeRole(StrEnum):
     agent = 'agent'
 
 
+class NodeLabelRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    label: str = Field(
+        ...,
+        description='What people call a machine, shown wherever its name would be. Any\nletters, spaces and punctuation; no control characters. Trimmed\nbefore it is checked. Not an identifier: nothing addresses a node by\nit.\n',
+        max_length=64,
+        min_length=1,
+    )
+
+
 class Grant(StrEnum):
     gateway = 'gateway'
 
@@ -2977,6 +3003,12 @@ class AccessAudit(BaseModel):
 
 class LogOp(StrEnum):
     """
+    **`labelNode` (2026-10-19)** sets or clears one node's `label`, the
+    name people see (`{name, label}`, `label` a string or `null`). It is
+    its own op because `updateNode` is the node-signed address change and
+    a label is an operator's, unsigned: widening that op would put an
+    unsigned field under a signature that does not name it.
+
     **`setStandby` (2026-10-08)** gives one node the `standby` grant
     (`on: true`) or takes it away (`on: false`); `promote` takes it from
     the node it promotes (`docs/design/warm-standby.md`). At most one
@@ -3067,6 +3099,7 @@ class LogOp(StrEnum):
     deleteExternalIdentity = 'deleteExternalIdentity'
     putBrowserSignIn = 'putBrowserSignIn'
     deleteBrowserSignIn = 'deleteBrowserSignIn'
+    labelNode = 'labelNode'
 
 
 class Group(RootModel[str]):
@@ -4406,6 +4439,12 @@ class EnrollmentRequest(BaseModel):
         ..., description="The join token, which is this request's only credential."
     )
     name: str = Field(..., min_length=1)
+    label: str | None = Field(
+        None,
+        description='The name people see for this machine, recorded as `Node.label`\nunder the rules `PUT /v1/nodes/{name}/label` applies. Checked\nbefore the join token is spent. Omitted, or equal to `name`, is\nno label. A machine that enrolls again under the same name keeps\nthe label it had unless this sets one.\n',
+        max_length=64,
+        min_length=1,
+    )
     publicKey: str = Field(
         ...,
         description="The agent's identity public key. The private half stays on\nthe node; sending it would defeat the point of per-node\nsealing.\n",
@@ -4861,6 +4900,12 @@ class Node(BaseModel):
     name: str = Field(
         ...,
         description='Operator-supplied, unique per install. Used in\n`Runtime.node`, `RuntimePlacementSpec.node`, and anywhere a\nplacement has to be named.\n',
+        min_length=1,
+    )
+    label: str | None = Field(
+        None,
+        description="The name people see for this machine, set by an operator\n(`PUT /v1/nodes/{name}/label`) or at enrollment. `null` shows\n`name`. Display only: everything that addresses the node uses\n`name`. Unique across the install's names and labels, ignoring\ncase, when it was written.\n",
+        max_length=64,
         min_length=1,
     )
     url: AnyUrl | None = Field(
