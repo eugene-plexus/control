@@ -31,7 +31,7 @@ from typing import Any
 import httpx
 
 from . import tokens
-from .applied import AppliedState, is_retired_site
+from .applied import AppliedState
 from .auth_state import AuthState
 
 log = logging.getLogger(__name__)
@@ -61,10 +61,7 @@ def trust_keys(state: AppliedState) -> list[tokens.TrustKey]:
         )
     seen = {k.kid for k in keys}
     for record in sorted(state.nodes.values(), key=lambda r: r.name):
-        if not record.tokenPublicKey or is_retired_site(record):
-            # A Job Site that joined as a node before slice 2b.1 is retired
-            # (J19): nothing it signs is accepted anywhere. A site's own key
-            # is in no bundle at all; only this root checks it.
+        if not record.tokenPublicKey:
             continue
         try:
             public = tokens.load_public(record.tokenPublicKey)

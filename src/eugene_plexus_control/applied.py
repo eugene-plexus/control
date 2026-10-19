@@ -97,13 +97,11 @@ OP_REVOKE_SESSION = "revokeSession"
 OP_PUT_PERSON = "putPerson"
 OP_PUT_PERMISSION_GROUP = "putPermissionGroup"
 OP_DELETE_PERMISSION_GROUP = "deletePermissionGroup"
-# **Retired, and read here for v0.2 only.** Between v0.1.0 and v0.2 these were
-# retired: `putNodeHelper`, an `enrollNode` with the grant `files` (a Job Site
-# that joined as a node), a person's `helperGrants` and a snapshot's
-# `nodeHelpers`. A root that still holds any of them converts them once at start
-# (`retired_conversion`), and nothing of those kinds is on its disk after. v0.3
-# deletes these handlers, `is_retired_site` and that module together.
-OP_PUT_NODE_HELPER = "putNodeHelper"
+# **Retired in v0.2 and refused since v0.3.1.** `putNodeHelper`, an `enrollNode`
+# with the grant `files` (a Job Site that joined as a node), a person's
+# `helperGrants` and a snapshot's `nodeHelpers` are what v0.1 wrote. v0.3.0
+# converted them once at start; replaying one now raises `ApplyError` through
+# `_retired`, which names it and the way out.
 OP_SET_PERSON_PASSWORD = "setPersonPassword"
 OP_DELETE_PERSON = "deletePerson"
 OP_PUT_OIDC_CLIENT = "putOidcClient"
@@ -147,7 +145,6 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_PUT_PERSON,
         OP_PUT_PERMISSION_GROUP,
         OP_DELETE_PERMISSION_GROUP,
-        OP_PUT_NODE_HELPER,
         OP_SET_PERSON_PASSWORD,
         OP_DELETE_PERSON,
         OP_PUT_OIDC_CLIENT,
@@ -168,12 +165,28 @@ ROLE_STANDBY = "standby"
 ROLE_AGENT = "agent"
 
 
+def _retired(what: str) -> RetiredData:
+    """The refusal for what v0.1 wrote and v0.2 retired: named, with the way out.
+
+    Nothing here converts it any more; v0.3.0 did, once, on the active root that held
+    it. A standby was never converted: its own records are set aside at start and it
+    follows the root again (`app.py`)."""
+    return RetiredData(
+        f"{what} was retired in v0.2; start Eugene v0.3.0 once on the active root to "
+        "convert it, then update."
+    )
+
+
 class ApplyError(Exception):
     """This entry cannot be applied to this state.
 
     Always fatal for the replica that raised it: the correct response is
     to re-snapshot, never to skip the entry. Skipping is how two roots
     end up disagreeing while both report healthy."""
+
+
+class RetiredData(ApplyError):
+    """What v0.1 wrote and v0.2 retired, met on replay (`_retired`)."""
 
 
 def normalize_url(value: str | None) -> str | None:
@@ -229,12 +242,10 @@ class NodeRecord:
     grants: tuple[str, ...] = ("node",)
     """What the node's key may issue. `gateway` comes from the join token
     that enrolled it, which the operator minted; never from the node.
-    Exactly `("files",)` marks a Job Site joined as a node before slice
-    2b.1 (J19): **retired**. It still replays, so a later `revokeNode` of
-    it does too, but it is in no listing and no trust bundle."""
+    A Job Site is never a node (J19): an `enrollNode` that grants `files`
+    is refused as retired."""
     owner: str | None = None
-    """A retired files node's owner, kept so its entries replay. None for
-    every other node."""
+    """The person a node was enrolled for, when the enrollment said."""
     agentVersion: str | None = None
     os: str | None = None
     arch: str | None = None
@@ -455,6 +466,8 @@ def apply(state: AppliedState, entry: dict[str, Any]) -> AppliedState:
             f"entry {index} carries epoch {epoch} below the highest seen ({state.epoch}); "
             "a superseded root is fenced out of the log as well as out of the agents"
         )
+    if op == "putNodeHelper":
+        raise _retired(f"entry {index} (putNodeHelper, an operator-managed node folder)")
     if op not in ALL_OPS:
         raise ApplyError(
             f"entry {index} has unknown op {op!r}. An op absent from LogOp is an op that "
@@ -527,17 +540,10 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
 _NODE_GRANTS = frozenset({"node", "gateway", "files", GRANT_STANDBY})
 
 
-def is_retired_site(record: NodeRecord | None) -> bool:
-    """A Job Site that joined as a node before slice 2b.1 (J19, J20). It
-    replays, and is in no listing and no trust bundle. `retired_conversion`
-    revokes each at start; kept for v0.2, deleted in v0.3."""
-    return record is not None and "files" in record.grants
-
-
 def _grants(raw: Any, index: int) -> tuple[str, ...]:
     """A node's grants, sorted so replay is byte-stable: always including
-    `node`, except a retired Job Site's, which are exactly `files`. Nothing
-    writes `files` now; old logs still hold it."""
+    `node`. `files` marked a Job Site that joined as a node (J19), which v0.2
+    retired: it is refused, naming what it was."""
     if raw is None:
         return ("node",)
     if not isinstance(raw, list) or not all(isinstance(g, str) for g in raw):
@@ -546,9 +552,9 @@ def _grants(raw: Any, index: int) -> tuple[str, ...]:
     if unknown:
         raise ApplyError(f"entry {index}: a node cannot hold {sorted(unknown)}")
     if "files" in raw:
-        if set(raw) != {"files"}:
-            raise ApplyError(f"entry {index}: a job site holds files and nothing else")
-        return ("files",)
+        raise _retired(
+            f"entry {index} (an enrollNode with the grant `files`, a Job Site as a node)"
+        )
     return tuple(sorted(set(raw) | {"node"}))
 
 
@@ -754,8 +760,6 @@ def _apply_set_standby(state: AppliedState, payload: dict[str, Any], index: int)
     record = state.nodes.get(name)
     if record is None:
         raise ApplyError(f"entry {index}: cannot make unknown node {name!r} the standby")
-    if is_retired_site(record):
-        raise ApplyError(f"entry {index}: a retired Job Site cannot be the standby")
     if on:
         holder = standby_node(state)
         if holder not in (None, name):
@@ -991,13 +995,14 @@ def _person_record(raw: Any) -> dict[str, Any]:
         "apps",
         "permissions",
         "groups",
-        "helperGrants",
         "disabled",
         "createdAt",
         "passwordChangedAt",
         "administration",
         "administrationVersion",
     }
+    if "helperGrants" in raw:
+        raise _retired("a person record with folder grants (helperGrants)")
     if raw.keys() - allowed:
         raise ApplyError("unexpected person property")
     grants = raw.get("administration", {})
@@ -1046,31 +1051,9 @@ def _person_record(raw: Any) -> dict[str, Any]:
         _string_list(groups, "person groups", limit=64, item_limit=64)
     if not isinstance(raw.get("disabled"), bool):
         raise ApplyError("invalid person disabled")
-    # Folder grants on nodes retired with the node folders (J20). Old
-    # entries still carry them; they are checked as they always were and
-    # then dropped, so they grant nothing and reach no snapshot. Kept for
-    # v0.2, deleted in v0.3 (see `OP_PUT_NODE_HELPER`).
-    grants = raw.get("helperGrants", [])
-    if not isinstance(grants, list) or len(grants) > 256:
-        raise ApplyError("invalid helper grants")
-    seen: set[str] = set()
-    for grant in grants:
-        if (
-            not isinstance(grant, dict)
-            or set(grant) != {"folderId", "writable"}
-            or not isinstance(grant["folderId"], str)
-            or not grant["folderId"]
-            or len(grant["folderId"]) > 64
-            or type(grant["writable"]) is not bool
-            or grant["folderId"] in seen
-        ):
-            raise ApplyError("invalid helper grant")
-        seen.add(grant["folderId"])
     _timestamp(raw, "createdAt", "person")
     _timestamp(raw, "passwordChangedAt", "person")
-    record = dict(raw)
-    record.pop("helperGrants", None)
-    return record
+    return dict(raw)
 
 
 def _apply_put_person(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
@@ -1212,18 +1195,6 @@ def _apply_revoke_sign_in(state: AppliedState, payload: dict[str, Any], index: i
     return replace(state, revoked_sign_ins=kept)
 
 
-def _apply_put_node_helper(
-    state: AppliedState, payload: dict[str, Any], index: int
-) -> AppliedState:
-    """Read and ignored: the operator-managed node folders retired (J20).
-    A log from a build before that holds these entries, so they still apply
-    until `retired_conversion` has folded them away; kept for v0.2, deleted in
-    v0.3."""
-    if not isinstance(payload.get("helper"), dict):
-        raise ApplyError(f"entry {index}: a node helper entry holds an object")
-    return state
-
-
 SITE_ID_ALPHABET = frozenset("abcdefghijklmnopqrstuvwxyz234567")
 
 
@@ -1357,7 +1328,6 @@ _HANDLERS: dict[str, _Handler] = {
     OP_PUT_PERSON: _apply_put_person,
     OP_PUT_PERMISSION_GROUP: _apply_put_permission_group,
     OP_DELETE_PERMISSION_GROUP: _apply_delete_permission_group,
-    OP_PUT_NODE_HELPER: _apply_put_node_helper,
     OP_SET_PERSON_PASSWORD: _apply_set_person_password,
     OP_DELETE_PERSON: _apply_delete_person,
     OP_PUT_OIDC_CLIENT: _apply_put_oidc_client,
@@ -1450,8 +1420,6 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
             state.permission_groups[key] for key in sorted(state.permission_groups)
         ],
         "sites": [_site_canonical(state.sites[key]) for key in sorted(state.sites)],
-        # Declared by `Snapshot` for old snapshots, and always empty now (J20).
-        "nodeHelpers": [],
         "oidcClients": [state.oidc_clients[key] for key in sorted(state.oidc_clients)],
         "oidcKeys": [dict(k) for k in state.oidc_keys],
         "revokedSignIns": [
@@ -1488,6 +1456,12 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
     """
     from .access_audit import validate as validate_audit
     from .client_admission import validate_ledger
+
+    if raw.get("nodeHelpers"):
+        raise _retired("a snapshot with node folders (nodeHelpers)")
+    for node in raw.get("nodes") or []:
+        if isinstance(node, dict) and "files" in (node.get("grants") or ()):
+            raise _retired(f"a snapshot node {node.get('name')!r} with the grant `files`")
 
     runtimes: dict[str, RuntimeRecord] = {}
     for entry in raw.get("runtimes") or []:

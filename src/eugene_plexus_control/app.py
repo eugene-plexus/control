@@ -7,8 +7,8 @@ Startup order matters and reads oddly, so it is spelled out:
    control root that came up ignoring its own node registry would hand
    out wrong answers rather than degraded ones, and safe mode exists to
    let an operator repair *config*, not to make the install forget
-   itself. A root that ran a build between v0.1.0 and v0.2 then converts
-   what that build retired, once (`retired_conversion`).
+   itself. What v0.1 wrote and v0.2 retired is no longer converted: replaying
+   it raises `ApplyError`, which names it and the way out (`applied._retired`).
 2. Auth state is built empty. This component is the trust root, so it
    receives no key from the agent that spawns it — it holds the signing
    key sealed in applied state and opens it at login.
@@ -30,10 +30,10 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
-from . import __version__, keyring_store, passphrase_file, retired_conversion, security
+from . import __version__, keyring_store, passphrase_file, security
 from . import config as config_module
 from .admission_worker import AdmissionWorker
-from .applied import normalize_url
+from .applied import RetiredData, normalize_url
 from .auth_state import AuthState
 from .join_tokens import JoinTokenStore
 from .log_store import LogStore
@@ -91,12 +91,23 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     role = ROLE_STANDBY if settings.role.strip().lower() == "standby" else ROLE_ACTIVE
     store = LogStore(settings.state_dir)
     machine = StateMachine(store, role=role)
-    machine.load()
-    # What a build between v0.1.0 and v0.2 retired is converted once, here, and
-    # only the current form is read after it. Never fatal: a root that cannot
-    # convert serves what it has, says why on /healthz, and tries again at the
-    # next start. Deleted, with its module, in v0.3.
-    app.state.conversion_failure = retired_conversion.run(store, machine)
+    try:
+        machine.load()
+    except RetiredData as exc:
+        # v0.3.0 converted what v0.1 left on the active root, never on a standby: a
+        # standby that followed an old root can still hold it in its own records. They
+        # are the root's to hold, so they are set aside, kept, and the standby starts
+        # empty and bootstraps from the root's snapshot as a new standby does. An active
+        # root has no one to take them from: that refusal stands, naming the way out.
+        if role != ROLE_STANDBY:
+            raise
+        kept = _set_aside(store)
+        log.warning(
+            "%s This standby set its records aside (%s) and follows the root again.", exc, kept
+        )
+        store = LogStore(settings.state_dir)
+        machine = StateMachine(store, role=role)
+        machine.load()
     app.state.machine = machine
     app.state.admission_worker = AdmissionWorker()
 
@@ -203,6 +214,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await app.state.root_tls_task
         await app.state.nodes_client.aclose()
         await app.state.admission_worker.close()
+
+
+def _set_aside(store: LogStore) -> list[str]:
+    """Rename a standby's log and snapshot to the first free `.retired-v0.1` name.
+
+    Renamed, never deleted or written over: they may be the only copy of what they
+    held. What is left is an empty state directory, which a standby fills from the
+    root."""
+    kept = []
+    for path in (store.log_path, store.snapshot_path):
+        if not path.exists():
+            continue
+        for number in range(100):
+            target = path.with_name(path.name + ".retired-v0.1" + (f".{number}" if number else ""))
+            if not target.exists():
+                path.rename(target)
+                kept.append(target.name)
+                break
+        else:
+            raise OSError(f"100 earlier copies of {path.name} are already kept beside it")
+    return kept
 
 
 def _auto_unlock(app: FastAPI, machine: StateMachine) -> None:

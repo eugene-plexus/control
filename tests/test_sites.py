@@ -714,60 +714,6 @@ def test_a_lan_only_install_invites_through_the_address_its_owner_set(
     assert made.status_code == 200 and made.json()["joinUrl"] == "http://192.0.2.5:59083"
 
 
-# --------------------------------------------------------------------------- old logs
-
-
-def test_a_slice_2_job_site_and_its_node_folders_still_replay_and_grant_nothing(
-    root: TestClient,
-) -> None:
-    """J20, J34: old entries apply, and what they describe is retired."""
-    machine = root.app.state.machine
-    keys = node_keys("oldsite")
-    machine.append(
-        applied.OP_ENROLL_NODE,
-        {
-            "name": "oldsite",
-            "role": "agent",
-            "publicKey": keys.public,
-            "signingPublicKey": keys.signing_public,
-            "tokenPublicKey": tokens.public_b64(keys.token.key),
-            "grants": ["files"],
-            "owner": None,
-            "url": None,
-            "enrolledAt": "2026-10-05T12:00:00+00:00",
-        },
-    )
-    machine.append(
-        applied.OP_PUT_NODE_HELPER,
-        {"helper": {"node": "oldsite", "enabled": True, "folders": []}},
-    )
-    assert all(n["name"] != "oldsite" for n in root.get("/v1/nodes").json()["nodes"])
-    assert root.get("/v1/nodes/oldsite").status_code == 404
-    listed = root.app.state.trust.view_for(machine.state).keys.values()
-    assert all(entry.issuer != "node:oldsite" for entry in listed)
-    # Its own token opens nothing, and it may not give itself an address (control#6).
-    assert (
-        root.get(
-            "/v1/nodes", headers={"Authorization": "Bearer " + keys.service_token()}
-        ).status_code
-        == 401
-    )
-    announced = root.patch(
-        "/v1/nodes/oldsite",
-        json={"url": "http://203.0.113.9:8079", "sequence": 1, "signature": "x"},
-    )
-    assert announced.status_code == 403
-    placed = root.post(
-        "/v1/runtimes", json={"node": "oldsite", "spec": {"name": "x", "modelPath": "/m.gguf"}}
-    )
-    assert placed.status_code == 409 and "retired" in placed.text
-    state = machine.state
-    assert applied.from_canonical(applied.to_canonical(state)) == state
-    assert applied.to_canonical(state)["nodeHelpers"] == []
-    machine.append(applied.OP_REVOKE_NODE, {"name": "oldsite"})
-    assert "oldsite" not in machine.state.nodes
-
-
 def test_a_site_survives_the_snapshot(root: TestClient) -> None:
     app = workbench(root)
     ada, _ = add_person(root, app, "ada")

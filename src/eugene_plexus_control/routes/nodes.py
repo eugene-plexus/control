@@ -49,7 +49,6 @@ from ..applied import (
     OP_SET_STANDBY,
     OP_UPDATE_NODE,
     NodeRecord,
-    is_retired_site,
     normalize_url,
     standby_node,
 )
@@ -76,9 +75,6 @@ async def list_nodes(request: Request) -> NodeList:
         nodes=[
             _to_node(record, probes.get(record.name))
             for record in sorted(machine.state.nodes.values(), key=lambda r: r.name)
-            # A Job Site that joined as a node before slice 2b.1 is retired
-            # (J19): it is not a machine of this install's any more.
-            if not is_retired_site(record)
         ]
     )
 
@@ -154,7 +150,7 @@ async def revoke_join_token(request: Request, id: str) -> None:
 async def get_node(request: Request, name: str) -> Node:
     machine: StateMachine = request.app.state.machine
     record = machine.state.nodes.get(name)
-    if record is None or is_retired_site(record):
+    if record is None:
         raise problem(
             status.HTTP_404_NOT_FOUND, "No such node", f"No node named {name!r} is enrolled."
         )
@@ -203,17 +199,6 @@ async def announce_node_address(
     if record is None:
         raise problem(
             status.HTTP_404_NOT_FOUND, "No such node", f"No node named {name!r} is enrolled."
-        )
-    if is_retired_site(record):
-        # control#6: a Job Site has no address, and one that joined as a
-        # node before slice 2b.1 is retired. Its key must not give it one,
-        # or this root would probe it and the console hop would hand it
-        # the operator's bearer.
-        log.warning("refused an address announcement from retired job site %s", name)
-        raise problem(
-            status.HTTP_403_FORBIDDEN,
-            "A job site has no address",
-            f"{name!r} joined as a job site, which connects out only and has no address.",
         )
     if not record.signingPublicKey:
         raise problem(
@@ -764,7 +749,7 @@ def _set_standby(request: Request, name: str, *, on: bool) -> TrustChange:
     machine: StateMachine = request.app.state.machine
     auth: AuthState = request.app.state.auth_state
     record = machine.state.nodes.get(name)
-    if record is None or is_retired_site(record):
+    if record is None:
         raise problem(
             status.HTTP_404_NOT_FOUND, "No such node", f"No node named {name!r} is enrolled."
         )

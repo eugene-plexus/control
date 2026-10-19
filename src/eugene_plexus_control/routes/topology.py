@@ -24,7 +24,6 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request, status
 from pydantic import ValidationError
 
-from .. import tokens
 from .._generated.models import (
     ComponentPlacement,
     ComponentPlacementList,
@@ -225,14 +224,6 @@ async def create_runtime(request: Request, body: RuntimePlacementSpec) -> Runtim
             status.HTTP_404_NOT_FOUND,
             "No such node",
             f"No node named {node_name!r} is enrolled. GET /v1/nodes lists them.",
-        )
-    if tokens.GRANT_FILES in record.grants:
-        raise problem(
-            status.HTTP_409_CONFLICT,
-            "A retired job site runs nothing",
-            f"{node_name!r} joined as a job site before job sites had their own enrollment: "
-            "it is retired, and runs no models "
-            "(remote-nodes.md §3.2). Choose another node.",
         )
     if not record.url:
         raise problem(
