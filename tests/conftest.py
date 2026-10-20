@@ -66,6 +66,16 @@ def active_client(tmp_path: Path) -> Iterator[TestClient]:
 
 
 @pytest.fixture(autouse=True)
+def _no_machine_table() -> Iterator[None]:
+    """An active root installs its machine table process-wide (LT1); one
+    test's install must not route the next test's requests."""
+    from eugene_plexus_control import _http
+
+    yield
+    _http.set_machine_table(None)
+
+
+@pytest.fixture(autouse=True)
 def _memoise_keyring_probe() -> Iterator[None]:
     """`GET /v1/auth/status` probes the OS keyring once per process; a test
     must not reach the developer's real one. Memoised to False for every

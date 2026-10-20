@@ -32,6 +32,7 @@ from fastapi import FastAPI
 
 from . import __version__, keyring_store, passphrase_file, security
 from . import config as config_module
+from . import machine_list as machine_list_module
 from .admission_worker import AdmissionWorker
 from .applied import OP_PATCH_CONFIG, RetiredData, normalize_url
 from .auth_state import AuthState
@@ -198,6 +199,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # An auto-unlocked root signs a fresh bundle for its state, and
     # pushes it once the node client exists.
+    if role == ROLE_ACTIVE:
+        machine_list_module.install_table(machine.state, app.state.node_name)
     if app.state.auth_state.control_private_key is not None and role == ROLE_ACTIVE:
         app.state.trust.publish(app)
 
@@ -415,6 +418,9 @@ async def _poll_nodes(app: FastAPI) -> None:
                 log.info("unlocked; resuming node polling")
                 announced_locked = False
 
+            # The root's own machine table, from its own records (LT1): every
+            # poll, so a change replicated or configured is never far behind.
+            machine_list_module.install_table(machine.state, app.state.node_name)
             if targets:
                 app.state.node_probes = await client.probe_all(
                     targets, lambda node: service_token_for(app.state.auth_state, node)

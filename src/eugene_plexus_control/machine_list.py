@@ -65,6 +65,55 @@ def content(state: Any, control_pins: list[str]) -> dict[str, Any]:
     }
 
 
+def _origin(url: str | None) -> str | None:
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url or "")
+    if not parts.hostname or parts.scheme not in ("http", "https"):
+        return None
+    host = parts.hostname.lower()
+    host = f"[{host}]" if ":" in host else host
+    return f"{parts.scheme}://{host}:{parts.port or (443 if parts.scheme == 'https' else 80)}"
+
+
+def install_table(state: Any, own_node: str | None) -> None:
+    """The active root's own machine table, from its own records (LT1).
+
+    The root is where every pin is recorded, so it never waits for its
+    agent's copy of the list: a node it has just enrolled is reached over
+    TLS by the very next call, the trust bundle pushed to it included.
+    """
+    from ._http import parse_machine_table, set_machine_table
+
+    machines: dict[str, list[str]] = {}
+    routes: dict[str, str | None] = {}
+    names: dict[str, str] = {}
+    for record in state.nodes.values():
+        if record.name == own_node:
+            continue
+        agent = _origin(record.url)
+        door = _origin(record.machineUrl)
+        carried = None
+        if door is not None and door.startswith("https://") and record.tlsPins:
+            hostport = door.removeprefix("https://")
+            machines[hostport] = list(record.tlsPins)
+            names[hostport] = record.name
+            carried = str(record.machineUrl).rstrip("/") + "/agent"
+        if agent is not None and agent.startswith("http://"):
+            routes[agent] = carried
+            names[agent] = record.name
+    set_machine_table(
+        parse_machine_table(
+            {
+                "machines": machines,
+                "routes": routes,
+                "names": names,
+                "required": required(state.config),
+            }
+        )
+    )
+
+
 def link(record: Any, probe: Any | None) -> dict[str, Any]:
     """`Node.machineTls`: how this root last reached the node (an observation)."""
     from ._http import machine_route

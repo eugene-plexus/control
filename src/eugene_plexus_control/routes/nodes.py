@@ -343,6 +343,7 @@ async def announce_node_address(
         )
     except NotActive as exc:
         raise _not_active(machine) from exc
+    machine_list.install_table(machine.state, request.app.state.node_name)
 
     log.info(
         "node %s re-advertised: %s -> %s (sequence %d)%s",
@@ -527,6 +528,7 @@ def revoke(request: Request, name: str) -> TrustChange:
         machine.append(OP_REVOKE_NODE, {"name": name})
     except NotActive as exc:
         raise _not_active(machine) from exc
+    machine_list.install_table(machine.state, request.app.state.node_name)
     bundle = request.app.state.trust.publish(request.app)
     version = bundle.version if bundle is not None else machine.state.index
     log.warning("node %s revoked; trust bundle %d no longer lists its key", name, version)
@@ -748,6 +750,9 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         machine.append(OP_ENROLL_NODE, payload)
     except NotActive as exc:
         raise _not_active(machine) from exc
+    # Before the bundle is pushed to it: the new node is reached over TLS to
+    # the key it enrolled with from the first call (LT1).
+    machine_list.install_table(machine.state, request.app.state.node_name)
 
     bundle = request.app.state.trust.publish(request.app)
     if bundle is None:  # pragma: no cover - the identity key was checked above
