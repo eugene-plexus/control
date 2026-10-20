@@ -40,6 +40,7 @@ from .._generated.models import (
     NodeAddressAck,
     NodeAddressAnnouncement,
     NodeCertificate,
+    NodeCertificateNames,
     NodeCertificateRequest,
     NodeLabelRequest,
     NodeList,
@@ -52,6 +53,7 @@ from ..applied import (
     OP_ENROLL_NODE,
     OP_LABEL_NODE,
     OP_REVOKE_NODE,
+    OP_SET_NODE_CERTIFICATE_NAMES,
     OP_SET_STANDBY,
     OP_UPDATE_NODE,
     ROLE_CONTROL,
@@ -910,6 +912,7 @@ def _to_node(record: NodeRecord, probe: Any | None) -> Node:
             "enrolledAt": record.enrolledAt,
             "machineUrl": record.machineUrl,
             "tlsPins": list(record.tlsPins),
+            "certificateNames": list(record.certificateNames),
             "machineTls": machine_list.link(record, probe),
             "lastSeenAt": probe.last_seen_at if probe is not None else None,
             # The probe client has always had the reason; until 2026-09-15
@@ -1078,7 +1081,7 @@ async def issue_node_certificate(
             ca_key=auth.install_ca_key,
             csr_pem=body.csr,
             node_name=name,
-            allowed=install_ca.own_names(name, record.url),
+            allowed=install_ca.own_names(name, record.url, list(record.certificateNames)),
             registered_pins=list(record.tlsPins),
         )
     except install_ca.Refused as exc:
@@ -1091,6 +1094,54 @@ async def issue_node_certificate(
         names=issued.names,
         notAfter=issued.not_after,
     )
+
+
+@router.put(
+    "/v1/nodes/{name}/certificate-names",
+    response_model=Node,
+    dependencies=[Depends(capabilities.require(capabilities.MEMBERSHIP))],
+)
+async def set_node_certificate_names(
+    request: Request, name: str, body: NodeCertificateNames
+) -> Node:
+    """The names the owner lists for a node's client certificate (LT2 §4).
+    One `setNodeCertificateNames` entry; the node asks for a new leaf with
+    them at its next look."""
+    from .. import install_ca
+
+    machine: StateMachine = request.app.state.machine
+    record = _labelled_node(machine, name)
+    raw = [str(getattr(n, "root", n)) for n in body.names]
+    names = list(dict.fromkeys(install_ca.normalise(n) for n in raw if n.strip()))
+    refused = [n for n in names if not install_ca.permitted(n)]
+    if refused:
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Not a name the install CA signs",
+            f"{', '.join(refused)}: the install's certificate authority signs only private "
+            "addresses and names ending .local, .lan, .internal or .home.arpa. Use your own "
+            "certificate for a name in your domain.",
+        )
+    for other in machine.state.nodes.values():
+        if other.name == name:
+            continue
+        theirs = set(install_ca.own_names(other.name, other.url, list(other.certificateNames)))
+        clash = [n for n in names if n in theirs and n not in install_ca.LOOPBACK_NAMES]
+        if clash:
+            raise problem(
+                status.HTTP_409_CONFLICT,
+                "Another machine's name",
+                f"{', '.join(clash)} is {other.label or other.name}'s; a machine's "
+                "certificate names only its own.",
+            )
+    if tuple(names) != record.certificateNames:
+        try:
+            machine.append(OP_SET_NODE_CERTIFICATE_NAMES, {"name": name, "names": names})
+        except NotActive as exc:
+            raise _not_active(machine) from exc
+        log.info("%s's certificate may now name %s", name, ", ".join(names) or "nothing extra")
+    probes = getattr(request.app.state, "node_probes", {})
+    return _to_node(machine.state.nodes[name], probes.get(name))
 
 
 def _labelled_node(machine: StateMachine, name: str) -> NodeRecord:

@@ -2875,6 +2875,17 @@ class MachineListNode(BaseModel):
     pins: list[TlsPin]
 
 
+class Name(RootModel[str]):
+    root: str = Field(..., max_length=253)
+
+
+class NodeCertificateNames(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    names: list[Name] = Field(..., max_length=16)
+
+
 class NodeCertificateRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -3088,6 +3099,10 @@ class AccessAudit(BaseModel):
 
 class LogOp(StrEnum):
     """
+    **`setNodeCertificateNames` (LT2, 2026-10-20)** replaces the names
+    the owner listed for one node's client certificate (`{name,
+    names}`). An operator's, unsigned, like `labelNode`.
+
     **`setInstallCa` (LT2, 2026-10-20)** records the install CA once:
     `{certificate, sealedKey}`, the certificate in PEM and the key's
     PKCS8 DER sealed under the passphrase-derived key, as the other
@@ -3192,6 +3207,7 @@ class LogOp(StrEnum):
     deleteBrowserSignIn = 'deleteBrowserSignIn'
     labelNode = 'labelNode'
     setInstallCa = 'setInstallCa'
+    setNodeCertificateNames = 'setNodeCertificateNames'
 
 
 class Group(RootModel[str]):
@@ -5091,6 +5107,10 @@ class Node(BaseModel):
         description="The keys this node's machine port may present, registered\nunder its signature. Every other machine refuses a connection\nthat presents any other. Empty on a node without a machine\nport.\n",
     )
     machineTls: MachineLink | None = None
+    certificateNames: list[str] | None = Field(
+        None,
+        description='Names the owner listed for this node (LT2,\n`tls-for-clients.md` §4): its client certificate may hold them\nbeside its own address and `.local` name. Private addresses and\nlocal names only. Empty when none are listed.\n',
+    )
     role: NodeRole
     reachable: bool = Field(
         ...,

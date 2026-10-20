@@ -336,3 +336,44 @@ def test_the_machine_list_carries_plain_off(active_client: TestClient) -> None:
     assert _machine_list(active_client)["clientPlainHttp"] == "on"
     assert active_client.patch("/v1/config", json={"clientPlainHttp": "off"}).status_code == 200
     assert _machine_list(active_client)["clientPlainHttp"] == "off"
+
+
+def test_the_owner_lists_names_a_node_certificate_may_hold(active_client: TestClient) -> None:
+    key = ec.generate_private_key(ec.SECP256R1())
+    keys, made = enroll(
+        active_client,
+        "gpu-box",
+        url="http://192.168.1.20:8079",
+        machineUrl="https://192.168.1.20:8083",
+        tlsPin=install_ca.spki_pin(key.public_key()),
+    )
+    assert made.status_code == 201, made.text
+    _, made = enroll(active_client, "other", url="http://192.168.1.21:8079")
+    assert made.status_code == 201, made.text
+
+    def ask(names: list[str]) -> int:
+        return active_client.post(
+            "/v1/nodes/gpu-box/certificate",
+            headers={"Authorization": "Bearer " + keys.service_token()},
+            json={"csr": _csr(key, names)},
+        ).status_code
+
+    assert ask(["eugene.lan"]) == 403
+    listed = active_client.put(
+        "/v1/nodes/gpu-box/certificate-names", json={"names": ["Eugene.LAN.", "wb.lan"]}
+    )
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["certificateNames"] == ["eugene.lan", "wb.lan"]
+    assert ask(["eugene.lan", "wb.lan", "192.168.1.20"]) == 200
+    public = active_client.put(
+        "/v1/nodes/gpu-box/certificate-names", json={"names": ["eugene.example.com"]}
+    )
+    assert public.status_code == 400 and "eugene.example.com" in public.text
+    theirs = active_client.put(
+        "/v1/nodes/gpu-box/certificate-names", json={"names": ["other.local"]}
+    )
+    assert theirs.status_code == 409
+    again = active_client.put("/v1/nodes/other/certificate-names", json={"names": ["wb.lan"]})
+    assert again.status_code == 409
+    node = active_client.get("/v1/nodes/gpu-box").json()
+    assert node["certificateNames"] == ["eugene.lan", "wb.lan"]

@@ -116,6 +116,7 @@ OP_SET_SITE_DEV_GRANTS = "setSiteDevGrants"
 OP_SET_STANDBY = "setStandby"
 OP_LABEL_NODE = "labelNode"
 OP_SET_INSTALL_CA = "setInstallCa"
+OP_SET_NODE_CERTIFICATE_NAMES = "setNodeCertificateNames"
 
 #: The grant that makes a node the install's warm standby (warm-standby.md).
 GRANT_STANDBY = "standby"
@@ -161,6 +162,7 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_SET_STANDBY,
         OP_LABEL_NODE,
         OP_SET_INSTALL_CA,
+        OP_SET_NODE_CERTIFICATE_NAMES,
     }
 )
 
@@ -266,6 +268,9 @@ class NodeRecord:
     tlsPins: tuple[str, ...] = ()
     """The keys its machine port may present, registered under its
     signature (or its join token). Empty on an older node."""
+    certificateNames: tuple[str, ...] = ()
+    """Names the owner listed for its client certificate (LT2,
+    `setNodeCertificateNames`): an operator's, never the node's."""
 
 
 @dataclass(frozen=True)
@@ -689,6 +694,22 @@ def _apply_label_node(state: AppliedState, payload: dict[str, Any], index: int) 
     if refusal is not None:
         raise ApplyError(f"entry {index}: {refusal}")
     updated = replace(record, label=None if label == name else label)
+    return replace(state, nodes={**state.nodes, name: updated})
+
+
+def _apply_set_node_certificate_names(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    """Replace the names the owner listed for one node's client certificate
+    (LT2). Checked at the writer; nothing else about the node changes."""
+    name = _require_str(payload, "name", index)
+    record = state.nodes.get(name)
+    if record is None:
+        raise ApplyError(f"entry {index}: cannot name unknown node {name!r}")
+    names = payload.get("names")
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise ApplyError(f"entry {index}: setNodeCertificateNames needs a list of names")
+    updated = replace(record, certificateNames=tuple(names))
     return replace(state, nodes={**state.nodes, name: updated})
 
 
@@ -1465,6 +1486,7 @@ _HANDLERS: dict[str, _Handler] = {
     OP_SET_STANDBY: _apply_set_standby,
     OP_LABEL_NODE: _apply_label_node,
     OP_SET_INSTALL_CA: _apply_set_install_ca,
+    OP_SET_NODE_CERTIFICATE_NAMES: _apply_set_node_certificate_names,
     **{op: partial(sign_in_state.apply, op=op) for op in sign_in_state.OPS},
 }
 
@@ -1516,6 +1538,7 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
                 "enrolledAt": n.enrolledAt,
                 "machineUrl": n.machineUrl,
                 "tlsPins": list(n.tlsPins),
+                "certificateNames": list(n.certificateNames),
             }
             for n in sorted(state.nodes.values(), key=lambda r: r.name)
         ],
@@ -1634,6 +1657,7 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
                 enrolledAt=n.get("enrolledAt"),
                 machineUrl=n.get("machineUrl"),
                 tlsPins=_pins(n.get("tlsPins")),
+                certificateNames=tuple(str(x) for x in n.get("certificateNames") or ()),
             )
             for n in raw.get("nodes") or []
         },
