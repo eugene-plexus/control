@@ -249,8 +249,11 @@ def test_set_install_ca_applies_once_and_survives_the_snapshot() -> None:
     assert state.identity.installCaCertificate == "PEM"
     again = from_canonical(to_canonical(state))
     assert again.identity.sealedInstallCaKey == "SEALED"
+    # The same CA again is nothing; another is refused.
+    assert apply_all(state, [{**entry, "index": 2}]).identity == state.identity
+    other = {**entry, "index": 2, "payload": {"certificate": "OTHER", "sealedKey": "S"}}
     with pytest.raises(ApplyError):
-        apply_all(state, [{**entry, "index": 2}])
+        apply_all(state, [other])
 
 
 def test_initialization_makes_the_ca_sealed_under_the_passphrase(

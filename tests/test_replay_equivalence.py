@@ -66,6 +66,8 @@ from eugene_plexus_control.applied import (
     OP_REVOKE_SIGN_IN,
     OP_ROTATE_SIGNING_KEY,
     OP_SET_CLIENT_KEY_LIMITS,
+    OP_SET_INSTALL_CA,
+    OP_SET_NODE_CERTIFICATE_NAMES,
     OP_SET_OIDC_CLIENT_REDIRECTS,
     OP_SET_PERSON_PASSWORD,
     OP_SET_SITE_DEV_GRANTS,
@@ -132,6 +134,8 @@ EXERCISED_OPS = {
     OP_SET_SITE_DEV_GRANTS,
     OP_SET_STANDBY,
     OP_LABEL_NODE,
+    OP_SET_INSTALL_CA,
+    OP_SET_NODE_CERTIFICATE_NAMES,
 }
 
 
@@ -548,6 +552,10 @@ def _write_history(machine: StateMachine) -> bytes:
     machine.append(OP_LABEL_NODE, {"name": "gpu-büro", "label": "Büro GPU"})
     machine.append(OP_LABEL_NODE, {"name": "gpu-büro", "label": None})
     machine.append(OP_LABEL_NODE, {"name": "attic", "label": "The Attic"})
+    # LT2: the install CA, once, and names the owner lists for a node.
+    held = machine.state.identity.installCaCertificate  # an initialized root made one
+    machine.append(OP_SET_INSTALL_CA, {"certificate": held or "CA PEM", "sealedKey": "SEALED"})
+    machine.append(OP_SET_NODE_CERTIFICATE_NAMES, {"name": "attic", "names": ["attic.lan"]})
     machine.append(OP_REVOKE_NODE, {"name": "gpu-büro"})
     last, last_public = _root_key()
     machine.append(

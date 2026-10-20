@@ -825,13 +825,18 @@ def _apply_rotate_signing_key(
 
 
 def _apply_set_install_ca(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
-    """The install CA, once (LT2). A second is refused: every device trusts
-    the first, and replacing it would strand them all."""
-    if state.identity.installCaCertificate is not None:
+    """The install CA, once (LT2). Another is refused: every device trusts
+    the first, and replacing it would strand them all. The same one again is
+    nothing (a replica that took the identity with it, then the log)."""
+    certificate = _require_str(payload, "certificate", index)
+    held = state.identity.installCaCertificate
+    if held is not None:
+        if held == certificate:
+            return state
         raise ApplyError(f"entry {index}: this install already has a CA")
     identity = replace(
         state.identity,
-        installCaCertificate=_require_str(payload, "certificate", index),
+        installCaCertificate=certificate,
         sealedInstallCaKey=_require_str(payload, "sealedKey", index),
     )
     return replace(state, identity=identity)
