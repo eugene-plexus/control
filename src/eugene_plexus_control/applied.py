@@ -115,6 +115,7 @@ OP_SET_SITE_HOST = "setSiteHost"
 OP_SET_SITE_DEV_GRANTS = "setSiteDevGrants"
 OP_SET_STANDBY = "setStandby"
 OP_LABEL_NODE = "labelNode"
+OP_SET_INSTALL_CA = "setInstallCa"
 
 #: The grant that makes a node the install's warm standby (warm-standby.md).
 GRANT_STANDBY = "standby"
@@ -159,6 +160,7 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_SET_SITE_DEV_GRANTS,
         OP_SET_STANDBY,
         OP_LABEL_NODE,
+        OP_SET_INSTALL_CA,
     }
 )
 
@@ -386,6 +388,15 @@ class InstallIdentity:
     signingKeyId: str | None = None
     """Names the current key generation. Not a secret, and the thing a
     node reports back so a rotation can tell which hosts are stale."""
+
+    installCaCertificate: str | None = None
+    """The install CA's certificate, PEM (LT2): what every device trusts
+    to reach the install's doors over TLS. Set once, by `setInstallCa`."""
+
+    sealedInstallCaKey: str | None = None
+    """The install CA's private key, PKCS8 DER sealed under the
+    passphrase-derived key. Replicated so a promoted standby issues under
+    the same CA and no device has to trust a new one."""
 
 
 @dataclass(frozen=True)
@@ -790,6 +801,19 @@ def _apply_rotate_signing_key(
     if isinstance(revoked, str) and revoked in state.nodes:
         state = _without_node(state, revoked)
     return state
+
+
+def _apply_set_install_ca(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    """The install CA, once (LT2). A second is refused: every device trusts
+    the first, and replacing it would strand them all."""
+    if state.identity.installCaCertificate is not None:
+        raise ApplyError(f"entry {index}: this install already has a CA")
+    identity = replace(
+        state.identity,
+        installCaCertificate=_require_str(payload, "certificate", index),
+        sealedInstallCaKey=_require_str(payload, "sealedKey", index),
+    )
+    return replace(state, identity=identity)
 
 
 def _apply_revoke_session(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
@@ -1440,6 +1464,7 @@ _HANDLERS: dict[str, _Handler] = {
     OP_SET_SITE_DEV_GRANTS: _apply_set_site_dev_grants,
     OP_SET_STANDBY: _apply_set_standby,
     OP_LABEL_NODE: _apply_label_node,
+    OP_SET_INSTALL_CA: _apply_set_install_ca,
     **{op: partial(sign_in_state.apply, op=op) for op in sign_in_state.OPS},
 }
 
@@ -1518,6 +1543,8 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
         "controlPublicKey": identity.controlPublicKey,
         "sealedRecoveryKey": identity.sealedRecoveryKey,
         "signingKeyId": identity.signingKeyId,
+        "installCaCertificate": identity.installCaCertificate,
+        "sealedInstallCaKey": identity.sealedInstallCaKey,
         "people": [state.people[key] for key in sorted(state.people)],
         "permissionGroups": [
             state.permission_groups[key] for key in sorted(state.permission_groups)
@@ -1642,5 +1669,7 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
             controlPublicKey=raw.get("controlPublicKey"),
             sealedRecoveryKey=raw.get("sealedRecoveryKey"),
             signingKeyId=raw.get("signingKeyId"),
+            installCaCertificate=raw.get("installCaCertificate"),
+            sealedInstallCaKey=raw.get("sealedInstallCaKey"),
         ),
     )

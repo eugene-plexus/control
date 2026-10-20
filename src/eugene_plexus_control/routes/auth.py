@@ -225,6 +225,9 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
             OP_PATCH_CONFIG, {"values": {machine_list.ENCRYPTION_KEY: machine_list.REQUIRED}}
         )
         request.app.state.bootstrap_config.write_through(machine.state.config)
+    from .. import install_ca
+
+    install_ca.ensure(auth, machine)
     request.app.state.trust.publish(request.app)
     log.info(
         "install initialized; epoch %d, token key generation %s",
@@ -493,6 +496,12 @@ def unseal_with_master_key(auth: AuthState, machine: StateMachine, master_key: b
             ).decode("ascii")
         except ValueError as exc:
             log.error("recovery key did not open: %s", exc)
+
+    # LT2: the install CA, made the first time an active root is unsealed
+    # with it, and its key held for issuing node certificates.
+    from .. import install_ca
+
+    install_ca.ensure(auth, machine)
 
 
 def _signer(auth: AuthState) -> tokens.Signer:

@@ -62,6 +62,10 @@ class AuthState:
     """Base64 Ed25519 private half of this root's identity, once
     unsealed. Needed to attest an epoch change to a node."""
 
+    install_ca_key: bytes | None = None
+    """The install CA's private key, PKCS8 DER, once unsealed (LT2). Signs
+    each node's client certificate; never written anywhere unsealed."""
+
     recovery_private_key: str | None = None
     """Base64 X25519 private half of the recovery recipient, once
     unsealed. Held only during an explicit recovery or re-seal; normal
@@ -108,6 +112,7 @@ class AuthState:
         that would let it act like one."""
         self.master_key = None
         self.control_private_key = None
+        self.install_ca_key = None
         self.recovery_private_key = None
 
     # ----- login rate limiting ----------------------------------------

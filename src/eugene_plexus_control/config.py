@@ -271,6 +271,25 @@ FIELDS: list[ConfigField] = [
         enumLabels=["Automatic", "Required", "Off"],
     ),
     ConfigField(
+        key="clientPlainHttp",
+        label="Plain HTTP for apps and browsers",
+        description=(
+            "Whether other machines' browsers and clients may still use plain HTTP.\n\n"
+            "- **On**: every door takes TLS and plain HTTP on the same port. A "
+            "device that trusts the install's certificate authority uses TLS.\n"
+            "- **Off**: a plain request from another machine is refused with the "
+            "https address named. Turn it off once every device you use trusts "
+            "the install's certificate authority; the Access page says when no "
+            "client has used plain HTTP for 7 days.\n\n"
+            "Requests from the same machine stay plain either way."
+        ),
+        category="security",
+        valueType=ConfigValueType.enum,
+        default="on",
+        enumValues=["on", "off"],
+        enumLabels=["On", "Off"],
+    ),
+    ConfigField(
         key="oidcIssuer",
         label="Sign-in address for apps",
         description=(

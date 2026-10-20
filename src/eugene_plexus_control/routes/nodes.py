@@ -22,7 +22,7 @@ import base64
 import logging
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request, status
 
@@ -39,6 +39,8 @@ from .._generated.models import (
     Node,
     NodeAddressAck,
     NodeAddressAnnouncement,
+    NodeCertificate,
+    NodeCertificateRequest,
     NodeLabelRequest,
     NodeList,
     Reason,
@@ -61,13 +63,14 @@ from ..applied import (
     standby_node,
 )
 from ..auth_state import AuthState
-from ..dependencies import problem, require_authorized, via_public_sites
+from ..dependencies import problem, require_authorized, require_node_actor, via_public_sites
 from ..join_tokens import JoinTokenConsumed, JoinTokenError, JoinTokenStore
 from ..state_machine import NotActive, StateMachine
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["nodes"])
+NodeActor = Annotated[tokens.Claims, Depends(require_node_actor)]
 
 
 @router.get("/v1/nodes", response_model=NodeList, dependencies=[Depends(require_authorized)])
@@ -1032,6 +1035,62 @@ async def clear_node_label(request: Request, name: str) -> Node:
     machine: StateMachine = request.app.state.machine
     _labelled_node(machine, name)
     return _set_label(request, name, None)
+
+
+@router.post("/v1/nodes/{name}/certificate", response_model=NodeCertificate)
+async def issue_node_certificate(
+    request: Request,
+    name: str,
+    body: NodeCertificateRequest,
+    actor: NodeActor,
+) -> NodeCertificate:
+    """A leaf from the install CA for this node's own key and names (LT2,
+    `tls-for-clients.md` §4). `install_ca.issue` holds the rules; this route
+    finds the node's registered keys and names and refuses everything else."""
+    from .. import install_ca
+
+    machine: StateMachine = request.app.state.machine
+    auth: AuthState = request.app.state.auth_state
+    if actor.issuer_node != name:
+        raise problem(
+            status.HTTP_403_FORBIDDEN,
+            "Not this node",
+            "A node asks for its own certificate only.",
+        )
+    record = machine.state.nodes.get(name)
+    if record is None:
+        raise problem(
+            status.HTTP_404_NOT_FOUND, "No such node", f"No node named {name!r} is enrolled."
+        )
+    if not machine.is_active:
+        raise _not_active(machine)
+    identity = machine.state.identity
+    if not identity.installCaCertificate or auth.install_ca_key is None:
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "No install CA here yet",
+            "This root is locked, or has not made its certificate authority yet. "
+            "Unlock it; the node asks again by itself.",
+        )
+    try:
+        issued = install_ca.issue(
+            ca_certificate=identity.installCaCertificate,
+            ca_key=auth.install_ca_key,
+            csr_pem=body.csr,
+            node_name=name,
+            allowed=install_ca.own_names(name, record.url),
+            registered_pins=list(record.tlsPins),
+        )
+    except install_ca.Refused as exc:
+        log.warning("refused a certificate for %s: %s", name, exc.detail)
+        raise problem(exc.status, exc.title, exc.detail) from exc
+    log.info("issued %s a certificate for %s", name, ", ".join(issued.names))
+    return NodeCertificate(
+        certificate=issued.certificate,
+        ca=identity.installCaCertificate,
+        names=issued.names,
+        notAfter=issued.not_after,
+    )
 
 
 def _labelled_node(machine: StateMachine, name: str) -> NodeRecord:

@@ -2851,6 +2851,21 @@ class SignedMachineList(BaseModel):
     )
 
 
+class ClientPlainHttp(StrEnum):
+    """
+    Whether a node's client doors (8079, 8080, app ports) still take
+    plain HTTP from another machine (LT2-C4, the `clientPlainHttp`
+    config field). `off` only by the owner's choice; a node then
+    refuses a plain request from another machine with the
+    `https://` URL named, and loopback stays plain. Absent from an
+    older root's list, which means `on`.
+
+    """
+
+    on = 'on'
+    off = 'off'
+
+
 class MachineListNode(BaseModel):
     name: str
     url: str | None = Field(
@@ -2858,6 +2873,25 @@ class MachineListNode(BaseModel):
     )
     machineUrl: str | None = None
     pins: list[TlsPin]
+
+
+class NodeCertificateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    csr: str = Field(
+        ...,
+        description="A PKCS#10 certificate signing request in PEM, signed with the\nnode's machine key, its names in a subjectAltName extension.\n",
+    )
+
+
+class NodeCertificate(BaseModel):
+    certificate: str = Field(..., description='The leaf, PEM.')
+    ca: str = Field(..., description='The install CA that signed it, PEM.')
+    names: list[str] = Field(
+        ..., description='The names it holds, IP addresses and DNS names.'
+    )
+    notAfter: AwareDatetime
 
 
 class NodeRole(StrEnum):
@@ -3054,6 +3088,12 @@ class AccessAudit(BaseModel):
 
 class LogOp(StrEnum):
     """
+    **`setInstallCa` (LT2, 2026-10-20)** records the install CA once:
+    `{certificate, sealedKey}`, the certificate in PEM and the key's
+    PKCS8 DER sealed under the passphrase-derived key, as the other
+    sealed keys are. A second one is refused at apply: the CA is made
+    once, so every device's trust holds through a promotion.
+
     **`labelNode` (2026-10-19)** sets or clears one node's `label`, the
     name people see (`{name, label}`, `label` a string or `null`). It is
     its own op because `updateNode` is the node-signed address change and
@@ -3151,6 +3191,7 @@ class LogOp(StrEnum):
     putBrowserSignIn = 'putBrowserSignIn'
     deleteBrowserSignIn = 'deleteBrowserSignIn'
     labelNode = 'labelNode'
+    setInstallCa = 'setInstallCa'
 
 
 class Group(RootModel[str]):
@@ -4499,13 +4540,19 @@ class MachineList(BaseModel):
 
     """
 
-    iat: int = Field(
+    iat: int = Field(..., description='When it was signed.')
+    version: int = Field(
         ...,
-        description='When it was signed. A node refuses a list older than the one it holds.',
+        description='Rises by one each time the list changes. A node refuses a list\nwhose version is lower than the one it holds, so an old list\ncannot bring back a key that was dropped.\n',
+        ge=1,
     )
     required: bool = Field(
         ...,
         description='Encryption between machines is required (`machineEncryption`):\nno plain HTTP between machines, and drivers and control bind\nto loopback.\n',
+    )
+    clientPlainHttp: ClientPlainHttp | None = Field(
+        None,
+        description="Whether a node's client doors (8079, 8080, app ports) still take\nplain HTTP from another machine (LT2-C4, the `clientPlainHttp`\nconfig field). `off` only by the owner's choice; a node then\nrefuses a plain request from another machine with the\n`https://` URL named, and loopback stays plain. Absent from an\nolder root's list, which means `on`.\n",
     )
     controlPins: list[TlsPin] = Field(
         ...,
@@ -5424,6 +5471,14 @@ class Snapshot(BaseModel):
     controlPublicKey: str | None = Field(
         None,
         description='The public half of the above, carried in the clear so a\nstandby can report the identity it would assume without\nholding the passphrase.\n',
+    )
+    installCaCertificate: str | None = Field(
+        None,
+        description="The install CA's certificate, PEM (LT2): what every device\ntrusts. Absent until `setInstallCa`.\n",
+    )
+    sealedInstallCaKey: str | None = Field(
+        None,
+        description="The install CA's private key, PKCS8 DER sealed under the\npassphrase-derived key. Replicated so a promoted standby issues\nleaves under the same CA and no device has to trust a new one.\n",
     )
     permissionGroups: list[PermissionGroup] | None = Field(
         None,

@@ -402,6 +402,40 @@ async def get_machine_list(request: Request) -> SignedMachineList:
     return SignedMachineList(jws=jws)
 
 
+@router.get("/v1/trust/ca", response_class=Response)
+async def get_install_ca(
+    request: Request, format: str = Query(default="pem", pattern="^(pem|der)$")
+) -> Response:
+    """The install CA's certificate (LT2), for a device to trust. Public on
+    every route: a certificate is not a secret."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    machine: StateMachine = request.app.state.machine
+    pem = machine.state.identity.installCaCertificate
+    if not pem:
+        raise problem(
+            status.HTTP_404_NOT_FOUND,
+            "No install CA yet",
+            "This root has not made its certificate authority: it has not been unlocked "
+            "since it was updated.",
+        )
+    if format == "der":
+        der = x509.load_pem_x509_certificate(pem.encode("ascii")).public_bytes(
+            serialization.Encoding.DER
+        )
+        return Response(
+            der,
+            media_type="application/pkix-cert",
+            headers={"Content-Disposition": 'attachment; filename="eugene-plexus-ca.cer"'},
+        )
+    return Response(
+        pem,
+        media_type="application/x-pem-file",
+        headers={"Content-Disposition": 'inline; filename="eugene-plexus-ca.pem"'},
+    )
+
+
 @router.get("/v1/trust/bundle", response_model=SignedTrustBundle)
 async def get_trust_bundle(request: Request) -> SignedTrustBundle:
     """The signed bundle every node pulls. **Public**: the signature is the credential.

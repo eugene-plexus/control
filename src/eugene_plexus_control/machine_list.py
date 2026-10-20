@@ -48,10 +48,20 @@ def required(config: dict[str, Any]) -> bool:
     return config.get(ENCRYPTION_KEY) == REQUIRED
 
 
+#: `clientPlainHttp`, the control config field (LT2-C4): `on` until the owner
+#: turns it off.
+CLIENT_PLAIN_KEY = "clientPlainHttp"
+
+
+def client_plain(config: dict[str, Any]) -> str:
+    return "off" if config.get(CLIENT_PLAIN_KEY) == "off" else "on"
+
+
 def content(state: Any, control_pins: list[str]) -> dict[str, Any]:
     """What the list says, before it is dated and signed."""
     return {
         "required": required(state.config),
+        "clientPlainHttp": client_plain(state.config),
         "controlPins": sorted(set(control_pins)),
         "nodes": [
             {
