@@ -380,3 +380,85 @@ def test_the_owner_lists_names_a_node_certificate_may_hold(active_client: TestCl
     assert again.status_code == 409
     node = active_client.get("/v1/nodes/gpu-box").json()
     assert node["certificateNames"] == ["eugene.lan", "wb.lan"]
+
+
+def test_a_node_cannot_take_another_machines_address_or_its_certificate(
+    active_client: TestClient,
+) -> None:
+    """Adversarial review, 2026-10-20: a node whose keys were stolen announced
+    the root's address and was issued a certificate for it."""
+    from .test_machine_tls import _announce
+
+    _, made = enroll(active_client, "root-node", url="http://192.168.1.10:8079")
+    assert made.status_code == 201, made.text
+    key = ec.generate_private_key(ec.SECP256R1())
+    keys, made = enroll(
+        active_client,
+        "worker",
+        url="http://192.168.1.50:8079",
+        machineUrl="https://192.168.1.50:8083",
+        tlsPin=install_ca.spki_pin(key.public_key()),
+    )
+    assert made.status_code == 201, made.text
+    # Announcing another machine's address, or its .local name: refused.
+    for url in ("http://192.168.1.10:8079", "http://root-node.local:8079"):
+        moved = _announce(active_client, "worker", keys.signing_private, url=url, sequence=9)
+        assert moved.status_code == 409, (url, moved.text)  # type: ignore[attr-defined]
+    # Its address on another port is two agents on one machine: let in, and
+    # then neither certificate names the address.
+    shared = _announce(
+        active_client,
+        "worker",
+        keys.signing_private,
+        url="http://192.168.1.10:9079",
+        sequence=10,
+        machine_url="https://192.168.1.10:9083",
+        pin=install_ca.spki_pin(key.public_key()),
+    )
+    assert shared.status_code == 200, shared.text  # type: ignore[attr-defined]
+    issued = active_client.post(
+        "/v1/nodes/worker/certificate",
+        headers={"Authorization": "Bearer " + keys.service_token()},
+        json={"csr": _csr(key, [])},
+    )
+    assert issued.status_code == 200, issued.text
+    assert "192.168.1.10" not in issued.json()["names"]
+    # Enrolling at it: refused too, before the token is spent.
+    _, again = enroll(active_client, "third", url="http://192.168.1.10:8079")
+    assert again.status_code == 409
+    # And a leaf never names another machine's names, whatever the records say.
+    with pytest.raises(install_ca.Refused):
+        install_ca.issue(
+            ca_certificate=active_client.app.state.machine.state.identity.installCaCertificate,  # type: ignore[attr-defined]
+            ca_key=active_client.app.state.auth_state.install_ca_key,  # type: ignore[attr-defined]
+            csr_pem=_csr(key, ["192.168.1.10"]),
+            node_name="worker",
+            allowed=install_ca.own_names("worker", "http://192.168.1.10:8079"),
+            registered_pins=[install_ca.spki_pin(key.public_key())],
+            others=install_ca.held_by_others("worker", active_client.app.state.machine.state.nodes),  # type: ignore[attr-defined]
+        )
+
+
+@pytest.mark.parametrize("name", ["*.home.arpa", "a_b.lan", "-x.local", "x..local"])
+def test_only_plain_hostname_labels_are_signed(name: str) -> None:
+    assert install_ca.permitted(name) is False
+
+
+def test_a_shared_agent_address_is_carried_for_nobody() -> None:
+    from types import SimpleNamespace
+
+    from eugene_plexus_control import _http, machine_list
+
+    def node(name: str, url: str, door: str, pin: str) -> SimpleNamespace:
+        return SimpleNamespace(name=name, url=url, machineUrl=door, tlsPins=(pin,))
+
+    pin_a, pin_b = "A" * 43, "B" * 43
+    state = SimpleNamespace(
+        config={},
+        nodes={
+            "a": node("a", "http://192.168.1.20:8079", "https://192.168.1.20:8083", pin_a),
+            "b": node("b", "http://192.168.1.20:8079", "https://192.168.1.21:8083", pin_b),
+        },
+    )
+    machine_list.install_table(state, None)
+    assert _http.machine_route("http://192.168.1.20:8079") is None

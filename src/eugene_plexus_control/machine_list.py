@@ -145,6 +145,13 @@ def install_table(state: Any, own_node: str | None) -> None:
             names[hostport] = record.name
             carried = str(record.machineUrl).rstrip("/") + "/agent"
         if agent is not None and agent.startswith("http://") and not _loopback(agent):
+            if agent in routes and names.get(agent) != record.name:
+                # Two records claim one address (written before the root
+                # refused that): neither is carried there.
+                log.warning("%s and %s both claim %s; neither is trusted there",
+                            names.get(agent), record.name, agent)  # fmt: skip
+                routes[agent] = None
+                continue
             routes[agent] = carried
             names[agent] = record.name
     set_machine_table(

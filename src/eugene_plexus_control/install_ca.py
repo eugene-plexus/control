@@ -29,6 +29,7 @@ import datetime
 import hashlib
 import ipaddress
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -42,7 +43,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 log = logging.getLogger(__name__)
 
 CA_DAYS = 20 * 365 + 5
-LEAF_DAYS = 397
+LEAF_DAYS = 90
 #: Issued a little in the past, so a device whose clock runs behind takes it.
 BACKDATE = datetime.timedelta(hours=1)
 
@@ -59,6 +60,9 @@ PERMITTED_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = 
 )
 PERMITTED_SUFFIXES = ("local", "home.arpa", "internal", "lan", "localhost")
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
+#: A DNS label the CA signs: letters, digits and inner hyphens. No `*`, no
+#: underscore, nothing a client could read as a wildcard.
+_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 class Refused(Exception):
@@ -112,9 +116,20 @@ def permitted(name: str) -> bool:
     address = _address(name)
     if address is not None:
         return any(address in network for network in PERMITTED_NETWORKS)
-    if not name or any(not label for label in name.split(".")):
+    if not name or len(name) > 253 or not all(_LABEL.match(p) for p in name.split(".")):
         return False
     return any(name == suffix or name.endswith("." + suffix) for suffix in PERMITTED_SUFFIXES)
+
+
+def held_by_others(node_name: str, nodes: Any) -> set[str]:
+    """Every name another node holds: its address's host, its `.local` name
+    and the names listed for it. Loopback names are everyone's."""
+    held: set[str] = set()
+    for other in nodes.values():
+        if other.name == node_name:
+            continue
+        held.update(own_names(other.name, other.url, list(other.certificateNames)))
+    return held - set(LOOPBACK_NAMES)
 
 
 def own_names(node_name: str, node_url: str | None, listed: list[str] | None = None) -> list[str]:
@@ -223,6 +238,7 @@ def issue(
     allowed: list[str],
     registered_pins: list[str],
     now: datetime.datetime | None = None,
+    others: set[str] | None = None,
 ) -> Issued:
     """A leaf for `node_name`'s own key and names, or `Refused`."""
     try:
@@ -248,9 +264,12 @@ def issue(
             f"The CSR is for a key {node_name} did not register; only its machine key "
             "gets a certificate.",
         )
-    own = [n for n in allowed if permitted(n)]
+    # A name another node holds is nobody's to sign here: not this node's,
+    # even if its own record says so (adversarial review, 2026-10-20).
+    taken = others or set()
+    own = [n for n in allowed if permitted(n) and n not in taken]
     requested = _requested(csr) or own
-    refused = [n for n in requested if n not in allowed or not permitted(n)]
+    refused = [n for n in requested if n not in own]
     if refused:
         raise Refused(
             403,

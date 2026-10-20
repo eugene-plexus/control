@@ -283,6 +283,7 @@ async def announce_node_address(
         )
 
     normalized = normalize_url(announced_url)
+    _not_anothers_address(name, normalized, machine.state.nodes)
     machine_url, pins = _checked_machine(
         name,
         normalized,
@@ -378,6 +379,39 @@ def machine_pins(settings: Any) -> list[str]:
     """This root's machine-port keys, as its agent handed them over (LT1)."""
     raw = getattr(settings, "machine_pins", None) or ""
     return [p for p in (s.strip() for s in raw.split(",")) if TLS_PIN.match(p)]
+
+
+def _not_anothers_address(name: str, url: str | None, nodes: dict[str, Any]) -> None:
+    """409 when another node holds this address (adversarial review,
+    2026-10-20): a node whose keys were stolen could otherwise announce the
+    root's address, be issued a certificate for it and be routed its
+    traffic. The same address with another port is allowed (two agents on
+    one machine), and then neither node's certificate names it
+    (`install_ca.held_by_others`). A machine that took another's old address
+    (DHCP) is let in once that one announces its new address; its agent
+    asks again."""
+    from urllib.parse import urlsplit
+
+    from .. import install_ca
+
+    parts = urlsplit(url or "")
+    host = install_ca.normalise(parts.hostname) if parts.hostname else None
+    if not host or host in install_ca.LOOPBACK_NAMES:
+        return
+    origin = machine_list._origin(url)
+    for other in nodes.values():
+        if other.name == name:
+            continue
+        theirs = {install_ca.normalise(f"{other.name}.local")}
+        theirs.update(install_ca.normalise(n) for n in other.certificateNames)
+        if origin == machine_list._origin(other.url) or host in theirs:
+            raise problem(
+                status.HTTP_409_CONFLICT,
+                "Another machine's address",
+                f"{url} is {other.label or other.name}'s. If that machine has moved, "
+                "this one is let in once it says where; if it is gone, remove it from "
+                "the install.",
+            )
 
 
 def _checked_machine(
@@ -733,6 +767,7 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
             f"{body.url} cannot be this node's address: {reason}.",
         )
     # Also before the token is spent, for the same reason.
+    _not_anothers_address(body.name, announced_url, machine.state.nodes)
     label = _checked_label(machine, body.name, body.label) if body.label is not None else None
     machine_url, pins = _checked_machine(
         body.name,
@@ -1082,6 +1117,7 @@ async def issue_node_certificate(
             csr_pem=body.csr,
             node_name=name,
             allowed=install_ca.own_names(name, record.url, list(record.certificateNames)),
+            others=install_ca.held_by_others(name, machine.state.nodes),
             registered_pins=list(record.tlsPins),
         )
     except install_ca.Refused as exc:
