@@ -264,6 +264,151 @@ def test_a_revocation_the_root_cannot_publish_revokes_nothing(active_client: Tes
     assert machine.state.index == index_before
 
 
+def _components_reported(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, items: list[dict[str, object]]
+) -> None:
+    """What the agents answer at `/v1/components`, as `collect` tags it."""
+    from eugene_plexus_control.nodes_client import NodeCollection
+
+    async def collect(*_args: object, **_kwargs: object) -> NodeCollection:
+        return NodeCollection(items=items, unreachable=[])
+
+    monkeypatch.setattr(client.app.state.nodes_client, "collect", collect)  # type: ignore[attr-defined]
+
+
+def test_the_root_s_own_machine_cannot_be_removed(active_client: TestClient) -> None:
+    """CX6. Its key leaving the bundle would end the root's own agent and
+    every session signed in to its console."""
+    from eugene_plexus_control.nodes_client import NodeProbe
+
+    enroll(active_client, "root-box")
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    active_client.app.state.node_probes = {  # type: ignore[attr-defined]
+        "root-box": NodeProbe(name="root-box", reachable=True, hosts_control=True)
+    }
+    index_before = machine.state.index
+    response = active_client.delete("/v1/nodes/root-box")
+    assert response.status_code == 409, response.text
+    assert "This root's own machine" in response.text
+    assert "root-box" in machine.state.nodes
+    assert machine.state.index == index_before
+
+    active_client.app.state.node_probes = {}  # type: ignore[attr-defined]
+    active_client.app.state.node_name = "root-box"  # type: ignore[attr-defined]
+    assert active_client.delete("/v1/nodes/root-box").status_code == 409
+
+
+def test_the_root_s_record_refuses_even_when_its_agent_is_silent(
+    active_client: TestClient,
+) -> None:
+    """Review B1: a root started before its machine enrolled has no
+    `node_name`, and a restarting agent's probe says nothing. The record's
+    role still names the root's machine."""
+    from dataclasses import replace
+
+    from eugene_plexus_control.nodes_client import NodeProbe
+
+    enroll(active_client, "root-box")
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    nodes = dict(machine.state.nodes)
+    nodes["root-box"] = replace(nodes["root-box"], role="control")
+    machine._state = replace(machine.state, nodes=nodes)
+    active_client.app.state.node_name = None  # type: ignore[attr-defined]
+    active_client.app.state.node_probes = {  # type: ignore[attr-defined]
+        "root-box": NodeProbe(name="root-box", reachable=False)
+    }
+    response = active_client.delete("/v1/nodes/root-box")
+    assert response.status_code == 409, response.text
+    assert "root-box" in machine.state.nodes
+
+
+def test_a_stopped_gateway_neither_blocks_nor_stands_in(
+    active_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review B2. A crashed second gateway does not let the only working
+    one go; a machine whose own gateway is stopped can be removed."""
+    enroll(active_client, "gw-live")
+    enroll(active_client, "gw-dead")
+    _components_reported(
+        active_client,
+        monkeypatch,
+        [
+            {"node": "gw-live", "name": "gateway", "kind": "gateway", "status": "running"},
+            {"node": "gw-dead", "name": "gateway", "kind": "gateway", "status": "crashed"},
+        ],
+    )
+    assert active_client.delete("/v1/nodes/gw-live").status_code == 409
+    assert active_client.delete("/v1/nodes/gw-dead").status_code == 202
+
+
+def test_the_last_running_gateway_cannot_be_removed(
+    active_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    enroll(active_client, "gw-box")
+    enroll(active_client, "gpu-box")
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    _components_reported(
+        active_client,
+        monkeypatch,
+        [
+            {"node": "gw-box", "name": "gateway", "kind": "gateway", "status": "running"},
+            {"node": "gpu-box", "name": "qwen", "kind": "inference-driver"},
+        ],
+    )
+    response = active_client.delete("/v1/nodes/gw-box")
+    assert response.status_code == 409, response.text
+    assert "The only gateway" in response.text
+    assert "gw-box" in machine.state.nodes
+    # A machine without the gateway is removed as before.
+    assert active_client.delete("/v1/nodes/gpu-box").status_code == 202
+
+
+def test_a_gateway_that_does_not_answer_does_not_block_removal(
+    active_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sold or dead box reports nothing, so it can always be removed;
+    and a second gateway elsewhere lets a running one go."""
+    enroll(active_client, "dead-box")
+    enroll(active_client, "gw-a")
+    _components_reported(active_client, monkeypatch, [])
+    assert active_client.delete("/v1/nodes/dead-box").status_code == 202
+
+    enroll(active_client, "gw-b")
+    _components_reported(
+        active_client,
+        monkeypatch,
+        [
+            {"node": "gw-a", "name": "gateway", "kind": "gateway", "status": "running"},
+            {"node": "gw-b", "name": "gateway", "kind": "gateway", "status": "running"},
+        ],
+    )
+    assert active_client.delete("/v1/nodes/gw-a").status_code == 202
+
+
+def test_removing_a_machine_clears_the_job_site_it_hosted(active_client: TestClient) -> None:
+    """CX6. The site stays (it is its own enrollment); it no longer names
+    a machine the install does not have."""
+    from dataclasses import replace
+
+    from eugene_plexus_control.applied import SiteRecord
+
+    enroll(active_client, "gpu-box")
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    site = SiteRecord(
+        id="s1",
+        label="Jessie's",
+        owner="p1",
+        tokenPublicKey="AAAA",
+        enrolledAt="2026-10-20T00:00:00Z",
+        hostNode="gpu-box",
+    )
+    other = replace(site, id="s2", hostNode="elsewhere")
+    machine._state = replace(machine.state, sites={"s1": site, "s2": other})
+    assert active_client.delete("/v1/nodes/gpu-box").status_code == 202
+    assert machine.state.sites["s1"].hostNode is None
+    assert machine.state.sites["s2"].hostNode == "elsewhere"
+
+
 def test_revoking_an_unknown_node_is_a_404(active_client: TestClient) -> None:
     assert active_client.delete("/v1/nodes/nowhere").status_code == 404
 

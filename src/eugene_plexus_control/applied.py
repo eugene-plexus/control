@@ -668,11 +668,17 @@ def _without_node(state: AppliedState, name: str) -> AppliedState:
     # The revoked node's declarations go with it. The model files on that
     # host's disk are untouched — but nothing in this install will route
     # to them, which is the honest consequence of removing a host.
+    # A Job Site it hosted stays (the site is its own enrollment), but no
+    # longer names a machine the install does not have (CX6).
     return replace(
         state,
         nodes={k: v for k, v in state.nodes.items() if k != name},
         components={k: v for k, v in state.components.items() if v.node != name},
         runtimes={k: v for k, v in state.runtimes.items() if v.node != name},
+        sites={
+            k: replace(v, hostNode=None) if v.hostNode == name else v
+            for k, v in state.sites.items()
+        },
     )
 
 

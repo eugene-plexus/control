@@ -17,6 +17,7 @@ the price of no quorum is a window you can see.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from datetime import UTC, datetime
@@ -50,6 +51,8 @@ from ..applied import (
     OP_REVOKE_NODE,
     OP_SET_STANDBY,
     OP_UPDATE_NODE,
+    ROLE_CONTROL,
+    ROLE_STANDBY,
     NodeRecord,
     clean_label,
     label_refusal,
@@ -351,8 +354,76 @@ async def revoke_node(request: Request, name: str) -> TrustChange:
     nothing rather than recording a revocation no node would hear of.
     The runtimes the node hosted become un-declared; the model files on
     that host's disk are untouched.
+
+    **Two removals are refused (CX6, 409).** This root's own machine: its
+    key leaving the bundle would end the root's own agent and every
+    session signed in to its console, and the machine could not join the
+    root it runs. And the last machine that runs a gateway, while it does:
+    every app would lose its front door. A machine that does not answer
+    is never refused, so a sold or dead box can always be removed.
     """
-    return revoke(request, name)
+    machine: StateMachine = request.app.state.machine
+    if name not in machine.state.nodes or not machine.is_active:
+        return revoke(request, name)  # its 404 or its not-active 409
+    # One removal at a time: two at once could each see the other's
+    # gateway and leave the install with none.
+    lock: asyncio.Lock | None = getattr(request.app.state, "removal_lock", None)
+    if lock is None:
+        lock = request.app.state.removal_lock = asyncio.Lock()
+    async with lock:
+        await _refuse_removal(request, name)
+        return revoke(request, name)
+
+
+#: A gateway in these states serves apps, or is about to.
+_GATEWAY_SERVING = frozenset({"running", "starting"})
+
+
+async def _refuse_removal(request: Request, name: str) -> None:
+    """Raise 409 when removing `name` would cut the install off (CX6).
+
+    The root's own machine is known three ways, and any one refuses: its
+    record's role, the name this root was started with (unless that names
+    the standby, which `_local_node_name` can), and the machine's own
+    probe. A probe alone would miss a root whose agent is restarting.
+    """
+    machine: StateMachine = request.app.state.machine
+    record = machine.state.nodes[name]
+    probe = request.app.state.node_probes.get(name)
+    if (
+        record.role == ROLE_CONTROL
+        or (name == request.app.state.node_name and record.role != ROLE_STANDBY)
+        or (probe is not None and probe.hosts_control)
+    ):
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "This root's own machine",
+            f"{name!r} runs this install's control root, so it cannot be removed. "
+            "Nothing was removed.",
+        )
+    from .topology import _targets
+
+    auth: AuthState = request.app.state.auth_state
+    collected = await request.app.state.nodes_client.collect(
+        _targets(machine),
+        lambda node: service_token_for(auth, node),
+        path="/v1/components",
+        key="components",
+    )
+    # A stopped or crashed gateway serves nobody: it neither keeps its
+    # machine in the install nor stands in for the one being removed.
+    serving = {
+        str(item.get("node"))
+        for item in collected.items
+        if item.get("kind") == "gateway" and item.get("status") in _GATEWAY_SERVING
+    }
+    if serving == {name}:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "The only gateway",
+            f"{name!r} runs the only gateway in this install, so every app would lose its "
+            "address. Run a gateway on another machine first. Nothing was removed.",
+        )
 
 
 def revoke(request: Request, name: str) -> TrustChange:
