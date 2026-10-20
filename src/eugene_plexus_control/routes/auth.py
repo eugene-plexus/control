@@ -215,10 +215,16 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
     auth.recovery_private_key = recovery.private
     # LT-C2: a new install requires encryption between machines from the
     # start; one upgraded from before LT1 has no value, which is automatic.
-    machine.append(
-        OP_PATCH_CONFIG, {"values": {machine_list.ENCRYPTION_KEY: machine_list.REQUIRED}}
-    )
-    request.app.state.bootstrap_config.write_through(machine.state.config)
+    # Only with a machine port in front of this root (its agent handed over
+    # the port's key): a root started on its own, as a harness starts one,
+    # has no door for TLS to arrive at, so it stays automatic.
+    from .nodes import machine_pins
+
+    if machine_pins(request.app.state.settings):
+        machine.append(
+            OP_PATCH_CONFIG, {"values": {machine_list.ENCRYPTION_KEY: machine_list.REQUIRED}}
+        )
+        request.app.state.bootstrap_config.write_through(machine.state.config)
     request.app.state.trust.publish(request.app)
     log.info(
         "install initialized; epoch %d, token key generation %s",

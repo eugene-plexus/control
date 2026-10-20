@@ -76,6 +76,26 @@ def _origin(url: str | None) -> str | None:
     return f"{parts.scheme}://{host}:{parts.port or (443 if parts.scheme == 'https' else 80)}"
 
 
+def _loopback(origin: str) -> bool:
+    """An address on this machine: nothing to encrypt, nothing to refuse."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(origin).hostname or "").strip("[]")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def door_of(url: str | None) -> str | None:
+    """`host:port` of an `https` machine URL, normalised as tables key it."""
+    origin = _origin(url)
+    return origin.removeprefix("https://") if origin and origin.startswith("https://") else None
+
+
 def install_table(state: Any, own_node: str | None) -> None:
     """The active root's own machine table, from its own records (LT1).
 
@@ -88,18 +108,33 @@ def install_table(state: Any, own_node: str | None) -> None:
     machines: dict[str, list[str]] = {}
     routes: dict[str, str | None] = {}
     names: dict[str, str] = {}
-    for record in state.nodes.values():
+    local: list[str] = []
+    for record in sorted(state.nodes.values(), key=lambda r: r.name):
         if record.name == own_node:
+            # This root's own machine, under its LAN address: not a crossing.
+            if record.url:
+                local.append(str(record.url))
             continue
         agent = _origin(record.url)
         door = _origin(record.machineUrl)
         carried = None
         if door is not None and door.startswith("https://") and record.tlsPins:
             hostport = door.removeprefix("https://")
+            if hostport in machines:
+                # Two records claim one door (written before the root checked
+                # for that): neither is trusted there.
+                log.warning(
+                    "%s and %s both registered %s; neither is trusted there",
+                    names.get(hostport),
+                    record.name,
+                    hostport,
+                )
+                machines[hostport] = []
+                continue
             machines[hostport] = list(record.tlsPins)
             names[hostport] = record.name
             carried = str(record.machineUrl).rstrip("/") + "/agent"
-        if agent is not None and agent.startswith("http://"):
+        if agent is not None and agent.startswith("http://") and not _loopback(agent):
             routes[agent] = carried
             names[agent] = record.name
     set_machine_table(
@@ -109,6 +144,7 @@ def install_table(state: Any, own_node: str | None) -> None:
                 "routes": routes,
                 "names": names,
                 "required": required(state.config),
+                "local": local,
             }
         )
     )
@@ -180,7 +216,10 @@ class MachineListPublisher:
                 return self.jws
             # `version` strictly rises, so a node that holds one never takes
             # an older one for the same; `iat` is only when it was signed.
-            self._version += 1
+            # It follows the replicated log index (a thousand versions to an
+            # entry), so a promoted standby, whose own file starts empty,
+            # signs above everything the root it replaced signed.
+            self._version = max(self._version + 1, int(state.index) * 1000)
             self.jws = jwt.encode(
                 {"iat": int(time.time()), "version": self._version, **wanted},
                 tokens.load_private(control_private_key),

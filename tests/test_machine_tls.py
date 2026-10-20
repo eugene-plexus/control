@@ -187,7 +187,9 @@ def test_an_announcement_without_a_key_clears_the_one_on_record(
 def test_the_machine_list_is_signed_and_its_iat_only_rises(active_client: TestClient) -> None:
     keys, _ = enroll(active_client, "gpu-box", url="http://100.64.0.7:8079")
     first = _machine_list(active_client)
-    assert first["required"] is True, "a new install starts required"
+    # A root with no machine port in front of it (this one) starts automatic;
+    # `test_a_join_token_carries_the_root_s_key...` has one, and starts required.
+    assert first["required"] is False
     assert first["controlPins"] == []
     _announce(
         active_client,
@@ -231,7 +233,9 @@ def test_a_join_token_carries_the_root_s_key_and_works_either_way(tmp_path: Path
         with_pin = mint_join_token(client)
         secret, _, pin = with_pin.partition(".")
         assert pin == ROOT_PIN and "." not in secret
-        assert _machine_list(client)["controlPins"] == [ROOT_PIN]
+        listed = _machine_list(client)
+        assert listed["controlPins"] == [ROOT_PIN]
+        assert listed["required"] is True, "a new install with a machine port starts required"
         keys = node_keys("a")
         assert client.post("/v1/nodes/enroll", json=keys.body(with_pin)).status_code == 201
         bare, _, _ = mint_join_token(client).partition(".")
@@ -314,3 +318,49 @@ def test_the_pins_survive_a_snapshot(active_client: TestClient) -> None:
     again = from_canonical(to_canonical(state))
     assert again.nodes["gpu-box"].machineUrl == "https://100.64.0.7:8083"
     assert again.nodes["gpu-box"].tlsPins == (PIN_A,)
+
+
+# ---- the adversarial review (2026-10-20) ------------------------------------
+
+
+def test_a_machine_port_on_another_host_is_refused(active_client: TestClient) -> None:
+    keys, _ = enroll(active_client, "gpu-box", url="http://100.64.0.7:8079")
+    response = _announce(
+        active_client,
+        "gpu-box",
+        keys.signing_private,
+        url="http://100.64.0.7:8079",
+        sequence=1,
+        machine_url="https://100.64.0.66:8083",
+        pin=PIN_A,
+    )
+    assert response.status_code == 400, response.text  # type: ignore[attr-defined]
+    assert "not on the host" in response.text  # type: ignore[attr-defined]
+
+
+def test_a_door_another_node_registered_is_refused(active_client: TestClient) -> None:
+    enroll(active_client, "gpu-box", url="http://100.64.0.7:8079",
+           machineUrl="https://100.64.0.7:8083", tlsPin=PIN_A)  # fmt: skip
+    thief, _ = enroll(active_client, "thief", url="http://100.64.0.7:8080")
+    response = _announce(
+        active_client,
+        "thief",
+        thief.signing_private,
+        url="http://100.64.0.7:8080",
+        sequence=1,
+        machine_url="https://100.64.0.7:8083",
+        pin=PIN_B,
+    )
+    assert response.status_code == 400, response.text  # type: ignore[attr-defined]
+    assert "already registered" in response.text  # type: ignore[attr-defined]
+    assert active_client.get("/v1/nodes/gpu-box").json()["tlsPins"] == [PIN_A]
+
+
+def test_the_list_version_follows_the_log(active_client: TestClient) -> None:
+    """A promoted standby, whose own file starts empty, still signs above what
+    the root it replaced signed: the version rides the replicated index."""
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    first = _machine_list(active_client)
+    assert first["version"] >= machine.state.index * 1000
+    enroll(active_client, "gpu-box", url="http://100.64.0.7:8079")
+    assert _machine_list(active_client)["version"] >= machine.state.index * 1000

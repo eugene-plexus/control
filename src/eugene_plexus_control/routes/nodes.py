@@ -279,7 +279,11 @@ async def announce_node_address(
 
     normalized = normalize_url(announced_url)
     machine_url, pins = _checked_machine(
-        name, normalized, machine_fields.get("machineUrl"), machine_fields.get("tlsPin")
+        name,
+        normalized,
+        machine_fields.get("machineUrl"),
+        machine_fields.get("tlsPin"),
+        machine.state.nodes,
     )
     if normalized == record.url and (machine_url, pins) == (record.machineUrl, record.tlsPins):
         # Nothing to record. Note that the sequence is deliberately NOT
@@ -372,7 +376,11 @@ def machine_pins(settings: Any) -> list[str]:
 
 
 def _checked_machine(
-    name: str, agent_url: str | None, machine_url: Any, pin: Any
+    name: str,
+    agent_url: str | None,
+    machine_url: Any,
+    pin: Any,
+    nodes: dict[str, Any] | None = None,
 ) -> tuple[str | None, tuple[str, ...]]:
     """A node's machine port and key as recorded, or a 400 (LT1).
 
@@ -381,6 +389,12 @@ def _checked_machine(
     (`node_address`), it is `https`, and it is no more public than the
     node's own address: the rule that stops a node moving itself onto the
     open internet holds for its machine port too.
+
+    **And it is the node's own** (adversarial review, 2026-10-20). Its host
+    is the host of the node's own address, and no other node already
+    registered that host and port. Without both, a node whose keys were
+    stolen could register its own key for the root's address or another
+    machine's, and every caller would accept a man in the middle there.
     """
     if machine_url is None and pin is None:
         return None, ()
@@ -397,12 +411,22 @@ def _checked_machine(
             "Malformed machine key",
             "`tlsPin` must be the base64url SHA-256 of the key's SubjectPublicKeyInfo.",
         )
-    normalized = normalize_url(machine_url).rstrip("/")
+    normalized = (normalize_url(machine_url) or "").rstrip("/")
     reason = node_address.rejection(normalized)
     if reason is None and not normalized.startswith("https://"):
         reason = "a machine port is reached over https and nothing else"
     if reason is None and node_address.goes_public(agent_url, normalized):
         reason = "it is on the open internet and the node's own address is not"
+    door = machine_list.door_of(normalized)
+    if reason is None and agent_url and door is not None:
+        own_host = machine_list.door_of(agent_url.replace("http://", "https://", 1))
+        if own_host is not None and own_host.rpartition(":")[0] != door.rpartition(":")[0]:
+            reason = "it is not on the host of the node's own address"
+    if reason is None and door is not None:
+        for other in (nodes or {}).values():
+            if other.name != name and machine_list.door_of(other.machineUrl) == door:
+                reason = f"{other.name!r} already registered that address"
+                break
     if reason is not None:
         raise problem(
             status.HTTP_400_BAD_REQUEST,
@@ -706,7 +730,11 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
     # Also before the token is spent, for the same reason.
     label = _checked_label(machine, body.name, body.label) if body.label is not None else None
     machine_url, pins = _checked_machine(
-        body.name, announced_url, str(body.machineUrl) if body.machineUrl else None, body.tlsPin
+        body.name,
+        announced_url,
+        str(body.machineUrl) if body.machineUrl else None,
+        body.tlsPin,
+        machine.state.nodes,
     )
 
     try:
