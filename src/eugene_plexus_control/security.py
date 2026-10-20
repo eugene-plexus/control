@@ -252,4 +252,8 @@ def hash_join_token(token: str) -> str:
     fast enough to be a UI action."""
     import hashlib
 
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+    # A node's token may carry this root's machine key after a dot (LT1:
+    # `<secret>.<pin>`). The secret never holds one (`token_urlsafe`), so
+    # the part before it is the credential, with or without the suffix.
+    secret = token.split(".", 1)[0]
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()

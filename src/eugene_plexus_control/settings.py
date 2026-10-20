@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     Supplied by the supervising agent. Site invitations name it ahead of
     `siteJoinUrl`, and the TLS keys it presents are what this root signs
     (`root_tls`)."""
+    machine_pins: str | None = None
+    """The keys the machine port in front of this root may present (LT1),
+    comma-separated `TlsPin`s: its own machine's agent's key. Supplied by
+    that agent, which owns the port; this root signs them into the machine
+    list and puts the first on every node's join token."""
     nodes_probe: str | None = None
     """`host:port` where this root reads the key its nodes name presents,
     when Eugene's own proxy terminates TLS: that proxy on loopback. Unset

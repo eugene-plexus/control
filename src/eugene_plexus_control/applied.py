@@ -258,6 +258,12 @@ class NodeRecord:
     enrolledAt: str | None = None
     """From the entry's payload, stamped once by the writer that
     appended it. Never `now()` at apply time."""
+    machineUrl: str | None = None
+    """This node's machine port, `https://<host>:8083` (LT1). From its
+    enrolment or its signed announcement; `None` on an older node."""
+    tlsPins: tuple[str, ...] = ()
+    """The keys its machine port may present, registered under its
+    signature (or its join token). Empty on an older node."""
 
 
 @dataclass(frozen=True)
@@ -545,6 +551,8 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
         arch=_optional_str(payload, "arch"),
         devices=tuple(d for d in raw_devices if isinstance(d, dict)),
         enrolledAt=_optional_str(payload, "enrolledAt"),
+        machineUrl=_optional_str(payload, "machineUrl"),
+        tlsPins=_pins(payload.get("tlsPins")),
     )
     # Re-enrollment overwrites rather than conflicting. A host that was
     # rebuilt presents a new keypair under the same operator-chosen name,
@@ -554,6 +562,14 @@ def _apply_enroll_node(state: AppliedState, payload: dict[str, Any], index: int)
 
 
 _NODE_GRANTS = frozenset({"node", "gateway", "files", GRANT_STANDBY})
+
+
+def _pins(raw: Any) -> tuple[str, ...]:
+    """A node's machine-key pins, sorted so replay is byte-stable. The writer
+    checked their form; apply keeps whatever strings it wrote."""
+    if not isinstance(raw, list):
+        return ()
+    return tuple(sorted({p for p in raw if isinstance(p, str) and p}))
 
 
 def _grants(raw: Any, index: int) -> tuple[str, ...]:
@@ -601,6 +617,14 @@ def _apply_update_node(state: AppliedState, payload: dict[str, Any], index: int)
             f"{record.advertiseSequence}"
         )
     updated = replace(record, url=_optional_str(payload, "url"), advertiseSequence=sequence)
+    # LT1: the machine port rides the same signed announcement. An entry
+    # written before it carries neither key and leaves them as they were.
+    if "machineUrl" in payload or "tlsPins" in payload:
+        updated = replace(
+            updated,
+            machineUrl=_optional_str(payload, "machineUrl"),
+            tlsPins=_pins(payload.get("tlsPins")),
+        )
     return replace(state, nodes={**state.nodes, name: updated})
 
 
@@ -1465,6 +1489,8 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
                 "arch": n.arch,
                 "devices": [dict(d) for d in n.devices],
                 "enrolledAt": n.enrolledAt,
+                "machineUrl": n.machineUrl,
+                "tlsPins": list(n.tlsPins),
             }
             for n in sorted(state.nodes.values(), key=lambda r: r.name)
         ],
@@ -1579,6 +1605,8 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
                 arch=n.get("arch"),
                 devices=tuple(n.get("devices") or ()),
                 enrolledAt=n.get("enrolledAt"),
+                machineUrl=n.get("machineUrl"),
+                tlsPins=_pins(n.get("tlsPins")),
             )
             for n in raw.get("nodes") or []
         },

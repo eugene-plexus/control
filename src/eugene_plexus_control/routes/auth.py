@@ -41,7 +41,7 @@ from fastapi import APIRouter, Depends, Request, status
 from fastapi.security import HTTPBearer
 
 from .. import config as config_module
-from .. import keyring_store, peer, sealing, security, tokens
+from .. import keyring_store, machine_list, peer, sealing, security, tokens
 from .._generated.models import (
     AuthInitializeRequest,
     AuthLoginResponse,
@@ -49,7 +49,7 @@ from .._generated.models import (
     TokenExchangeRequest,
     TokenExchangeResponse,
 )
-from ..applied import OP_REVOKE_SESSION
+from ..applied import OP_PATCH_CONFIG, OP_REVOKE_SESSION
 from ..auth_state import AuthState
 from ..dependencies import (
     optional_node_actor,
@@ -213,6 +213,12 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
     auth.set_signing_key(signing_key)
     auth.control_private_key = control_identity.private
     auth.recovery_private_key = recovery.private
+    # LT-C2: a new install requires encryption between machines from the
+    # start; one upgraded from before LT1 has no value, which is automatic.
+    machine.append(
+        OP_PATCH_CONFIG, {"values": {machine_list.ENCRYPTION_KEY: machine_list.REQUIRED}}
+    )
+    request.app.state.bootstrap_config.write_through(machine.state.config)
     request.app.state.trust.publish(request.app)
     log.info(
         "install initialized; epoch %d, token key generation %s",

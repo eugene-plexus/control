@@ -222,7 +222,9 @@ def verify_rekey(control_public_key: str, message: bytes, signature: str) -> boo
     return True
 
 
-def address_message(*, name: str, sequence: int, url: str) -> bytes:
+def address_message(
+    *, name: str, sequence: int, url: str, machine: dict[str, Any] | None = None
+) -> bytes:
     """The canonical bytes an address announcement is signed over —
     `NodeAddressAnnouncement.signature` in `control.yaml`, byte for byte.
 
@@ -231,12 +233,14 @@ def address_message(*, name: str, sequence: int, url: str) -> bytes:
     announcement cannot be replayed against another node's record, and
     `url` is the value exactly as sent, before this root normalizes it —
     normalizing first would mean the two ends sign different bytes.
+
+    `machine` holds whichever of `machineUrl` and `tlsPin` the body held
+    (LT1), exactly as sent; they join the signed object under their own
+    names, so the key a node registers is covered by its signature.
     """
-    return json.dumps(
-        {"name": name, "sequence": sequence, "url": url},
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    signed: dict[str, Any] = {"name": name, "sequence": sequence, "url": url}
+    signed.update(machine or {})
+    return json.dumps(signed, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def sign_address(node_private_key: str, message: bytes) -> str:

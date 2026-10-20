@@ -1906,39 +1906,20 @@ class PathMapping(BaseModel):
     )
 
 
-class LibraryFolder(BaseModel):
+class LibraryFolderKind(StrEnum):
     """
-    One directory the library catalogues, and where other machines
-    find it (2026-09-14).
-
-    `path` is the directory as the library's own host spells it —
-    what the scanner walks, what a `ModelSummary.path` starts with,
-    the left-hand side of every rule that reaches it. `mounts` is
-    the same directory as **other** machines see it: a POSIX-shaped
-    entry is for Linux and macOS nodes, a Windows-shaped one (drive
-    letter or UNC) for Windows nodes, and a node takes the first
-    entry of its own shape. That is the whole of "how does node X
-    reach folder Y" for every node that mounts the share where the
-    folder says; a node that mounts it elsewhere carries one
-    override in its agent's `pathMappings`, and a node with no
-    mount of its shape opens `path` as written — the identical-mount
-    convention, and every single-host install.
-
-    The rule this replaces was per node per folder, on each node's
-    agent, and grew as nodes × folders with every row typed by hand.
-    This is per folder, stated once. Nothing is copied or cached:
-    the operator mounts the share, this says where.
+    What the library reads in a folder (CX9, 2026-10-20). `folder`:
+    model files, walked as they are. `ollama`: an Ollama model store
+    (the directory holding `blobs/` and `manifests/` or
+    `manifests-v2/`), read through its manifests and **never written
+    to** -- no download, provenance, prepared file or delete lands
+    there. Its models are Ollama's: one that Ollama removes goes
+    `missing`.
 
     """
 
-    path: str = Field(
-        ...,
-        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
-    )
-    mounts: list[str] | None = Field(
-        [],
-        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
-    )
+    folder = 'folder'
+    ollama = 'ollama'
 
 
 class DirectoryEntryKind(StrEnum):
@@ -2186,6 +2167,37 @@ class Os(StrEnum):
 class Arch(StrEnum):
     x64 = 'x64'
     arm64 = 'arm64'
+
+
+class MachinePort(BaseModel):
+    """
+    This node's machine port (LT1, `docs/design/tls-between-machines.md`):
+    the one TLS door every other machine of the install reaches it
+    through, and what this node holds about the others.
+
+    """
+
+    url: AnyUrl | None = Field(
+        None,
+        description="Where other machines reach it, as announced to the root:\n`https://<advertise host>:<port>`. The port is 8083, shifted by\nthe same offset as the agent's advertised port, or the\n`machineUrl` config field. `null` while this node advertises\nno address.\n",
+    )
+    port: int | None = Field(None, description='The port it listens on here.')
+    pin: str = Field(
+        ...,
+        description="Base64url SHA-256 of this node's machine key's\nSubjectPublicKeyInfo: what it registered, and what every other\nmachine checks.\n",
+    )
+    listening: bool
+    error: str | None = Field(
+        None, description='Why it is not listening, in the words of the failure.'
+    )
+    required: bool = Field(
+        ...,
+        description="The install requires encryption between machines, from the\nroot's signed list: plain HTTP from another machine is refused\nhere, and plain HTTP to another machine is refused.\n",
+    )
+    listAgeSeconds: int | None = Field(
+        None,
+        description="Seconds since this node last took the root's signed machine\nlist. `null` when it holds none.\n",
+    )
 
 
 class ComponentName(StrEnum):
@@ -2643,6 +2655,10 @@ class AuthStatus(BaseModel):
     passphraseFile: bool | None = Field(
         None,
         description='True when this agent unlocks itself from a passphrase file:\n`securityMode` is `passphrase_file` and\n`EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE` names where the file\ngoes. The Linux system install, where the agent runs under\nits own account and has no keyring (2026-09-24). The wizard\nthen says the install unlocks itself after a restart, offers\nno keyring choice, and sets the control root to the same\nmode. Absent from an agent that predates the field, and false\neverywhere else.\n',
+    )
+    firstRunComplete: bool | None = Field(
+        None,
+        description="The agent config's `firstRunComplete`: true once first-run\nsetup has finished (screen 2's Finish). Here so the console's\ngate can tell a half-set-up install from a finished one before\nit has a session (console-ux-pass.md CX2-C1). The half-set-up\none goes to setup, which signs in and carries on in one\npassphrase prompt; the finished one goes to sign-in. Present\nonly when `initialized` is true, and absent from an agent that\npredates the field, so a console treats absent as finished.\n",
     )
 
 
@@ -3986,6 +4002,10 @@ class Component(BaseModel):
         None,
         description="Where a **peer on another host** reaches this component: the\nagent's advertise host with this component's port. Derived,\nnever declared, and present only for a component this agent\nspawns on an agent that has an advertise address\n(`NodeIdentity.advertiseUrl`). `url` keeps its one meaning —\nwhat the agent binds and probes — and the gateway prefers this\nfield and falls back to `url`, which is the whole of what makes\na companion driver on one host routable from a gateway on\nanother. Absent on a single-host install, where the two would\nsay the same thing.\n",
     )
+    machineUrl: AnyUrl | None = Field(
+        None,
+        description="Where another machine reaches this component **over TLS**\n(LT1): this node's machine port with the component's path,\n`https://<host>:8083/drivers/<name>`. Present for an\ninference-driver or tool-driver this agent spawns, once the\nnode has a machine port. A caller that holds the node's pin\n(from the root's signed machine list) prefers it to\n`advertiseUrl`; one that does not, or an older one, keeps\n`advertiseUrl`, and that is how an install with old and new\nmachines keeps working.\n",
+    )
     spawn: SpawnConfig | None = Field(
         None,
         description="Present iff this component runs locally under agent\nsupervision. Absence means it's remote (the agent only\nmonitors reachability).\n",
@@ -4301,6 +4321,46 @@ class ConfigFieldStatus(BaseModel):
 
     level: ConfigFieldStatusLevel
     text: str
+
+
+class LibraryFolder(BaseModel):
+    """
+    One directory the library catalogues, and where other machines
+    find it (2026-09-14).
+
+    `path` is the directory as the library's own host spells it —
+    what the scanner walks, what a `ModelSummary.path` starts with,
+    the left-hand side of every rule that reaches it. `mounts` is
+    the same directory as **other** machines see it: a POSIX-shaped
+    entry is for Linux and macOS nodes, a Windows-shaped one (drive
+    letter or UNC) for Windows nodes, and a node takes the first
+    entry of its own shape. That is the whole of "how does node X
+    reach folder Y" for every node that mounts the share where the
+    folder says; a node that mounts it elsewhere carries one
+    override in its agent's `pathMappings`, and a node with no
+    mount of its shape opens `path` as written — the identical-mount
+    convention, and every single-host install.
+
+    The rule this replaces was per node per folder, on each node's
+    agent, and grew as nodes × folders with every row typed by hand.
+    This is per folder, stated once. Nothing is copied or cached:
+    the operator mounts the share, this says where.
+
+    """
+
+    path: str = Field(
+        ...,
+        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
+    )
+    mounts: list[str] | None = Field(
+        [],
+        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
+    )
+    kind: LibraryFolderKind | None = 'folder'
+    found: bool | None = Field(
+        None,
+        description='Not in `modelRoots`: the library found it on its own machine\n(an Ollama store, CX9) and lists it while `findOllama` is on.\nAbsent or false for a folder someone added.\n',
+    )
 
 
 class DirectoryEntry(BaseModel):
@@ -5664,6 +5724,7 @@ class NodeIdentity(BaseModel):
         None,
         description="Where other hosts reach this agent — the `advertiseUrl` config\nfield, or the value derived at enrollment when none was set.\nWhat the control root holds as this node's `Node.url`.\n",
     )
+    machine: MachinePort | None = None
     trustBundleVersion: int | None = Field(
         None,
         description='The version of the trust bundle this agent holds. After a\nrevocation or a rotation, a node still below the root\'s\ncurrent version is the answer to "which host is stale", from\nthe host itself.\n',

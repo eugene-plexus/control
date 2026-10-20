@@ -249,6 +249,28 @@ FIELDS: list[ConfigField] = [
         ),
     ),
     ConfigField(
+        key="machineEncryption",
+        label="Encryption between machines",
+        description=(
+            "Whether machines in this install may talk to each other in plain "
+            "HTTP.\n\n"
+            "- **Automatic**: plain HTTP to a machine that runs an older version, "
+            "TLS to every other; switches to required by itself once every machine "
+            "has a machine key and answers on its machine port.\n"
+            "- **Required**: TLS between every pair of machines. A machine on an "
+            "older version is refused until it is updated, and control and drivers "
+            "listen on their own machine only.\n"
+            "- **Off**: no switch to required. Prompts, answers and sign-in tokens "
+            "to a machine on an older version cross the network in clear text.\n\n"
+            "Apps, browsers and the console reach Eugene as before either way."
+        ),
+        category="security",
+        valueType=ConfigValueType.enum,
+        default="automatic",
+        enumValues=["automatic", "required", "off"],
+        enumLabels=["Automatic", "Required", "Off"],
+    ),
+    ConfigField(
         key="oidcIssuer",
         label="Sign-in address for apps",
         description=(

@@ -35,7 +35,7 @@ from typing import Any
 
 import httpx
 
-from ._http import internal_client
+from ._http import internal_client, refused_pin
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +64,9 @@ class NodeProbe:
     hosts_control: bool = False
     """The node said its agent supervises the active control root: this
     root's own machine, which can never be its standby (warm-standby.md)."""
+    pin_refused: str | None = None
+    """The probe was refused because the node's machine port presented a
+    key it never registered (LT1): that key's pin. A security event."""
 
 
 TokenFor = Callable[[str], str | None]
@@ -148,7 +151,9 @@ class NodesClient:
         except httpx.HTTPStatusError as exc:
             return NodeProbe(name=name, reachable=False, error=_describe(exc))
         except (httpx.HTTPError, ValueError) as exc:
-            return NodeProbe(name=name, reachable=False, error=_describe(exc))
+            return NodeProbe(
+                name=name, reachable=False, error=_describe(exc), pin_refused=refused_pin(exc)
+            )
 
         if not isinstance(body, dict):
             return NodeProbe(name=name, reachable=False, error="malformed /v1/node response")

@@ -33,10 +33,11 @@ from fastapi import FastAPI
 from . import __version__, keyring_store, passphrase_file, security
 from . import config as config_module
 from .admission_worker import AdmissionWorker
-from .applied import RetiredData, normalize_url
+from .applied import OP_PATCH_CONFIG, RetiredData, normalize_url
 from .auth_state import AuthState
 from .join_tokens import JoinTokenStore
 from .log_store import LogStore
+from .machine_list import MachineListPublisher
 from .nodes_client import NodesClient
 from .replication import Follower, StandbyToken
 from .root_tls import RootTls
@@ -147,6 +148,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         Path(settings.state_dir), settings.nodes_origin, settings.nodes_probe
     )
     app.state.root_tls_task = None
+    app.state.machine_list = MachineListPublisher(Path(settings.state_dir))
     app.state.standby_reports = {}
     app.state.nodes_client = NodesClient(
         timeout_provider=lambda: config_module.effective(machine.state.config)[
@@ -417,6 +419,7 @@ async def _poll_nodes(app: FastAPI) -> None:
                 app.state.node_probes = await client.probe_all(
                     targets, lambda node: service_token_for(app.state.auth_state, node)
                 )
+            _require_when_ready(app, machine)
             await asyncio.sleep(float(values["nodePollIntervalSeconds"]))
         except asyncio.CancelledError:
             raise
@@ -426,6 +429,37 @@ async def _poll_nodes(app: FastAPI) -> None:
             # than reporting nothing: a stale `true` reads as healthy.
             log.warning("node poll failed: %s", exc)
             await asyncio.sleep(5.0)
+
+
+def _require_when_ready(app: FastAPI, machine: StateMachine) -> None:
+    """LT-C2: an automatic install requires encryption once every machine can.
+
+    Once every enrolled machine has a machine key on record and this root's
+    last poll reached it over TLS to that key, one `patchConfig` makes it
+    required, and it stays so: a machine on an older version that joins
+    later is refused until it is updated, rather than turning encryption
+    off for everyone. An expert sets `off` to stop this.
+    """
+    from .machine_list import AUTOMATIC, ENCRYPTION_KEY, REQUIRED, link
+
+    if (machine.state.config.get(ENCRYPTION_KEY) or AUTOMATIC) != AUTOMATIC:
+        return
+    probes = app.state.node_probes
+    nodes = list(machine.state.nodes.values())
+    if not nodes:
+        return
+    for record in nodes:
+        state = link(record, probes.get(record.name))
+        own = state["state"] == "unknown" and state["detail"] == "This root's own machine."
+        if state["state"] != "encrypted" and not own:
+            return
+    machine.append(OP_PATCH_CONFIG, {"values": {ENCRYPTION_KEY: REQUIRED}})
+    app.state.bootstrap_config.write_through(machine.state.config)
+    log.warning(
+        "every machine in this install has a machine key and answers on its machine port: "
+        "encryption between machines is now required (machineEncryption). Set it to `off` "
+        "to go back."
+    )
 
 
 def _local_node_name(machine: StateMachine) -> str | None:

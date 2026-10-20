@@ -2771,39 +2771,20 @@ class PathMapping(BaseModel):
     )
 
 
-class LibraryFolder(BaseModel):
+class LibraryFolderKind(StrEnum):
     """
-    One directory the library catalogues, and where other machines
-    find it (2026-09-14).
-
-    `path` is the directory as the library's own host spells it —
-    what the scanner walks, what a `ModelSummary.path` starts with,
-    the left-hand side of every rule that reaches it. `mounts` is
-    the same directory as **other** machines see it: a POSIX-shaped
-    entry is for Linux and macOS nodes, a Windows-shaped one (drive
-    letter or UNC) for Windows nodes, and a node takes the first
-    entry of its own shape. That is the whole of "how does node X
-    reach folder Y" for every node that mounts the share where the
-    folder says; a node that mounts it elsewhere carries one
-    override in its agent's `pathMappings`, and a node with no
-    mount of its shape opens `path` as written — the identical-mount
-    convention, and every single-host install.
-
-    The rule this replaces was per node per folder, on each node's
-    agent, and grew as nodes × folders with every row typed by hand.
-    This is per folder, stated once. Nothing is copied or cached:
-    the operator mounts the share, this says where.
+    What the library reads in a folder (CX9, 2026-10-20). `folder`:
+    model files, walked as they are. `ollama`: an Ollama model store
+    (the directory holding `blobs/` and `manifests/` or
+    `manifests-v2/`), read through its manifests and **never written
+    to** -- no download, provenance, prepared file or delete lands
+    there. Its models are Ollama's: one that Ollama removes goes
+    `missing`.
 
     """
 
-    path: str = Field(
-        ...,
-        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
-    )
-    mounts: list[str] | None = Field(
-        [],
-        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
-    )
+    folder = 'folder'
+    ollama = 'ollama'
 
 
 class DirectoryEntryKind(StrEnum):
@@ -2816,6 +2797,67 @@ class DirectoryEntryKind(StrEnum):
 
     directory = 'directory'
     file = 'file'
+
+
+class TlsPin(RootModel[str]):
+    root: str = Field(
+        ...,
+        description="Base64url (no padding) of the SHA-256 of a machine key's\nSubjectPublicKeyInfo, the form Job Sites pin too.\n",
+        pattern='^[A-Za-z0-9_-]{43}$',
+    )
+
+
+class State(StrEnum):
+    """
+    * `encrypted`: the last poll went over TLS to the key the node
+      registered.
+    * `no_key`: the node runs a version without a machine port, so
+      traffic to it is plain (refused once encryption is required).
+    * `unreachable`: it has a key on record and its machine port did
+      not answer.
+    * `refused`: its machine port presented a key it did not
+      register. A security event; nothing was sent.
+    * `unknown`: not polled yet.
+
+    """
+
+    encrypted = 'encrypted'
+    no_key = 'no_key'
+    unreachable = 'unreachable'
+    refused = 'refused'
+    unknown = 'unknown'
+
+
+class MachineLink(BaseModel):
+    """
+    How this root last reached the node, as an observation: never
+    replicated, and absent until it has polled.
+
+    """
+
+    state: State = Field(
+        ...,
+        description='* `encrypted`: the last poll went over TLS to the key the node\n  registered.\n* `no_key`: the node runs a version without a machine port, so\n  traffic to it is plain (refused once encryption is required).\n* `unreachable`: it has a key on record and its machine port did\n  not answer.\n* `refused`: its machine port presented a key it did not\n  register. A security event; nothing was sent.\n* `unknown`: not polled yet.\n',
+    )
+    detail: str | None = Field(
+        None, description="The reason in the probe client's words, for the last three."
+    )
+
+
+class SignedMachineList(BaseModel):
+    jws: str = Field(
+        ...,
+        description='A JWS compact serialization with header\n`{"alg": "EdDSA", "typ": "ep-machines+jwt"}` whose payload is a\n`MachineList`, signed with this root\'s identity key: the key\nevery node pinned at enrolment.\n',
+    )
+
+
+class MachineListNode(BaseModel):
+    name: str
+    url: str | None = Field(
+        None, description='The agent address other machines know it by (`Node.url`).'
+    )
+    machineUrl: str | None = None
+    pins: list[TlsPin]
 
 
 class NodeRole(StrEnum):
@@ -2874,7 +2916,7 @@ class JoinToken(BaseModel):
     )
     token: str = Field(
         ...,
-        description='**Shown once.** Not retrievable afterwards and not stored in\nrecoverable form — a lost token is re-minted, never looked\nup.\n',
+        description="**Shown once.** Not retrievable afterwards and not stored in\nrecoverable form — a lost token is re-minted, never looked\nup.\n\n**It carries the root's machine key (LT1)** when this root has\none: `<secret>.<pin>`, the pin a `TlsPin`. A joining machine\nenrols over TLS to the root's machine port and checks that key\nbefore it sends the token, so nobody on the network can answer\nin the root's place. The root takes the token with or without\nthe suffix.\n",
     )
     expiresAt: AwareDatetime
     nodeName: str | None = Field(
@@ -2910,7 +2952,16 @@ class NodeAddressAnnouncement(BaseModel):
     )
     signature: str = Field(
         ...,
-        description='Detached Ed25519 signature, base64, by the node\'s identity\nsigning key over the **canonical message**: the UTF-8 bytes\nof the JSON object `{"name": "<name>", "sequence":\n<sequence>, "url": "<url>"}` with keys sorted and no\nwhitespace — `json.dumps(obj, sort_keys=True,\nseparators=(",", ":"))`. `name` is the path parameter and\n`url` is the value in this body, verbatim and unnormalized.\n\nThree fields, one serializer, stated here so both sides\nimplement it from one sentence. Including `name` is what\nstops one node\'s announcement being replayed against\nanother\'s record.\n\n**Verified against the raw request body, never against a\nparsed `url`.** An OpenAPI `format: uri` becomes a URL type\nin most generators, and those normalize — Pydantic\'s\n`AnyUrl` appends a trailing slash to an authority-only URL —\nso a verifier that parses first compares different bytes\nfrom the ones the node signed, and *every* announcement\nfails with what looks like a crypto error. Found by it\nhappening. A signature is over bytes on the wire; `format:\nuri` stays here because the validation and the generated\nclients are still worth having.\n',
+        description='Detached Ed25519 signature, base64, by the node\'s identity\nsigning key over the **canonical message**: the UTF-8 bytes\nof the JSON object `{"name": "<name>", "sequence":\n<sequence>, "url": "<url>"}` with keys sorted and no\nwhitespace — `json.dumps(obj, sort_keys=True,\nseparators=(",", ":"))`. `name` is the path parameter and\n`url` is the value in this body, verbatim and unnormalized.\n\nThree fields, one serializer, stated here so both sides\nimplement it from one sentence. Including `name` is what\nstops one node\'s announcement being replayed against\nanother\'s record.\n\n**With `machineUrl` or `tlsPin` in the body (LT1), the object\nsigned holds them too**, under the same names, so the key a\nnode registers is covered by the same signature as its\naddress: `{"machineUrl": …, "name": …, "sequence": …,\n"tlsPin": …, "url": …}`, keys sorted, holding exactly the\nones the body holds. An announcement without either signs\nthe three fields above, so an older node\'s announcement\nverifies as before.\n\n**Verified against the raw request body, never against a\nparsed `url`.** An OpenAPI `format: uri` becomes a URL type\nin most generators, and those normalize — Pydantic\'s\n`AnyUrl` appends a trailing slash to an authority-only URL —\nso a verifier that parses first compares different bytes\nfrom the ones the node signed, and *every* announcement\nfails with what looks like a crypto error. Found by it\nhappening. A signature is over bytes on the wire; `format:\nuri` stays here because the validation and the generated\nclients are still worth having.\n',
+    )
+    machineUrl: AnyUrl | None = Field(
+        None,
+        description="Where other machines reach this node's machine port (LT1,\n`docs/design/tls-between-machines.md`): `https://<host>:<port>`,\n8083 unless the node's published ports are remapped. Paths under\nit reach this node's own listeners: `/agent`, `/control` (on the\nroot) and `/drivers/<name>`.\n",
+    )
+    tlsPin: str | None = Field(
+        None,
+        description="Base64url (no padding) of the SHA-256 of a machine key's\nSubjectPublicKeyInfo, the form Job Sites pin too.\n",
+        pattern='^[A-Za-z0-9_-]{43}$',
     )
 
 
@@ -4388,6 +4439,46 @@ class ConfigFieldStatus(BaseModel):
     text: str
 
 
+class LibraryFolder(BaseModel):
+    """
+    One directory the library catalogues, and where other machines
+    find it (2026-09-14).
+
+    `path` is the directory as the library's own host spells it —
+    what the scanner walks, what a `ModelSummary.path` starts with,
+    the left-hand side of every rule that reaches it. `mounts` is
+    the same directory as **other** machines see it: a POSIX-shaped
+    entry is for Linux and macOS nodes, a Windows-shaped one (drive
+    letter or UNC) for Windows nodes, and a node takes the first
+    entry of its own shape. That is the whole of "how does node X
+    reach folder Y" for every node that mounts the share where the
+    folder says; a node that mounts it elsewhere carries one
+    override in its agent's `pathMappings`, and a node with no
+    mount of its shape opens `path` as written — the identical-mount
+    convention, and every single-host install.
+
+    The rule this replaces was per node per folder, on each node's
+    agent, and grew as nodes × folders with every row typed by hand.
+    This is per folder, stated once. Nothing is copied or cached:
+    the operator mounts the share, this says where.
+
+    """
+
+    path: str = Field(
+        ...,
+        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
+    )
+    mounts: list[str] | None = Field(
+        [],
+        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
+    )
+    kind: LibraryFolderKind | None = 'folder'
+    found: bool | None = Field(
+        None,
+        description='Not in `modelRoots`: the library found it on its own machine\n(an Ollama store, CX9) and lists it while `findOllama` is on.\nAbsent or false for a folder someone added.\n',
+    )
+
+
 class DirectoryEntry(BaseModel):
     name: str
     path: str = Field(
@@ -4398,6 +4489,29 @@ class DirectoryEntry(BaseModel):
         False,
         description='A dot-prefixed name, or the hidden attribute on Windows.\nOnly present in a listing that asked for `showHidden`.\n',
     )
+
+
+class MachineList(BaseModel):
+    """
+    Every machine's TLS door and the keys it may present (LT1). A node
+    that holds it reaches another node's agent, and this root, only
+    over TLS to a key listed here.
+
+    """
+
+    iat: int = Field(
+        ...,
+        description='When it was signed. A node refuses a list older than the one it holds.',
+    )
+    required: bool = Field(
+        ...,
+        description='Encryption between machines is required (`machineEncryption`):\nno plain HTTP between machines, and drivers and control bind\nto loopback.\n',
+    )
+    controlPins: list[TlsPin] = Field(
+        ...,
+        description="The keys the machine port in front of this control root may\npresent, given to it by its own machine's agent. A node reaches\nthe root at the address it joined with, over TLS to one of\nthese.\n",
+    )
+    nodes: list[MachineListNode]
 
 
 class JoinTokenRecord(BaseModel):
@@ -4460,6 +4574,15 @@ class EnrollmentRequest(BaseModel):
     url: AnyUrl | None = Field(
         None,
         description="Where other hosts reach this agent — its `advertiseUrl`,\nconfigured or derived (`agent.yaml`, `GET /v1/node`). Becomes\n`Node.url`. The agent sends it because the agent knows which\ninterface it used to reach this root; a root deriving it from\nthe request's source address would be right on a flat mesh\nnetwork and wrong behind anything else.\n",
+    )
+    machineUrl: AnyUrl | None = Field(
+        None,
+        description="Where other machines reach this node's machine port (LT1,\n`docs/design/tls-between-machines.md`): `https://<host>:<port>`,\n8083 unless the node's published ports are remapped. Paths under\nit reach this node's own listeners: `/agent`, `/control` (on the\nroot) and `/drivers/<name>`.\n",
+    )
+    tlsPin: str | None = Field(
+        None,
+        description="Base64url (no padding) of the SHA-256 of a machine key's\nSubjectPublicKeyInfo, the form Job Sites pin too.\n",
+        pattern='^[A-Za-z0-9_-]{43}$',
     )
     agentVersion: str | None = None
     os: Os | None = None
@@ -4912,6 +5035,15 @@ class Node(BaseModel):
         None,
         description="Where this node's agent is reachable — from this root, and from\na gateway sending a lifecycle action to the agent that owns a\nruntime. Recorded verbatim from `EnrollmentRequest.url`; the\nagent is the one that knows how it reached this root, and this\nroot does not guess from a source address.\n",
     )
+    machineUrl: AnyUrl | None = Field(
+        None,
+        description="This node's machine port (LT1): the one TLS door other\nmachines reach it through, `https://<host>:8083`. From its\nsigned announcement or its enrolment. `null` on a node that\nruns a version without one.\n",
+    )
+    tlsPins: list[TlsPin] | None = Field(
+        None,
+        description="The keys this node's machine port may present, registered\nunder its signature. Every other machine refuses a connection\nthat presents any other. Empty on a node without a machine\nport.\n",
+    )
+    machineTls: MachineLink | None = None
     role: NodeRole
     reachable: bool = Field(
         ...,

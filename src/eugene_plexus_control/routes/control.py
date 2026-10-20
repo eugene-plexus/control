@@ -17,13 +17,14 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 
-from .. import root_tls, security, tokens, trust
+from .. import machine_list, root_tls, security, tokens, trust
 from .._generated.models import (
     ControlStatus,
     LogPage,
     NodeRole,
     PromoteRequest,
     Reason,
+    SignedMachineList,
     SignedRootTls,
     SignedTrustBundle,
     Snapshot,
@@ -352,6 +353,55 @@ async def rotate_signing_key(request: Request) -> TrustChange:
     )
 
 
+def _members_only_off_the_network(request: Request, what: str) -> None:
+    """A bearer, when sent, must be a member's own `sub: agent` token; and
+    through the public node route one is required (J3)."""
+    authorization = request.headers.get("authorization")
+    if authorization or via_public_sites(request):
+        scheme, _, bearer = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not bearer.strip():
+            raise problem(
+                status.HTTP_401_UNAUTHORIZED,
+                "Node token required",
+                f"Through the public node route {what} is given only to a member "
+                "machine presenting its own token.",
+            )
+        claims = verify_with_view(request, bearer.strip(), classes=(tokens.TYP_SERVICE,))
+        if claims.sub != tokens.SUB_AGENT or claims.issuer_node is None:
+            raise problem(
+                status.HTTP_401_UNAUTHORIZED,
+                "Node token required",
+                f"Only a member machine's own agent token opens {what} here.",
+            )
+
+
+@router.get("/v1/trust/machines", response_model=SignedMachineList)
+async def get_machine_list(request: Request) -> SignedMachineList:
+    """Every machine's TLS door and key, signed by this root's identity (LT1).
+
+    The same rules as the bundle, for the same reasons: public on this
+    network, a member's token through the public node route, and the last
+    list signed while this root is sealed.
+    """
+    _members_only_off_the_network(request, "the machine list")
+    from ..routes.nodes import machine_pins
+
+    machine: StateMachine = request.app.state.machine
+    auth: AuthState = request.app.state.auth_state
+    publisher: machine_list.MachineListPublisher = request.app.state.machine_list
+    jws = publisher.current(
+        machine.state, machine_pins(request.app.state.settings), auth.control_private_key
+    )
+    if jws is None:
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "No machine list yet",
+            "This root has never signed a machine list: it is not initialized, or it has not "
+            "been unlocked since it was.",
+        )
+    return SignedMachineList(jws=jws)
+
+
 @router.get("/v1/trust/bundle", response_model=SignedTrustBundle)
 async def get_trust_bundle(request: Request) -> SignedTrustBundle:
     """The signed bundle every node pulls. **Public**: the signature is the credential.
@@ -366,23 +416,7 @@ async def get_trust_bundle(request: Request) -> SignedTrustBundle:
     Checked against the keys applied state names, which needs no private
     key, so a sealed root still answers its members.
     """
-    authorization = request.headers.get("authorization")
-    if authorization or via_public_sites(request):
-        scheme, _, bearer = (authorization or "").partition(" ")
-        if scheme.lower() != "bearer" or not bearer.strip():
-            raise problem(
-                status.HTTP_401_UNAUTHORIZED,
-                "Node token required",
-                "Through the public node route the trust bundle is given only to a member "
-                "machine presenting its own token.",
-            )
-        claims = verify_with_view(request, bearer.strip(), classes=(tokens.TYP_SERVICE,))
-        if claims.sub != tokens.SUB_AGENT or claims.issuer_node is None:
-            raise problem(
-                status.HTTP_401_UNAUTHORIZED,
-                "Node token required",
-                "Only a member machine's own agent token opens the trust bundle here.",
-            )
+    _members_only_off_the_network(request, "the trust bundle")
     publisher: trust.TrustPublisher = request.app.state.trust
     if publisher.current is None:
         raise problem(

@@ -20,12 +20,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, status
 
-from .. import capabilities, node_address, oidc, sealing, security, tokens, trust
+from .. import capabilities, machine_list, node_address, oidc, sealing, security, tokens, trust
 from .._generated.models import (
     Enrollment,
     EnrollmentRequest,
@@ -237,7 +238,22 @@ async def announce_node_address(
             "Malformed announcement",
             "`url` must be present in the request body as a string.",
         )
-    message = sealing.address_message(name=name, sequence=int(body.sequence), url=announced_url)
+    # LT1: the machine port and its key, read raw for the same reason as
+    # `url`, and signed with it whenever the body holds them.
+    machine_fields = {
+        key: raw[key]
+        for key in ("machineUrl", "tlsPin")
+        if isinstance(raw, dict) and raw.get(key) is not None
+    }
+    if any(not isinstance(value, str) for value in machine_fields.values()):
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Malformed announcement",
+            "`machineUrl` and `tlsPin` must be strings when present.",
+        )
+    message = sealing.address_message(
+        name=name, sequence=int(body.sequence), url=announced_url, machine=machine_fields
+    )
     if not sealing.verify_address(record.signingPublicKey, message, body.signature):
         log.warning("refused an address announcement for %s: signature did not verify", name)
         raise problem(
@@ -262,7 +278,10 @@ async def announce_node_address(
         )
 
     normalized = normalize_url(announced_url)
-    if normalized == record.url:
+    machine_url, pins = _checked_machine(
+        name, normalized, machine_fields.get("machineUrl"), machine_fields.get("tlsPin")
+    )
+    if normalized == record.url and (machine_url, pins) == (record.machineUrl, record.tlsPins):
         # Nothing to record. Note that the sequence is deliberately NOT
         # advanced here: it lives in applied state, and advancing it
         # would need a log entry, which is exactly what this branch
@@ -311,17 +330,27 @@ async def announce_node_address(
     try:
         machine.append(
             OP_UPDATE_NODE,
-            {"name": name, "url": normalized, "sequence": int(body.sequence)},
+            {
+                "name": name,
+                "url": normalized,
+                "sequence": int(body.sequence),
+                # Both, always: an announcement is the node's whole statement
+                # of its doors, so one without a key clears the key on record
+                # (a node rolled back to an older version).
+                "machineUrl": machine_url,
+                "tlsPins": list(pins),
+            },
         )
     except NotActive as exc:
         raise _not_active(machine) from exc
 
     log.info(
-        "node %s re-advertised: %s -> %s (sequence %d)",
+        "node %s re-advertised: %s -> %s (sequence %d)%s",
         name,
         record.url,
         normalized,
         int(body.sequence),
+        f", machine port {machine_url} with key {pins[0]}" if machine_url and pins else "",
     )
     updated = machine.state.nodes[name]
     return NodeAddressAck(
@@ -330,6 +359,56 @@ async def announce_node_address(
         sequence=updated.advertiseSequence,
         changed=True,
     )
+
+
+TLS_PIN = re.compile(r"^[A-Za-z0-9_-]{43}$")
+
+
+def machine_pins(settings: Any) -> list[str]:
+    """This root's machine-port keys, as its agent handed them over (LT1)."""
+    raw = getattr(settings, "machine_pins", None) or ""
+    return [p for p in (s.strip() for s in raw.split(",")) if TLS_PIN.match(p)]
+
+
+def _checked_machine(
+    name: str, agent_url: str | None, machine_url: Any, pin: Any
+) -> tuple[str | None, tuple[str, ...]]:
+    """A node's machine port and key as recorded, or a 400 (LT1).
+
+    Both or neither: a key with no door, or a door with no key, is nothing
+    a caller can use. The door is held to the rules a node's address is
+    (`node_address`), it is `https`, and it is no more public than the
+    node's own address: the rule that stops a node moving itself onto the
+    open internet holds for its machine port too.
+    """
+    if machine_url is None and pin is None:
+        return None, ()
+    if not isinstance(machine_url, str) or not isinstance(pin, str):
+        sent = "a key with no machine URL" if pin else "a machine URL with no key"
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Machine port incomplete",
+            f"Node {name!r} sent {sent}; both are needed.",
+        )
+    if not TLS_PIN.match(pin):
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Malformed machine key",
+            "`tlsPin` must be the base64url SHA-256 of the key's SubjectPublicKeyInfo.",
+        )
+    normalized = normalize_url(machine_url).rstrip("/")
+    reason = node_address.rejection(normalized)
+    if reason is None and not normalized.startswith("https://"):
+        reason = "a machine port is reached over https and nothing else"
+    if reason is None and node_address.goes_public(agent_url, normalized):
+        reason = "it is on the open internet and the node's own address is not"
+    if reason is not None:
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Machine port cannot be a node's",
+            f"{machine_url} cannot be node {name!r}'s machine port: {reason}.",
+        )
+    return normalized, (pin,)
 
 
 @router.delete(
@@ -491,6 +570,8 @@ async def mint_join_token(request: Request, body: JoinTokenRequest | None = None
     grants = tuple(sorted({str(getattr(g, "value", g)) for g in requested}))
 
     minted = store.mint(ttl_seconds=ttl, node_name=node_name, grants=grants)
+    # LT1: the machine key a joining machine checks before it sends this.
+    pins = machine_pins(request.app.state.settings)
     log.info(
         "minted a join token%s%s, valid for %ds",
         f" bound to node {node_name!r}" if node_name else "",
@@ -499,7 +580,7 @@ async def mint_join_token(request: Request, body: JoinTokenRequest | None = None
     )
     return JoinToken(
         id=minted.id,
-        token=minted.token,
+        token=f"{minted.token}.{pins[0]}" if pins else minted.token,
         expiresAt=datetime.fromtimestamp(minted.expires_at, tz=UTC),
         nodeName=minted.node_name,
         grants=[Grant(g) for g in minted.grants] or None,
@@ -622,6 +703,9 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         )
     # Also before the token is spent, for the same reason.
     label = _checked_label(machine, body.name, body.label) if body.label is not None else None
+    machine_url, pins = _checked_machine(
+        body.name, announced_url, str(body.machineUrl) if body.machineUrl else None, body.tlsPin
+    )
 
     try:
         grants = store.consume(body.token, node_name=body.name)
@@ -644,6 +728,8 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         "tokenPublicKey": body.tokenPublicKey,
         "grants": sorted({"node", *grants}),
         "url": announced_url,
+        "machineUrl": machine_url,
+        "tlsPins": list(pins),
         "agentVersion": body.agentVersion,
         "os": body.os.value if body.os else None,
         "arch": body.arch.value if body.arch else None,
@@ -786,6 +872,9 @@ def _to_node(record: NodeRecord, probe: Any | None) -> Node:
             "arch": record.arch,
             "devices": [dict(d) for d in record.devices],
             "enrolledAt": record.enrolledAt,
+            "machineUrl": record.machineUrl,
+            "tlsPins": list(record.tlsPins),
+            "machineTls": machine_list.link(record, probe),
             "lastSeenAt": probe.last_seen_at if probe is not None else None,
             # The probe client has always had the reason; until 2026-09-15
             # this view dropped it, and `reachable: false` sent an operator
