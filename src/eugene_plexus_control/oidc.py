@@ -257,6 +257,22 @@ def redirect_allowed(client: dict[str, Any], uri: str, issuer: str | None = None
     return uri in client["redirectUris"]
 
 
+def group_claims(state: Any, sub: str) -> dict[str, Any]:
+    """`eugene_groups` and `eugene_policies` (row 70), from the root's state
+    now: the person's groups as `{id, name}`, and the policies in effect
+    (`PoliciesInEffect`). Eugene's owner is in no group. Only for a
+    registered app, which the person may use (`still_valid`, `may_use`)."""
+    from .permissions import effective_policies, groups_in_effect
+
+    person = state.people.get(sub)
+    if person is None:
+        return {"eugene_groups": [], "eugene_policies": {}}
+    return {
+        "eugene_groups": groups_in_effect(state, person),
+        "eugene_policies": effective_policies(state, person),
+    }
+
+
 def may_use(state: Any, person: dict[str, Any], client_id: str) -> bool:
     from .permissions import apps_in_effect
 
@@ -446,6 +462,10 @@ def token_response(
     }
     if nonce is not None:
         id_claims["nonce"] = nonce
+    if client_id in machine.state.oidc_clients:
+        # Worked out at each sign-in and refresh, so a change reaches the
+        # app within one ID token's life. Never for a built-in client.
+        id_claims.update(group_claims(machine.state, subject.sub))
     access = {
         **base,
         "exp": issued + ACCESS_TOKEN_TTL_SECONDS,

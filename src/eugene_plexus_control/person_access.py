@@ -43,3 +43,16 @@ def check(state: Any, key_id: str, token: str | None) -> dict[str, str]:
     if subject is None:
         raise AdmissionRefusal(403, "This person's sign-in or access to the app has ended.")
     return {"personId": subject.sub, "appClientId": client_id}
+
+
+def queue_band(state: Any, identity: dict[str, str]) -> dict[str, str]:
+    """The verified person's queue band from their groups (row 70), or
+    nothing: no person, or no group of theirs sets one. Read from the
+    root's state at each check, never from the caller. Kept out of the
+    reservation's policy digest: a band change is not a permission change,
+    so it never ends a lease."""
+    from .permissions import effective_policies
+
+    person = state.people.get(identity.get("personId") or "")
+    band = effective_policies(state, person).get("queueBand") if person else None
+    return {"queueBand": band} if band else {}

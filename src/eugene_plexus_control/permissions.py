@@ -84,3 +84,64 @@ def apps_in_effect(state: Any, person: dict[str, Any]) -> list[str] | None:
     if any(g["apps"] is None for g in groups):
         return None
     return sorted({a for g in groups for a in g["apps"]})
+
+
+# --------------------------------------------------------------------------- #
+# group policies (row 70)
+# --------------------------------------------------------------------------- #
+
+#: Queue bands, lowest first: the most generous is the last.
+QUEUE_BANDS: tuple[str, ...] = ("sheddable", "background", "interactive")
+SUMMARY_PERCENT_MIN = 50
+SUMMARY_PERCENT_MAX = 95
+#: The policies a group may set (`GroupPolicies`).
+GROUP_POLICIES: tuple[str, ...] = ("queueBand", "summaryContextPercent")
+#: At most this many groups in the `eugene_groups` claim (`Person.groups`'s own bound).
+MAX_CLAIM_GROUPS = 64
+
+
+def _by_name(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(groups, key=lambda g: (g["name"].casefold(), g["id"]))
+
+
+def _generosity(policy: str, value: Any) -> int:
+    return QUEUE_BANDS.index(value) if policy == "queueBand" else int(value)
+
+
+def effective_policies(state: Any, person: dict[str, Any]) -> dict[str, Any]:
+    """The group policies that apply to `person` now, as `PoliciesInEffect`.
+
+    The most generous value of each policy across the groups they are in:
+    the highest queue band, the larger summary percent. `setBy` names every
+    group that sets the value in effect, sorted by group name. A policy no
+    group sets is absent: the reader's default applies. Individual access
+    (`groups` null) takes no group's policy; a group id the state no longer
+    has is skipped. This is the one place the combination rule lives: the
+    console, the sign-in claims and the admission check all read it.
+    """
+    groups = _by_name(_groups(state, person))
+    found: dict[str, Any] = {}
+    set_by: dict[str, list[str]] = {}
+    for policy in GROUP_POLICIES:
+        values = [
+            (g["id"], value)
+            for g in groups
+            if (value := (g.get("policies") or {}).get(policy)) is not None
+        ]
+        if not values:
+            continue
+        best = max(_generosity(policy, value) for _, value in values)
+        winners = [(gid, value) for gid, value in values if _generosity(policy, value) == best]
+        found[policy] = winners[0][1]
+        set_by[policy] = [gid for gid, _ in winners]
+    if set_by:
+        found["setBy"] = set_by
+    return found
+
+
+def groups_in_effect(state: Any, person: dict[str, Any]) -> list[dict[str, str]]:
+    """The groups `person` is in, as `{id, name}` sorted by name, for the
+    `eugene_groups` claim. Group names are not secret to their members."""
+    return [{"id": g["id"], "name": g["name"]} for g in _by_name(_groups(state, person))][
+        :MAX_CLAIM_GROUPS
+    ]

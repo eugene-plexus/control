@@ -1065,8 +1065,12 @@ def _string_list(raw: Any, label: str, *, limit: int, item_limit: int | None = N
 
 def _permission_group_record(raw: Any) -> dict[str, Any]:
     required = {"id", "name", "description", "apps", "permissions", "createdAt", "updatedAt"}
-    if not isinstance(raw, dict) or set(raw) != required:
+    # `policies` (row 70) is optional: a group written before it, or one
+    # that sets none, has no such key and loads as "no policy".
+    if not isinstance(raw, dict) or not required <= set(raw) <= required | {"policies"}:
         raise ApplyError("invalid permission group properties")
+    if "policies" in raw:
+        _check_group_policies(raw["policies"])
     for key, limit in (("id", 64), ("name", 80), ("description", 500)):
         value = raw[key]
         if (
@@ -1085,6 +1089,26 @@ def _permission_group_record(raw: Any) -> dict[str, Any]:
     _timestamp(raw, "createdAt", "permission group")
     _timestamp(raw, "updatedAt", "permission group")
     return dict(raw)
+
+
+def _check_group_policies(raw: Any) -> None:
+    """`GroupPolicies` as the log keeps it: only the policies set, never
+    null, never empty, and nothing else, so one form has one byte string."""
+    from .permissions import (
+        GROUP_POLICIES,
+        QUEUE_BANDS,
+        SUMMARY_PERCENT_MAX,
+        SUMMARY_PERCENT_MIN,
+    )
+
+    if not isinstance(raw, dict) or not raw or raw.keys() - set(GROUP_POLICIES):
+        raise ApplyError("invalid permission group policies")
+    if "queueBand" in raw and raw["queueBand"] not in QUEUE_BANDS:
+        raise ApplyError("invalid permission group policy queueBand")
+    if "summaryContextPercent" in raw:
+        percent = raw["summaryContextPercent"]
+        if type(percent) is not int or not SUMMARY_PERCENT_MIN <= percent <= SUMMARY_PERCENT_MAX:
+            raise ApplyError("invalid permission group policy summaryContextPercent")
 
 
 def _check_group_memberships(groups: dict[str, dict[str, Any]], person: dict[str, Any]) -> None:
