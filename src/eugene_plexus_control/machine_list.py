@@ -252,14 +252,21 @@ def key_change(
             version = None if door is None else max(version, door)
     waiting: list[str] = []
     unreachable: list[str] = []
+    not_ready: list[str] = []
+    capable = publisher.list_capable
     for other in sorted(nodes.values(), key=lambda r: r.name):
         if other.name == record.name or not other.tlsPins:
             continue
         probe = probes.get(other.name)
+        held = getattr(probe, "list_version", None)
+        if held is None and other.name not in capable:
+            # Review blocker 2: an agent older than row 3 cannot take the
+            # root's new key by itself if it misses the change. Named even
+            # while it is off; the root's own change waits for it.
+            not_ready.append(other.name)
         if probe is not None and not probe.reachable:
             unreachable.append(other.name)
             continue
-        held = getattr(probe, "list_version", None)
         if version is None or held is None or held < version:
             waiting.append(other.name)
     return {
@@ -267,6 +274,7 @@ def key_change(
         "listVersion": version,
         "waitingOn": waiting,
         "unreachable": unreachable,
+        "notReady": not_ready,
     }
 
 
@@ -284,6 +292,11 @@ class MachineListPublisher:
         self._content: dict[str, Any] | None = None
         self._version = 0
         self._first_signed: dict[str, int] = {}
+        #: Nodes this root has seen report a machine list version (row 3):
+        #: their agents take the root's new key by themselves after missing
+        #: a change. Kept in this root's file, so a node that is off when
+        #: this root restarts still counts.
+        self.list_capable: set[str] = set()
         try:
             kept = json.loads(self._path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -291,6 +304,9 @@ class MachineListPublisher:
         except (OSError, ValueError) as exc:
             log.warning("the kept machine list at %s is unreadable: %s", self._path, exc)
             return
+        capable = kept.get("listCapable") if isinstance(kept, dict) else None
+        if isinstance(capable, list):
+            self.list_capable = {str(n) for n in capable if isinstance(n, str)}
         if isinstance(kept, dict) and isinstance(kept.get("jws"), str):
             self.jws = kept["jws"]
             self._content = kept.get("content") if isinstance(kept.get("content"), dict) else None
@@ -300,6 +316,14 @@ class MachineListPublisher:
                 self._first_signed = {
                     str(k): int(v) for k, v in first.items() if isinstance(v, int)
                 }
+
+    def note_list_capable(self, names: set[str]) -> None:
+        """Remember nodes seen reporting a list version; written when it grows."""
+        with self._lock:
+            if names <= self.list_capable:
+                return
+            self.list_capable |= names
+            self._save()
 
     def first_signed(self, name: str, pins: tuple[str, ...]) -> int | None:
         """The version that first named `pins` for `name` (a node, or
@@ -348,19 +372,25 @@ class MachineListPublisher:
                 for key, pins in after.items()
             }
             self._content = wanted
-            try:
-                self._path.parent.mkdir(parents=True, exist_ok=True)
-                self._path.write_text(
-                    json.dumps(
-                        {
-                            "jws": self.jws,
-                            "content": wanted,
-                            "version": self._version,
-                            "firstSigned": self._first_signed,
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                log.warning("could not keep the machine list at %s: %s", self._path, exc)
+            self._save()
             return self.jws
+
+    def _save(self) -> None:
+        """The list and what is known about it, kept beside the log. Called
+        with the lock held."""
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(
+                json.dumps(
+                    {
+                        "jws": self.jws,
+                        "content": self._content,
+                        "version": self._version,
+                        "firstSigned": self._first_signed,
+                        "listCapable": sorted(self.list_capable),
+                    }
+                ),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            log.warning("could not keep the machine list at %s: %s", self._path, exc)

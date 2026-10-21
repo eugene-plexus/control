@@ -2833,6 +2833,10 @@ class NodeMachineKeyChange(BaseModel):
         ...,
         description='Machines this root could not reach on its last poll. The node\ndoes not wait for them: each fetches the list when it is back.\n',
     )
+    notReady: list[str] | None = Field(
+        None,
+        description="Machines with a machine key that this root has never seen\nreport a machine list version: they run an agent older than\nrow 3, which cannot take the root's new key by itself if it\nmisses the change. A change of the key of the machine that\nruns this root does not switch while any is listed (update\nthem, or remove a machine that is gone). Another machine's\nchange is not held up by them.\n",
+    )
 
 
 class State(StrEnum):

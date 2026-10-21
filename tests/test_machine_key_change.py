@@ -190,6 +190,56 @@ def test_the_root_says_which_machines_hold_an_older_list(active_client: TestClie
     assert change["listVersion"] == version
 
 
+def test_machines_never_seen_with_a_list_version_are_not_ready(
+    tmp_path: Path, active_client: TestClient
+) -> None:
+    """Review blocker 2: an agent older than row 3 that is off for the whole
+    change of the root's key never takes the new key. The root names every
+    machine it has never seen report a list version, and remembers the ones
+    it has across a restart (its own file), even while they are off."""
+    from eugene_plexus_control.app import _note_list_capable
+
+    app = active_client.app
+    keys, _ = enroll(active_client, "gpu-box", url=URL)
+    for name, url in (("nas", "http://100.64.0.8:8079"), ("old", "http://100.64.0.9:8079")):
+        other, _ = enroll(active_client, name, url=url)
+        host = url.split("//")[1].split(":")[0]
+        fields = {"machineUrl": f"https://{host}:8083", "tlsPin": _pin(name.encode())}
+        message = sealing.address_message(name=name, sequence=1, url=url, machine=fields)
+        body = {
+            "url": url,
+            "sequence": 1,
+            "signature": sealing.sign_address(other.signing_private, message),
+            **fields,
+        }
+        assert active_client.patch(f"/v1/nodes/{name}", json=body).status_code == 200
+    both = {"machineUrl": DOOR, "tlsPin": PIN_A, "tlsNextPin": PIN_B}
+    response = active_client.patch(
+        "/v1/nodes/gpu-box", json=_body("gpu-box", keys.signing_private, 1, both)
+    )
+    assert response.status_code == 200, response.text
+    change = active_client.get("/v1/nodes/gpu-box").json()["machineKeyChange"]
+    assert sorted(change["notReady"]) == ["nas", "old"]
+
+    # The NAS reports a list version once: it is ready, and stays so while
+    # it is off; the old agent never reports one.
+    probes = {
+        "nas": NodeProbe(name="nas", reachable=True, list_version=3),
+        "old": NodeProbe(name="old", reachable=True),
+    }
+    _note_list_capable(app, probes)  # what the poller does after each round
+    app.state.node_probes = {  # type: ignore[attr-defined]
+        "nas": NodeProbe(name="nas", reachable=False, error="timed out"),
+        "old": NodeProbe(name="old", reachable=False, error="timed out"),
+    }
+    change = active_client.get("/v1/nodes/gpu-box").json()["machineKeyChange"]
+    assert change["notReady"] == ["old"]
+    assert sorted(change["unreachable"]) == ["nas", "old"]
+    # Kept across a restart of this root.
+    again = machine_list.MachineListPublisher(app.state.settings.state_dir)  # type: ignore[attr-defined]
+    assert again.list_capable == {"nas"}
+
+
 def test_the_probe_reads_the_list_version_a_node_holds() -> None:
     import asyncio
 
