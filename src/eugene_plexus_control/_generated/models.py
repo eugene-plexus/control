@@ -3478,6 +3478,29 @@ class OAuthError(BaseModel):
     error_description: str | None = None
 
 
+class OidcSubject(RootModel[str]):
+    root: str = Field(
+        ...,
+        description="A person's `sub`, as their ID token carries it.",
+        max_length=200,
+        min_length=1,
+    )
+
+
+class OidcSubjectsResponse(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    known: list[str] = Field(
+        ...,
+        description="Ids Eugene has a person record for (on or off), or the owner's.",
+    )
+    unknown: list[str] = Field(
+        ...,
+        description="Ids Eugene has no person for. Each one was deleted, or never was Eugene's.",
+    )
+
+
 class PromoteRequest(BaseModel):
     passphrase: SecretStr = Field(
         ...,
@@ -4863,6 +4886,13 @@ class PersonList(BaseModel):
         None,
         description='The name the owner signs in with, once the install has people.',
     )
+
+
+class OidcSubjectsRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subjects: list[OidcSubject] = Field(..., max_length=500, min_length=1)
 
 
 class ComponentPlacementList(BaseModel):

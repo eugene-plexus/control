@@ -731,3 +731,54 @@ async def revoke(request: Request) -> Response:
             actor=claims["sub"],
         )
     return Response(status_code=200, headers=_NO_STORE)
+
+
+#: The most ids one `/oidc/subjects` call may carry; an app asks in batches.
+MAX_SUBJECTS = 500
+
+
+@router.post("/oidc/subjects", operation_id="oidcSubjects")
+async def subjects(request: Request) -> JSONResponse:
+    """Which of the ids an app sends Eugene still has a person for (row 7).
+
+    An app deletes a person's data on `unknown`, so nothing is said while the root
+    cannot vouch for its own list: locked (it has not been unlocked since it started)
+    or a standby (it may be behind the active root). A person turned off is `known`;
+    so is the owner. Only the ids sent are answered, so nobody can list people."""
+    client = _client_auth(request)
+    if client is None:
+        return _oauth_error(401, "invalid_client", "Client authentication failed.")
+    machine = request.app.state.machine
+    if not machine.is_active:
+        return _oauth_error(
+            503,
+            "temporarily_unavailable",
+            "This control root is a standby; ask the active one.",
+        )
+    if request.app.state.auth_state.master_key is None:
+        return _oauth_error(
+            503,
+            "temporarily_unavailable",
+            "Eugene is locked. Sign in to the console once with the passphrase to unlock it.",
+        )
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    asked = body.get("subjects") if isinstance(body, dict) else None
+    if (
+        not isinstance(asked, list)
+        or not 1 <= len(asked) <= MAX_SUBJECTS
+        or not all(isinstance(s, str) and 1 <= len(s) <= 200 for s in asked)
+    ):
+        return _oauth_error(
+            400,
+            "invalid_request",
+            f"Send subjects: a list of 1 to {MAX_SUBJECTS} ids, each a string.",
+        )
+    people = machine.state.people
+    known: list[str] = []
+    unknown: list[str] = []
+    for sub in dict.fromkeys(asked):
+        (known if sub == OPERATOR_NAME or sub in people else unknown).append(sub)
+    return JSONResponse({"known": known, "unknown": unknown}, headers=_NO_STORE)
