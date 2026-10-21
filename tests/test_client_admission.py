@@ -289,3 +289,43 @@ def test_a_key_that_may_send_logs_says_so_to_the_ingress(active_client):
     assert answer.json()["limits"].get("writeLogs") is not True
     with pytest.raises(ValueError):
         admission.validate_limits({"writeLogs": 1})
+
+
+def search_call(client, key, action, request_id="s1", **extra):
+    return client.post(
+        "/v1/auth/client-keys/admission",
+        json={
+            "keyId": key,
+            "action": action,
+            "requestId": request_id,
+            "purpose": "search",
+            **extra,
+        },
+    )
+
+
+def test_a_search_is_admitted_with_no_model_under_the_keys_limits(active_client):
+    """Row 34: Open WebUI's web search has no model, and still counts."""
+    c = active_client
+    key = mint(c, maxConcurrentRequests=1, requestsPerMinute=2, allowedModels=["chat"])["key"]["id"]
+    # The model list does not apply to a search; the concurrency limit does.
+    assert search_call(c, key, "acquire", "s1").json()["leaseSeconds"] > 0
+    assert search_call(c, key, "renew", "s1").status_code == 200
+    busy = search_call(c, key, "acquire", "s2")
+    assert busy.status_code == 429
+    assert int(busy.headers["Retry-After"]) > 0
+    assert search_call(c, key, "release", "s1").status_code == 200
+    assert search_call(c, key, "acquire", "s2").status_code == 200
+    assert search_call(c, key, "release", "s2").status_code == 200
+    # Two searches used the rolling-minute allowance.
+    assert search_call(c, key, "acquire", "s3").status_code == 429
+
+
+def test_a_search_names_no_model_and_an_inference_still_does(active_client):
+    c = active_client
+    key = mint(c)["key"]["id"]
+    assert search_call(c, key, "acquire", model="chat").status_code == 422
+    assert call(c, key, "acquire", "i1", model=None).status_code == 422
+    assert search_call(c, key, "acquire", "s1").status_code == 200
+    # One request identifier is one kind of work.
+    assert call(c, key, "acquire", "s1").status_code == 409

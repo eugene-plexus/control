@@ -178,6 +178,7 @@ class StateMachine:
         model: str | None,
         person_token: str | None = None,
         app_metadata_only: bool = False,
+        purpose: str = "inference",
     ) -> dict[str, Any]:
         """Read, decide and commit under one lock, including policy edits."""
         from .applied import OP_PUT_CLIENT_ADMISSION
@@ -208,6 +209,7 @@ class StateMachine:
                 model=model,
                 now=clock.now(ledger["clock"]),
                 principal=identity,
+                purpose=purpose,
             )
             if candidate is not None:
                 self.append(
