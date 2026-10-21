@@ -153,7 +153,9 @@ def test_a_node_service_token_can_read_but_not_mutate(active_client: TestClient)
         assert active_client.post("/v1/nodes/join-token", headers=headers).status_code == 401
         assert active_client.post("/v1/control/rotate-key", headers=headers).status_code == 401
         assert (
-            active_client.patch("/v1/config", json={"uiTheme": "dark"}, headers=headers).status_code
+            active_client.patch(
+                "/v1/config", json={"joinTokenTtlSeconds": 60}, headers=headers
+            ).status_code
             == 401
         )
 

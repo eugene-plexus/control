@@ -67,7 +67,7 @@ def _initialize_and_patch(directory: Path) -> None:
         token = login(client)
         patched = client.patch(
             "/v1/config",
-            json={"uiTheme": "dark"},
+            json={"joinTokenTtlSeconds": 600},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert patched.status_code == 200, patched.text
@@ -119,7 +119,8 @@ def test_every_secret_bearing_file_is_created_asking_for_0600(
         flags for path, flags, _ in open_spy.calls if Path(path).name.startswith(".control.yaml.")
     ]
     assert all(flags & os.O_EXCL for flags in cache_flags)
-    assert (directory / "control.yaml").read_text(encoding="utf-8").count("uiTheme: dark") == 1
+    cached = (directory / "control.yaml").read_text(encoding="utf-8")
+    assert cached.count("joinTokenTtlSeconds: 600") == 1
 
 
 @posix_only
@@ -176,6 +177,6 @@ def test_the_config_cache_stays_best_effort(
         raise OSError("disk said no")
 
     monkeypatch.setattr(os, "replace", refuse)
-    cache.write_through({"uiTheme": "dark"})
+    cache.write_through({"joinTokenTtlSeconds": 600})
 
     assert list(tmp_path.iterdir()) == []

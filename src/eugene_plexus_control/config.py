@@ -51,7 +51,6 @@ CATEGORY_LABELS: dict[str, str] = {
     "security": "Security",
     "replication": "Replication",
     "topology": "Topology",
-    "ui": "Appearance",
     "logging": "Logging",
 }
 
@@ -149,26 +148,6 @@ FIELDS: list[ConfigField] = [
         default=900,
         minimum=30,
         maximum=86400,
-    ),
-    ConfigField(
-        key="uiTheme",
-        label="Theme",
-        description="Color theme for the Eugene Plexus UI.",
-        category="ui",
-        valueType=ConfigValueType.enum,
-        default="auto",
-        enumValues=["light", "dark", "auto"],
-        enumLabels=["Light", "Dark", "Auto (follow system)"],
-    ),
-    ConfigField(
-        key="uiFontSize",
-        label="Font size",
-        description="Base font size for the Eugene Plexus UI.",
-        category="ui",
-        valueType=ConfigValueType.enum,
-        default="medium",
-        enumValues=["small", "medium", "large"],
-        enumLabels=["Small", "Medium", "Large"],
     ),
     ConfigField(
         key="logLevel",
@@ -384,6 +363,8 @@ RETIRED: dict[str, str] = {
         "retired: the standby is the machine made one on Machines "
         "(PUT /v1/nodes/{name}/standby), not a typed list"
     ),
+    "uiTheme": "retired: nothing read it; the console's look is set in the console",
+    "uiFontSize": "retired: nothing read it; the console's look is set in the console",
 }
 
 

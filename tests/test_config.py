@@ -54,25 +54,25 @@ def test_a_patch_becomes_a_log_entry(active_client: TestClient) -> None:
     machine = active_client.app.state.machine  # type: ignore[attr-defined]
     before = machine.state.index
 
-    response = active_client.patch("/v1/config", json={"uiTheme": "dark"})
+    response = active_client.patch("/v1/config", json={"joinTokenTtlSeconds": 600})
     assert response.status_code == 200
-    assert response.json()["applied"] == ["uiTheme"]
+    assert response.json()["applied"] == ["joinTokenTtlSeconds"]
 
     assert machine.state.index == before + 1
     entries = machine.read_page(before, 10)
     assert entries[-1]["op"] == "patchConfig"
-    assert entries[-1]["payload"]["values"] == {"uiTheme": "dark"}
+    assert entries[-1]["payload"]["values"] == {"joinTokenTtlSeconds": 600}
 
 
 def test_rejected_keys_do_not_discard_the_accepted_ones(active_client: TestClient) -> None:
     """Telling the operator which field was wrong beats refusing all
     five because one was."""
     response = active_client.patch(
-        "/v1/config", json={"uiTheme": "dark", "nodePollIntervalSeconds": 99999}
+        "/v1/config", json={"joinTokenTtlSeconds": 600, "nodePollIntervalSeconds": 99999}
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["applied"] == ["uiTheme"]
+    assert body["applied"] == ["joinTokenTtlSeconds"]
     assert [r["key"] for r in body["rejected"]] == ["nodePollIntervalSeconds"]
     assert "<= 600" in body["rejected"][0]["message"]
 
@@ -83,10 +83,37 @@ def test_a_rejected_value_never_reaches_the_log(active_client: TestClient) -> No
     end up with different config from the same log."""
     machine = active_client.app.state.machine  # type: ignore[attr-defined]
     before = machine.state.index
-    response = active_client.patch("/v1/config", json={"uiTheme": "chartreuse"})
+    response = active_client.patch("/v1/config", json={"logLevel": "chartreuse"})
     assert response.status_code == 200
     assert response.json()["applied"] == []
     assert machine.state.index == before, "nothing valid was patched, so nothing was logged"
+
+
+def test_ui_theme_is_retired(active_client: TestClient) -> None:
+    """Nothing read `uiTheme` or `uiFontSize` (the console keeps its look in the
+    browser), so a setting that offered them showed a choice with no effect. Gone
+    from the schema and the document; a PATCH is refused as retired, not as
+    unknown, and logs nothing; an old log entry that holds one still replays and
+    is not shown."""
+    schema = active_client.get("/v1/config/schema").json()
+    assert not {"uiTheme", "uiFontSize"} & {f["key"] for f in schema["fields"]}
+    assert "ui" not in schema["categories"], "no field is left in Appearance"
+
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    before = machine.state.index
+    for key, value in (("uiTheme", "dark"), ("uiFontSize", "large")):
+        body = active_client.patch("/v1/config", json={key: value}).json()
+        assert body["applied"] == []
+        [refused] = body["rejected"]
+        assert refused["key"] == key
+        assert "retired" in refused["message"], refused
+        assert "unknown" not in refused["message"]
+    assert machine.state.index == before, "a refused key is not logged"
+
+    machine.append(OP_PATCH_CONFIG, {"values": {"uiTheme": "dark", "uiFontSize": "large"}})
+    assert machine.state.config["uiTheme"] == "dark", "replay keeps it"
+    document = active_client.get("/v1/config").json()
+    assert "uiTheme" not in document and "uiFontSize" not in document
 
 
 def test_the_retired_standby_list_is_refused_and_says_what_replaced_it(
@@ -127,7 +154,7 @@ def test_config_survives_a_restart_through_the_log(tmp_path: Path) -> None:
         ]
         client.patch(
             "/v1/config",
-            json={"uiTheme": "dark", "joinTokenTtlSeconds": 60},
+            json={"nodePollIntervalSeconds": 30, "joinTokenTtlSeconds": 60},
             headers={"Authorization": f"Bearer {token}"},
         )
 
@@ -136,7 +163,7 @@ def test_config_survives_a_restart_through_the_log(tmp_path: Path) -> None:
     restarted = create_app(settings_for(directory))
     with TestClient(restarted):
         values = restarted.state.machine.state.config
-        assert values["uiTheme"] == "dark"
+        assert values["nodePollIntervalSeconds"] == 30
         assert values["joinTokenTtlSeconds"] == 60
 
 
@@ -198,7 +225,9 @@ def test_safe_mode_ignores_config_but_not_the_log(tmp_path: Path) -> None:
             "sessionToken"
         ]
         client.patch(
-            "/v1/config", json={"uiTheme": "dark"}, headers={"Authorization": f"Bearer {token}"}
+            "/v1/config",
+            json={"joinTokenTtlSeconds": 60},
+            headers={"Authorization": f"Bearer {token}"},
         )
         app.state.machine.append(
             "enrollNode",
@@ -214,12 +243,12 @@ def test_safe_mode_ignores_config_but_not_the_log(tmp_path: Path) -> None:
         assert health["status"] == "degraded"
         # The registry is intact; only the config file was skipped.
         assert health["details"]["nodes"] == 1
-        assert safe.state.machine.state.config["uiTheme"] == "dark"
+        assert safe.state.machine.state.config["joinTokenTtlSeconds"] == 60
 
 
 def test_effective_config_layers_applied_over_defaults() -> None:
-    values = config_module.effective({"uiTheme": "dark"})
-    assert values["uiTheme"] == "dark"
+    values = config_module.effective({"joinTokenTtlSeconds": 60})
+    assert values["joinTokenTtlSeconds"] == 60
     assert values["nodePollIntervalSeconds"] == 15
 
 

@@ -302,7 +302,7 @@ def test_a_replicating_standby_is_promotable_from_the_passphrase_alone(tmp_path:
 
         # Logged in and still not a writer. Reading is not writing, and
         # the role gate is what says so.
-        rejected = standby.patch("/v1/config", json={"uiTheme": "light"}, headers=headers)
+        rejected = standby.patch("/v1/config", json={"joinTokenTtlSeconds": 60}, headers=headers)
         assert rejected.status_code == 409, rejected.text
         assert "not the active root" in rejected.text.lower()
 
@@ -321,10 +321,10 @@ def test_a_replicating_standby_is_promotable_from_the_passphrase_alone(tmp_path:
 
         # It can write now, which is the difference between promoted and
         # merely relabelled.
-        patched = standby.patch("/v1/config", json={"uiTheme": "light"}, headers=headers)
+        patched = standby.patch("/v1/config", json={"joinTokenTtlSeconds": 60}, headers=headers)
         assert patched.status_code == 200, patched.text
-        assert patched.json()["applied"] == ["uiTheme"]
-        assert standby_app.state.machine.state.config["uiTheme"] == "light"
+        assert patched.json()["applied"] == ["joinTokenTtlSeconds"]
+        assert standby_app.state.machine.state.config["joinTokenTtlSeconds"] == 60
 
 
 def test_a_standby_with_nothing_replicated_refuses_to_promote(tmp_path: Path) -> None:

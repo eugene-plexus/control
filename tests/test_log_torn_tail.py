@@ -424,7 +424,7 @@ def test_the_apps_own_start_up_repairs_the_tail_before_the_first_write(tmp_path:
     with TestClient(first) as client:
         client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).raise_for_status()
         client.headers["Authorization"] = f"Bearer {login(client)}"
-        assert client.patch("/v1/config", json={"uiTheme": "dark"}).status_code == 200
+        assert client.patch("/v1/config", json={"joinTokenTtlSeconds": 60}).status_code == 200
     _tear(settings.state_dir)
 
     second = start()
@@ -433,7 +433,7 @@ def test_the_apps_own_start_up_repairs_the_tail_before_the_first_write(tmp_path:
         assert health["status"] == "degraded"
         assert health["details"]["discardedTornTailLines"] == 1
         client.headers["Authorization"] = f"Bearer {login(client)}"
-        assert client.patch("/v1/config", json={"uiTheme": "light"}).status_code == 200
+        assert client.patch("/v1/config", json={"joinTokenTtlSeconds": 120}).status_code == 200
 
     third = start()
     with TestClient(third) as client:
@@ -442,5 +442,5 @@ def test_the_apps_own_start_up_repairs_the_tail_before_the_first_write(tmp_path:
         # Initialization records the install CA (LT2, `setInstallCa`), entry 1.
         assert health["details"]["appliedIndex"] == 3
         assert health["status"] == "ok"
-    assert third.state.machine.state.config["uiTheme"] == "light"
+    assert third.state.machine.state.config["joinTokenTtlSeconds"] == 120
     assert _indexes(settings.state_dir) == [1, 2, 3]
