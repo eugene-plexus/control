@@ -62,6 +62,9 @@ def content(state: Any, control_pins: list[str]) -> dict[str, Any]:
     return {
         "required": required(state.config),
         "clientPlainHttp": client_plain(state.config),
+        # Row 3: this root records a next key (`tlsNextPin`), so a node may
+        # change its machine key. A node offers no change without it.
+        "keyChange": True,
         "controlPins": sorted(set(control_pins)),
         "nodes": [
             {
@@ -198,8 +201,81 @@ def link(record: Any, probe: Any | None) -> dict[str, Any]:
     }
 
 
+#: `first_signed`'s key for the machine port in front of this root.
+CONTROL_KEY = "@control"
+
+
+def _pin_sets(listed: dict[str, Any] | None) -> dict[str, tuple[str, ...]]:
+    """Each node's pins in a list's content, and this root's own."""
+    if not listed:
+        return {}
+    sets = {
+        str(n.get("name")): tuple(sorted(n.get("pins") or ()))
+        for n in listed.get("nodes") or ()
+        if isinstance(n, dict)
+    }
+    sets[CONTROL_KEY] = tuple(sorted(listed.get("controlPins") or ()))
+    return sets
+
+
+def key_change(
+    record: Any,
+    *,
+    nodes: dict[str, Any],
+    probes: dict[str, Any],
+    publisher: MachineListPublisher,
+    control_pins: list[str],
+    hosts_control: bool,
+) -> dict[str, Any] | None:
+    """`Node.machineKeyChange` (row 3): who this root sees holding a list
+    that names both of a node's keys. An observation, never replicated.
+
+    `listVersion` is the first list that named both keys (and, for the
+    machine in front of this root, both in `controlPins` too); a machine
+    holding that list or a later one has them. The node switches once
+    `waitingOn` is empty. Unreachable machines are not waited for: each
+    takes the list when it is back, the root's own key included
+    (`machine_trust.pull` fetches it in plain HTTP when the key it holds is
+    refused, and takes it only if it verifies). A machine without a machine
+    key talks plain HTTP and is not concerned.
+    """
+    if not record.tlsNextPin:
+        return None
+    pins = tuple(sorted(record.tlsPins))
+    version = publisher.first_signed(record.name, pins)
+    if hosts_control and version is not None:
+        wanted = tuple(sorted(set(control_pins)))
+        if not set(pins) <= set(wanted):
+            version = None
+        else:
+            door = publisher.first_signed(CONTROL_KEY, wanted)
+            version = None if door is None else max(version, door)
+    waiting: list[str] = []
+    unreachable: list[str] = []
+    for other in sorted(nodes.values(), key=lambda r: r.name):
+        if other.name == record.name or not other.tlsPins:
+            continue
+        probe = probes.get(other.name)
+        if probe is not None and not probe.reachable:
+            unreachable.append(other.name)
+            continue
+        held = getattr(probe, "list_version", None)
+        if version is None or held is None or held < version:
+            waiting.append(other.name)
+    return {
+        "nextPin": record.tlsNextPin,
+        "listVersion": version,
+        "waitingOn": waiting,
+        "unreachable": unreachable,
+    }
+
+
 class MachineListPublisher:
-    """The last list signed, re-signed when what it says changes."""
+    """The last list signed, re-signed when what it says changes.
+
+    It also keeps, for each node and for this root's own machine port, the
+    version that first named its pins as they are now (row 3), so a machine
+    key change can tell which machines hold a list that names both keys."""
 
     def __init__(self, state_dir: Path) -> None:
         self._path = Path(state_dir) / FILE
@@ -207,6 +283,7 @@ class MachineListPublisher:
         self.jws: str | None = None
         self._content: dict[str, Any] | None = None
         self._version = 0
+        self._first_signed: dict[str, int] = {}
         try:
             kept = json.loads(self._path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -218,6 +295,20 @@ class MachineListPublisher:
             self.jws = kept["jws"]
             self._content = kept.get("content") if isinstance(kept.get("content"), dict) else None
             self._version = int(kept.get("version") or 0)
+            first = kept.get("firstSigned")
+            if isinstance(first, dict):
+                self._first_signed = {
+                    str(k): int(v) for k, v in first.items() if isinstance(v, int)
+                }
+
+    def first_signed(self, name: str, pins: tuple[str, ...]) -> int | None:
+        """The version that first named `pins` for `name` (a node, or
+        `CONTROL_KEY`), when the last list signed names exactly those; None
+        when no list signed yet does."""
+        with self._lock:
+            if _pin_sets(self._content).get(name) != tuple(sorted(pins)):
+                return None
+            return self._first_signed.get(name)
 
     def current(
         self, state: Any, control_pins: list[str], control_private_key: str | None
@@ -243,11 +334,31 @@ class MachineListPublisher:
                 algorithm="EdDSA",
                 headers={"typ": TYP_MACHINES},
             )
+            # Row 3: a pin set unchanged since the last list keeps the
+            # version that first named it; a new or changed one starts here.
+            # With no last list (a promoted standby, a new file), every set
+            # starts here, so a key change waits for every machine again.
+            before, after = _pin_sets(self._content), _pin_sets(wanted)
+            self._first_signed = {
+                key: (
+                    self._first_signed[key]
+                    if before.get(key) == pins and key in self._first_signed
+                    else self._version
+                )
+                for key, pins in after.items()
+            }
             self._content = wanted
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 self._path.write_text(
-                    json.dumps({"jws": self.jws, "content": wanted, "version": self._version}),
+                    json.dumps(
+                        {
+                            "jws": self.jws,
+                            "content": wanted,
+                            "version": self._version,
+                            "firstSigned": self._first_signed,
+                        }
+                    ),
                     encoding="utf-8",
                 )
             except OSError as exc:

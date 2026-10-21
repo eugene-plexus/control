@@ -267,7 +267,11 @@ class NodeRecord:
     enrolment or its signed announcement; `None` on an older node."""
     tlsPins: tuple[str, ...] = ()
     """The keys its machine port may present, registered under its
-    signature (or its join token). Empty on an older node."""
+    signature (or its join token). Empty on an older node. Two while its
+    machine key changes (row 3)."""
+    tlsNextPin: str | None = None
+    """The one of `tlsPins` it announced as its next key (row 3); None
+    outside a machine key change."""
     certificateNames: tuple[str, ...] = ()
     """Names the owner listed for its client certificate (LT2,
     `setNodeCertificateNames`): an operator's, never the node's."""
@@ -636,10 +640,14 @@ def _apply_update_node(state: AppliedState, payload: dict[str, Any], index: int)
     # LT1: the machine port rides the same signed announcement. An entry
     # written before it carries neither key and leaves them as they were.
     if "machineUrl" in payload or "tlsPins" in payload:
+        pins = _pins(payload.get("tlsPins"))
+        next_pin = _optional_str(payload, "tlsNextPin")
         updated = replace(
             updated,
             machineUrl=_optional_str(payload, "machineUrl"),
-            tlsPins=_pins(payload.get("tlsPins")),
+            tlsPins=pins,
+            # Row 3. An entry written before it has no `tlsNextPin`: none.
+            tlsNextPin=next_pin if next_pin in pins else None,
         )
     return replace(state, nodes={**state.nodes, name: updated})
 
@@ -1543,6 +1551,7 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
                 "enrolledAt": n.enrolledAt,
                 "machineUrl": n.machineUrl,
                 "tlsPins": list(n.tlsPins),
+                "tlsNextPin": n.tlsNextPin,
                 "certificateNames": list(n.certificateNames),
             }
             for n in sorted(state.nodes.values(), key=lambda r: r.name)
@@ -1662,6 +1671,9 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
                 enrolledAt=n.get("enrolledAt"),
                 machineUrl=n.get("machineUrl"),
                 tlsPins=_pins(n.get("tlsPins")),
+                tlsNextPin=n.get("tlsNextPin")
+                if n.get("tlsNextPin") in (n.get("tlsPins") or ())
+                else None,
                 certificateNames=tuple(str(x) for x in n.get("certificateNames") or ()),
             )
             for n in raw.get("nodes") or []
