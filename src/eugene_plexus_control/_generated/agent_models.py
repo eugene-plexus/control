@@ -2217,6 +2217,18 @@ class MachineKeyChangeState(StrEnum):
     failed = 'failed'
 
 
+class MachineKeyChangeReason(StrEnum):
+    """
+    * `requested`: an operator asked for it (`POST /v1/node/machine-key`).
+    * `scheduled`: the key was older than `machineKeyChangeDays`, and the
+      machine started the change by itself (part 3b).
+
+    """
+
+    requested = 'requested'
+    scheduled = 'scheduled'
+
+
 class MachineKeyChange(BaseModel):
     """
     A change of this node's machine key (row 3): two pins across an
@@ -2225,6 +2237,7 @@ class MachineKeyChange(BaseModel):
     """
 
     state: MachineKeyChangeState
+    reason: MachineKeyChangeReason | None = None
     nextPin: str | None = Field(
         None,
         description='The pin of the key it changes to, while `waiting` or\n`switched`. `null` otherwise.\n',
@@ -4630,6 +4643,21 @@ class MachinePort(BaseModel):
         None,
         description="This node's last machine key change (`POST\n/v1/node/machine-key`), or `null` when it never had one.\n",
     )
+    keyMadeAt: AwareDatetime | None = Field(
+        None, description='When the key the machine port presents was made (part 3b).\n'
+    )
+    keyChangeDueAt: AwareDatetime | None = Field(
+        None,
+        description='When this machine changes its key by itself next: `keyMadeAt`\nplus the `machineKeyChangeDays` config field (365 by default),\nplus a spread of up to a twelfth of it (about a month a year),\ndrawn from the key itself: the same for one key, different for\neach, so the machines of one install do not change on the same\nday. `null` when the field is 0 (only on request).\n',
+    )
+    keyChangeNextAttemptAt: AwareDatetime | None = Field(
+        None,
+        description='When this machine next tries to start that change: at\n`keyChangeDueAt`; for a key already overdue when first seen (an\ninstall updated to this version, a machine that was off), at a\ntime up to 7 days later drawn from the key, so the machines of an\ninstall do not all change at once; a day after a change that was\nstopped or refused; an hour after a start that could not happen\n(`keyChangeBlocked`). `null` when the key does not change by\nitself or a change is under way.\n',
+    )
+    keyChangeBlocked: str | None = Field(
+        None,
+        description='Why the last start of a scheduled change could not happen, in\nthe words of the cause (a root older than row 3, a key that\ncould not be written). `null` when the last start did not fail.\n',
+    )
 
 
 class ClientTls(BaseModel):
@@ -6190,7 +6218,7 @@ class MessageContent1(
         TextContentPart | ImageContentPart | InputAudioContentPart | FileContentPart
     ] = Field(
         ...,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        description='Text, null for an assistant tool-call turn, or ordered content parts.\nImages ride on user messages and on tool results (the gateway carries\na tool\'s picture on the next user message). Audio and files ride on\nuser messages only.\n\nImages are inline PNG/JPEG only: the gateway\'s `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nTool pictures count toward these same limits. On all three gateway\ndoors (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), when\ntool pictures exceed the image count or decoded-byte limits, the\ngateway keeps the newest tool pictures that fit. Each picture not\nattached becomes a note in its tool message naming the limit, for\nexample: "[A picture this tool returned is not attached: this request\nholds at most 12 pictures.]" (with the effective setting\'s value).\nA person\'s own pictures are never dropped; if they alone exceed a\nlimit, the request is a 400.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Remote URLs are never fetched, and a\n`file_id` is refused:\neach names a store this install does not have.\n',
         min_length=1,
     )
 
@@ -6249,7 +6277,7 @@ class Message(BaseModel):
     role: Role
     content: str | MessageContent1 | None = Field(
         None,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        description='Text, null for an assistant tool-call turn, or ordered content parts.\nImages ride on user messages and on tool results (the gateway carries\na tool\'s picture on the next user message). Audio and files ride on\nuser messages only.\n\nImages are inline PNG/JPEG only: the gateway\'s `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nTool pictures count toward these same limits. On all three gateway\ndoors (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), when\ntool pictures exceed the image count or decoded-byte limits, the\ngateway keeps the newest tool pictures that fit. Each picture not\nattached becomes a note in its tool message naming the limit, for\nexample: "[A picture this tool returned is not attached: this request\nholds at most 12 pictures.]" (with the effective setting\'s value).\nA person\'s own pictures are never dropped; if they alone exceed a\nlimit, the request is a 400.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Remote URLs are never fetched, and a\n`file_id` is refused:\neach names a store this install does not have.\n',
     )
     toolCalls: list[dict[str, Any]] | None = Field(
         None,
@@ -6257,7 +6285,7 @@ class Message(BaseModel):
     )
     toolCallId: str | None = Field(
         None,
-        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+        description="On a **tool** message: which call this is the result of.\nFor inference-driver requests, `content` carries text; the gateway\nmoves a tool's pictures to the next user message, labelled with\nthis id.\n",
     )
     reasoning: str | None = Field(
         None,
