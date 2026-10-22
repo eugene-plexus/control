@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     comma-separated `TlsPin`s: its own machine's agent's key. Supplied by
     that agent, which owns the port; this root signs them into the machine
     list and puts the first on every node's join token."""
+    machine_door_file: str | None = None
+    """A JSON file, `{"pins": [...], "url": ...}`, that the agent in front of
+    this root writes and rewrites (row 3): the machine port's keys, the one
+    it presents first. Read again while this root runs (at most once a
+    second), so the machine port's key changes with no restart of control,
+    which would bring it back sealed. Wins over `machine_pins` while it can
+    be read; `machine_pins` stays for an agent older than row 3."""
     nodes_probe: str | None = None
     """`host:port` where this root reads the key its nodes name presents,
     when Eugene's own proxy terminates TLS: that proxy on loopback. Unset

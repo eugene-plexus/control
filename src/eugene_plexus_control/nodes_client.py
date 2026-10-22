@@ -67,6 +67,10 @@ class NodeProbe:
     pin_refused: str | None = None
     """The probe was refused because the node's machine port presented a
     key it never registered (LT1): that key's pin. A security event."""
+    list_version: int | None = None
+    """The machine list version the node said it holds (`machine.listVersion`,
+    row 3): how a machine key change reads which machines have both keys.
+    None from an agent older than row 3."""
 
 
 TokenFor = Callable[[str], str | None]
@@ -160,6 +164,8 @@ class NodesClient:
         epoch = body.get("epoch")
         devices = body.get("devices")
         held = body.get("trustBundleVersion")
+        machine = body.get("machine")
+        listed = machine.get("listVersion") if isinstance(machine, dict) else None
         return NodeProbe(
             name=name,
             reachable=True,
@@ -171,6 +177,9 @@ class NodesClient:
             devices=devices if isinstance(devices, list) else None,
             last_seen_at=datetime.now(UTC).isoformat(),
             hosts_control=body.get("hostsControl") is True,
+            list_version=listed
+            if isinstance(listed, int) and not isinstance(listed, bool)
+            else None,
         )
 
     async def probe_all(

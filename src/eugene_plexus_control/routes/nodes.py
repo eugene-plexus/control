@@ -86,7 +86,7 @@ async def list_nodes(request: Request) -> NodeList:
     probes = getattr(request.app.state, "node_probes", {})
     return NodeList(
         nodes=[
-            _to_node(record, probes.get(record.name))
+            _to_node(record, probes.get(record.name), request)
             for record in sorted(machine.state.nodes.values(), key=lambda r: r.name)
         ]
     )
@@ -168,7 +168,7 @@ async def get_node(request: Request, name: str) -> Node:
             status.HTTP_404_NOT_FOUND, "No such node", f"No node named {name!r} is enrolled."
         )
     probes = getattr(request.app.state, "node_probes", {})
-    return _to_node(record, probes.get(name))
+    return _to_node(record, probes.get(name), request)
 
 
 @router.patch("/v1/nodes/{name}", response_model=NodeAddressAck)
@@ -244,17 +244,19 @@ async def announce_node_address(
             "`url` must be present in the request body as a string.",
         )
     # LT1: the machine port and its key, read raw for the same reason as
-    # `url`, and signed with it whenever the body holds them.
+    # `url`, and signed with it whenever the body holds them. Row 3: the
+    # next key too, under its own name.
     machine_fields = {
         key: raw[key]
-        for key in ("machineUrl", "tlsPin")
+        for key in ("machineUrl", "tlsPin", "tlsNextPin")
         if isinstance(raw, dict) and raw.get(key) is not None
     }
     if any(not isinstance(value, str) for value in machine_fields.values()):
         raise problem(
             status.HTTP_400_BAD_REQUEST,
             "Malformed announcement",
-            "`machineUrl` and `tlsPin` must be strings when present.",
+            "`machineUrl`, `tlsPin` and `tlsNextPin` must be strings when present: a node "
+            "announces one key, and one next key while it changes keys.",
         )
     message = sealing.address_message(
         name=name, sequence=int(body.sequence), url=announced_url, machine=machine_fields
@@ -291,7 +293,14 @@ async def announce_node_address(
         machine_fields.get("tlsPin"),
         machine.state.nodes,
     )
-    if normalized == record.url and (machine_url, pins) == (record.machineUrl, record.tlsPins):
+    next_pin = _checked_next_pin(name, pins, machine_fields.get("tlsNextPin"))
+    if next_pin is not None:
+        pins = tuple(sorted({*pins, next_pin}))
+    if normalized == record.url and (machine_url, pins, next_pin) == (
+        record.machineUrl,
+        record.tlsPins,
+        record.tlsNextPin,
+    ):
         # Nothing to record. Note that the sequence is deliberately NOT
         # advanced here: it lives in applied state, and advancing it
         # would need a log entry, which is exactly what this branch
@@ -349,19 +358,23 @@ async def announce_node_address(
                 # (a node rolled back to an older version).
                 "machineUrl": machine_url,
                 "tlsPins": list(pins),
+                # Row 3: which of them is the next key; None drops it.
+                "tlsNextPin": next_pin,
             },
         )
     except NotActive as exc:
         raise _not_active(machine) from exc
     machine_list.install_table(machine.state, request.app.state.node_name)
 
+    current = [p for p in pins if p != next_pin]
     log.info(
-        "node %s re-advertised: %s -> %s (sequence %d)%s",
+        "node %s re-advertised: %s -> %s (sequence %d)%s%s",
         name,
         record.url,
         normalized,
         int(body.sequence),
-        f", machine port {machine_url} with key {pins[0]}" if machine_url and pins else "",
+        f", machine port {machine_url} with key {current[0]}" if machine_url and current else "",
+        f" and next key {next_pin}" if next_pin else "",
     )
     updated = machine.state.nodes[name]
     return NodeAddressAck(
@@ -374,9 +387,60 @@ async def announce_node_address(
 
 TLS_PIN = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
+#: How often the door file is looked at again (row 3).
+DOOR_RECHECK_SECONDS = 1.0
+#: path -> (checked at, pins read, said it was unreadable). Module-level:
+#: every route reads the same file, and a test app's file is its own path.
+_DOORS: dict[str, tuple[float, list[str] | None, bool]] = {}
+
+
+def _door_pins(path: str) -> list[str] | None:
+    """The pins in the door file the agent writes, in its order (the key the
+    machine port presents first), or None when it cannot be read and none
+    were read before. Read whole at most once a second: it is a few hundred
+    bytes, and a file's modification time can miss a rewrite of the same
+    size within one clock tick. A file that turns unreadable keeps the last
+    pins read from it: a half-written file must not drop the root's own key."""
+    import json
+    import time
+
+    now = time.perf_counter()
+    checked, pins, said = _DOORS.get(path, (None, None, False))
+    if checked is not None and now - checked < DOOR_RECHECK_SECONDS:
+        return pins
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        raw = document.get("pins") if isinstance(document, dict) else None
+        if not isinstance(raw, list):
+            raise ValueError("it holds no list of pins")
+        read = list(dict.fromkeys(p for p in raw if isinstance(p, str) and TLS_PIN.match(p)))
+    except (OSError, ValueError) as exc:
+        if not said:
+            log.warning(
+                "the machine door file %s is unreadable, keeping %s: %s",
+                path,
+                "the keys read from it last" if pins else "the keys given at start",
+                exc,
+            )
+        _DOORS[path] = (now, pins, True)
+        return pins
+    if read != pins:
+        log.info("the machine port in front of this root presents %s", ", ".join(read) or "none")
+    _DOORS[path] = (now, read, False)
+    return read
+
 
 def machine_pins(settings: Any) -> list[str]:
-    """This root's machine-port keys, as its agent handed them over (LT1)."""
+    """This root's machine-port keys, the one it presents first (LT1).
+
+    From the door file its agent writes (row 3), read again while this root
+    runs; otherwise as the agent handed them over at spawn."""
+    door = getattr(settings, "machine_door_file", None)
+    if door:
+        pins = _door_pins(str(door))
+        if pins:
+            return pins
     raw = getattr(settings, "machine_pins", None) or ""
     return [p for p in (s.strip() for s in raw.split(",")) if TLS_PIN.match(p)]
 
@@ -473,6 +537,35 @@ def _checked_machine(
             f"{machine_url} cannot be node {name!r}'s machine port: {reason}.",
         )
     return normalized, (pin,)
+
+
+def _checked_next_pin(name: str, pins: tuple[str, ...], next_pin: Any) -> str | None:
+    """The next key a node announces while its machine key changes (row 3),
+    or a 400. Only beside a current key and its door, never the current key
+    again, so a record holds at most two. It is held to the same door as the
+    current key (`_checked_machine`): a node can add a key only to its own
+    machine port, never another machine's."""
+    if next_pin is None:
+        return None
+    if not pins:
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Machine port incomplete",
+            f"Node {name!r} sent a next key with no current key and machine URL.",
+        )
+    if not isinstance(next_pin, str) or not TLS_PIN.match(next_pin):
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Malformed machine key",
+            "`tlsNextPin` must be the base64url SHA-256 of the key's SubjectPublicKeyInfo.",
+        )
+    if next_pin in pins:
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Next key is the current key",
+            f"Node {name!r} sent the same key as its current and its next key.",
+        )
+    return next_pin
 
 
 @router.delete(
@@ -917,7 +1010,7 @@ def _confirm_site_owner(request: Request, invited: str | None, proof: Any) -> st
 # --------------------------------------------------------------------------- #
 
 
-def _to_node(record: NodeRecord, probe: Any | None) -> Node:
+def _to_node(record: NodeRecord, probe: Any | None, request: Request | None = None) -> Node:
     """Applied state plus this root's observations, kept distinguishable.
 
     `reachable` defaults to False when nothing has polled yet, and that
@@ -925,6 +1018,18 @@ def _to_node(record: NodeRecord, probe: Any | None) -> Node:
     `down`, never `out` — nothing is reassigned on the strength of this
     field.
     """
+    key_change = None
+    if record.tlsNextPin and request is not None:
+        app = request.app
+        machine: StateMachine = app.state.machine
+        key_change = machine_list.key_change(
+            record,
+            nodes=machine.state.nodes,
+            probes=getattr(app.state, "node_probes", {}) or {},
+            publisher=app.state.machine_list,
+            control_pins=machine_pins(app.state.settings),
+            hosts_control=record.name == getattr(app.state, "node_name", None),
+        )
     return Node.model_validate(
         {
             "name": record.name,
@@ -947,6 +1052,8 @@ def _to_node(record: NodeRecord, probe: Any | None) -> Node:
             "enrolledAt": record.enrolledAt,
             "machineUrl": record.machineUrl,
             "tlsPins": list(record.tlsPins),
+            "tlsNextPin": record.tlsNextPin,
+            "machineKeyChange": key_change,
             "certificateNames": list(record.certificateNames),
             "machineTls": machine_list.link(record, probe),
             "lastSeenAt": probe.last_seen_at if probe is not None else None,
@@ -1177,7 +1284,7 @@ async def set_node_certificate_names(
             raise _not_active(machine) from exc
         log.info("%s's certificate may now name %s", name, ", ".join(names) or "nothing extra")
     probes = getattr(request.app.state, "node_probes", {})
-    return _to_node(machine.state.nodes[name], probes.get(name))
+    return _to_node(machine.state.nodes[name], probes.get(name), request)
 
 
 def _labelled_node(machine: StateMachine, name: str) -> NodeRecord:
@@ -1217,7 +1324,7 @@ def _set_label(request: Request, name: str, label: str | None) -> Node:
             raise _not_active(machine) from exc
         log.info("node %s is now shown as %r", name, label or name)
     probes = getattr(request.app.state, "node_probes", {})
-    return _to_node(machine.state.nodes[name], probes.get(name))
+    return _to_node(machine.state.nodes[name], probes.get(name), request)
 
 
 def _not_active(machine: StateMachine) -> Any:

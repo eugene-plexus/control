@@ -2811,6 +2811,38 @@ class TlsPin(RootModel[str]):
     )
 
 
+class NodeMachineKeyChange(BaseModel):
+    """
+    A machine key change seen from this root (row 3): the node
+    announced a next key, and it switches once every machine that can
+    reach it holds a machine list naming both keys. An observation of
+    this root's last poll: a standby has seen none of it.
+
+    """
+
+    nextPin: str = Field(
+        ...,
+        description="Base64url (no padding) of the SHA-256 of a machine key's\nSubjectPublicKeyInfo, the form Job Sites pin too.\n",
+        pattern='^[A-Za-z0-9_-]{43}$',
+    )
+    listVersion: int | None = Field(
+        None,
+        description='The first machine list `version` that names both keys (and,\nfor the machine that runs this root, both in `controlPins`).\n`null` until this root has signed one.\n',
+    )
+    waitingOn: list[str] = Field(
+        ...,
+        description='Machines this root reached that hold an older list, or that\nreport no list version (a version before row 3), or that it\nhas not polled yet. The node waits for none of them after 3\nminutes.\n',
+    )
+    unreachable: list[str] = Field(
+        ...,
+        description='Machines this root could not reach on its last poll. The node\ndoes not wait for them: each fetches the list when it is back.\n',
+    )
+    notReady: list[str] | None = Field(
+        None,
+        description="Machines with a machine key that this root has never seen\nreport a machine list version: they run an agent older than\nrow 3, which cannot take the root's new key by itself if it\nmisses the change. A change of the key of the machine that\nruns this root does not switch while any is listed (update\nthem, or remove a machine that is gone). Another machine's\nchange is not held up by them.\n",
+    )
+
+
 class State(StrEnum):
     """
     * `encrypted`: the last poll went over TLS to the key the node
@@ -3001,7 +3033,7 @@ class NodeAddressAnnouncement(BaseModel):
     )
     signature: str = Field(
         ...,
-        description='Detached Ed25519 signature, base64, by the node\'s identity\nsigning key over the **canonical message**: the UTF-8 bytes\nof the JSON object `{"name": "<name>", "sequence":\n<sequence>, "url": "<url>"}` with keys sorted and no\nwhitespace — `json.dumps(obj, sort_keys=True,\nseparators=(",", ":"))`. `name` is the path parameter and\n`url` is the value in this body, verbatim and unnormalized.\n\nThree fields, one serializer, stated here so both sides\nimplement it from one sentence. Including `name` is what\nstops one node\'s announcement being replayed against\nanother\'s record.\n\n**With `machineUrl` or `tlsPin` in the body (LT1), the object\nsigned holds them too**, under the same names, so the key a\nnode registers is covered by the same signature as its\naddress: `{"machineUrl": …, "name": …, "sequence": …,\n"tlsPin": …, "url": …}`, keys sorted, holding exactly the\nones the body holds. An announcement without either signs\nthe three fields above, so an older node\'s announcement\nverifies as before.\n\n**Verified against the raw request body, never against a\nparsed `url`.** An OpenAPI `format: uri` becomes a URL type\nin most generators, and those normalize — Pydantic\'s\n`AnyUrl` appends a trailing slash to an authority-only URL —\nso a verifier that parses first compares different bytes\nfrom the ones the node signed, and *every* announcement\nfails with what looks like a crypto error. Found by it\nhappening. A signature is over bytes on the wire; `format:\nuri` stays here because the validation and the generated\nclients are still worth having.\n',
+        description='Detached Ed25519 signature, base64, by the node\'s identity\nsigning key over the **canonical message**: the UTF-8 bytes\nof the JSON object `{"name": "<name>", "sequence":\n<sequence>, "url": "<url>"}` with keys sorted and no\nwhitespace — `json.dumps(obj, sort_keys=True,\nseparators=(",", ":"))`. `name` is the path parameter and\n`url` is the value in this body, verbatim and unnormalized.\n\nThree fields, one serializer, stated here so both sides\nimplement it from one sentence. Including `name` is what\nstops one node\'s announcement being replayed against\nanother\'s record.\n\n**With `machineUrl` or `tlsPin` in the body (LT1), the object\nsigned holds them too**, under the same names, so the key a\nnode registers is covered by the same signature as its\naddress: `{"machineUrl": …, "name": …, "sequence": …,\n"tlsPin": …, "url": …}`, keys sorted, holding exactly the\nones the body holds. An announcement without either signs\nthe three fields above, so an older node\'s announcement\nverifies as before. `tlsNextPin` (row 3) joins the signed\nobject under its own name in the same way.\n\n**Verified against the raw request body, never against a\nparsed `url`.** An OpenAPI `format: uri` becomes a URL type\nin most generators, and those normalize — Pydantic\'s\n`AnyUrl` appends a trailing slash to an authority-only URL —\nso a verifier that parses first compares different bytes\nfrom the ones the node signed, and *every* announcement\nfails with what looks like a crypto error. Found by it\nhappening. A signature is over bytes on the wire; `format:\nuri` stays here because the validation and the generated\nclients are still worth having.\n',
     )
     machineUrl: AnyUrl | None = Field(
         None,
@@ -3010,6 +3042,11 @@ class NodeAddressAnnouncement(BaseModel):
     tlsPin: str | None = Field(
         None,
         description="Base64url (no padding) of the SHA-256 of a machine key's\nSubjectPublicKeyInfo, the form Job Sites pin too.\n",
+        pattern='^[A-Za-z0-9_-]{43}$',
+    )
+    tlsNextPin: str | None = Field(
+        None,
+        description="The node's next machine key, while it changes keys (row 3).\nOnly with `tlsPin`, and not equal to it. The root records both\nin `Node.tlsPins` and lists both, so every machine accepts\neither key across the switch; the node then announces\n`tlsPin` alone, and the old key leaves the list. A replay of\nan announcement that carried the old key is refused by\n`sequence`.\n",
         pattern='^[A-Za-z0-9_-]{43}$',
     )
 
@@ -4578,6 +4615,10 @@ class MachineList(BaseModel):
         ...,
         description="The keys the machine port in front of this control root may\npresent, given to it by its own machine's agent. A node reaches\nthe root at the address it joined with, over TLS to one of\nthese.\n",
     )
+    keyChange: bool | None = Field(
+        None,
+        description="This root takes `NodeAddressAnnouncement.tlsNextPin` (row 3):\na node may change its machine key. Absent from an older\nroot's list, and a node then offers no change.\n",
+    )
     nodes: list[MachineListNode]
 
 
@@ -5108,7 +5149,16 @@ class Node(BaseModel):
     )
     tlsPins: list[TlsPin] | None = Field(
         None,
-        description="The keys this node's machine port may present, registered\nunder its signature. Every other machine refuses a connection\nthat presents any other. Empty on a node without a machine\nport.\n",
+        description="The keys this node's machine port may present, registered\nunder its signature. Every other machine refuses a connection\nthat presents any other. Empty on a node without a machine\nport. Two while its machine key changes (`tlsNextPin`, row 3):\nthe current key and the next, and both again after the switch\nuntil the node announces the new key alone.\n",
+        max_length=2,
+    )
+    tlsNextPin: TlsPin | None = Field(
+        None,
+        description='The one of `tlsPins` the node announced as its next key\n(`NodeAddressAnnouncement.tlsNextPin`). `null` outside a\nmachine key change.\n',
+    )
+    machineKeyChange: NodeMachineKeyChange | None = Field(
+        None,
+        description='While the node announces a next key: which machines this root\nsees holding a list that names it. An observation, never\nreplicated. `null` outside a change.\n',
     )
     machineTls: MachineLink | None = None
     certificateNames: list[str] | None = Field(

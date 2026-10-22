@@ -27,6 +27,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
 
@@ -425,6 +426,7 @@ async def _poll_nodes(app: FastAPI) -> None:
                 app.state.node_probes = await client.probe_all(
                     targets, lambda node: service_token_for(app.state.auth_state, node)
                 )
+                _note_list_capable(app, app.state.node_probes)
             _require_when_ready(app, machine)
             await asyncio.sleep(float(values["nodePollIntervalSeconds"]))
         except asyncio.CancelledError:
@@ -435,6 +437,15 @@ async def _poll_nodes(app: FastAPI) -> None:
             # than reporting nothing: a stale `true` reads as healthy.
             log.warning("node poll failed: %s", exc)
             await asyncio.sleep(5.0)
+
+
+def _note_list_capable(app: FastAPI, probes: dict[str, Any]) -> None:
+    """Row 3: remember every node seen reporting a machine list version, so
+    a change of the root's own key knows which agents recover by themselves
+    after missing it, even while they are off."""
+    seen = {name for name, probe in probes.items() if probe.list_version is not None}
+    if seen:
+        app.state.machine_list.note_list_capable(seen)
 
 
 def _require_when_ready(app: FastAPI, machine: StateMachine) -> None:
