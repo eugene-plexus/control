@@ -204,7 +204,8 @@ async def rotate_key(
         limits=old.limits,
         replaces=old.id,
     )
-    retires = datetime.fromtimestamp(issued + body.overlapSeconds, UTC)
+    overlap = 86400 if body.overlapSeconds is None else body.overlapSeconds
+    retires = datetime.fromtimestamp(issued + overlap, UTC)
     machine.append(
         OP_ROTATE_CLIENT_KEY,
         {

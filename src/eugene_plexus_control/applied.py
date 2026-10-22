@@ -1005,7 +1005,7 @@ def _apply_rotate_client_key(
 ) -> AppliedState:
     old_id = payload.get("oldId")
     old = state.client_keys.get(old_id) if isinstance(old_id, str) else None
-    if old is None:
+    if old is None or not isinstance(old_id, str):
         raise ApplyError("unknown client-key identifier")
     if old.get("revokedAt"):
         raise ApplyError("this key is turned off and cannot be rotated")
