@@ -144,8 +144,9 @@ def test_under_the_cap_the_id_token_holds_every_group(
 
 
 def test_the_cap_is_measured_in_bytes_not_characters() -> None:
-    """A name in another script takes more bytes than letters: the cap counts bytes, and
-    everything the cut adds to the token, the flag included, fits inside it."""
+    """A name in another script takes more bytes than letters: the cap counts the bytes the
+    signer writes (non-ASCII escaped, as PyJWT serializes), and everything the cut adds to the
+    token, the flag included, fits inside it."""
     groups = [{"id": f"{n:032x}", "name": "日本語のグループ名" * 8} for n in range(10)]
     policies = {"queueBand": "interactive", "setBy": {"queueBand": [g["id"] for g in groups]}}
     added = oidc.capped_group_claims(groups, policies, CAP)
@@ -155,8 +156,66 @@ def test_the_cap_is_measured_in_bytes_not_characters() -> None:
     assert added["eugene_policies"]["setBy"]["queueBand"] == [
         g["id"] for g in added["eugene_groups"]
     ]
-    size = len(json.dumps(added, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-    assert size <= CAP
+    assert len(json.dumps(added, separators=(",", ":")).encode("ascii")) <= CAP
     # Under the cap nothing is cut and no flag is added.
     small = oidc.capped_group_claims(groups[:1], {}, CAP)
     assert small == {"eugene_groups": groups[:1], "eugene_policies": {}}
+
+
+def _signed_claims_bytes(token: str) -> int:
+    """The group claims' bytes as the signed token carries them, in the payload's own JSON
+    (PyJWT escapes non-ASCII), never re-encoded some other way."""
+    import base64
+
+    payload = token.split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    kept = {
+        k: claims[k]
+        for k in ("eugene_groups", "eugene_policies", "eugene_groups_truncated")
+        if k in claims
+    }
+    return len(json.dumps(kept, separators=(",", ":")).encode("ascii"))
+
+
+def test_the_cap_holds_for_the_bytes_signed_even_with_emoji(active_client: TestClient) -> None:
+    """Review blocker 1: a name outside the Basic Multilingual Plane is escaped by the signer
+    (12 bytes for one emoji), so the cap must count what is signed, not UTF-8."""
+    c = active_client
+    made = _client(c)
+    app = made["client"]["clientId"]
+    emoji = chr(0x1F600)
+    groups = [_group(c, f"{n:02d}" + emoji * 65, apps=[app]) for n in range(64)]
+    person = c.post(
+        "/v1/people", json={"name": "Em", "password": FIRST, "groups": [g["id"] for g in groups]}
+    )
+    assert person.status_code == 201, person.text
+    issued = _tokens(c, made, name="Em", password=FIRST)
+    claims = _id_claims(issued)
+    assert claims["eugene_groups_truncated"] is True
+    assert _signed_claims_bytes(issued["id_token"]) <= CAP
+    assert len(issued["id_token"]) < 3500
+    assert len(_userinfo(c, issued)["eugene_groups"]) == 64
+
+
+def test_a_wrong_secret_is_tried_five_times_a_minute_at_most(active_client: TestClient) -> None:
+    """Review should-fix 4: guessing an app's secret at `/oidc/groups` is bounded per caller."""
+    c = active_client
+    app = _client(c)
+    bare = TestClient(c.app)
+    for _ in range(5):
+        wrong = bare.get("/oidc/groups", auth=(app["client"]["clientId"], "wrong"))
+        assert wrong.status_code == 401
+    limited = bare.get("/oidc/groups", auth=(app["client"]["clientId"], "wrong"))
+    assert limited.status_code == 429 and limited.headers.get("retry-after")
+    assert limited.json()["error"] == "slow_down"
+    # The right secret from the same caller waits too, as a sign-in does.
+    assert _groups(c, app).status_code == 429
+
+
+def test_an_app_reads_its_groups_sixty_times_a_minute_at_most(active_client: TestClient) -> None:
+    c = active_client
+    app = _client(c)
+    for _ in range(60):
+        assert _groups(c, app).status_code == 200
+    limited = _groups(c, app)
+    assert limited.status_code == 429 and limited.headers.get("retry-after")

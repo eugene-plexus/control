@@ -263,7 +263,10 @@ ID_TOKEN_GROUP_BYTES = 1024
 
 
 def _json_bytes(value: Any) -> int:
-    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    """The bytes `value` takes in a signed token's payload: compact JSON with non-ASCII
+    escaped, as PyJWT writes it (`json.dumps` with its default `ensure_ascii`). Counting UTF-8
+    instead undercounts a name outside the Basic Multilingual Plane sixfold (row 70c review)."""
+    return len(json.dumps(value, separators=(",", ":")).encode("ascii"))
 
 
 def capped_group_claims(
@@ -274,7 +277,7 @@ def capped_group_claims(
     Past the cap: the groups that fit, from the start of the name-ordered list; every
     policy value; in `setBy`, only the groups listed; and `eugene_groups_truncated: true`,
     so an app that needs them all reads `/oidc/userinfo`. Everything this adds to the
-    token, the flag included, fits in `cap` (compact JSON, UTF-8)."""
+    token, the flag included, fits in `cap` (as signed: `_json_bytes`)."""
     whole = {"eugene_groups": groups, "eugene_policies": policies}
     if _json_bytes(whole) <= cap:
         return whole
