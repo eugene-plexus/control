@@ -789,3 +789,30 @@ async def subjects(request: Request) -> JSONResponse:
     for sub in dict.fromkeys(asked):
         (known if sub == OPERATOR_NAME or sub in people else unknown).append(sub)
     return JSONResponse({"known": known, "unknown": unknown}, headers=_NO_STORE)
+
+
+@router.get("/oidc/groups", operation_id="oidcGroups")
+async def groups(request: Request) -> JSONResponse:
+    """The permission groups that give the calling app, as `{id, name}` (row 70c).
+
+    Workbench's owner attaches a memory server to a group before any member signs in, so
+    the app needs the list without a member's claims. It needs the app's own secret, and
+    says nothing of who is in a group: a person's groups come only in their own sign-in."""
+    client = _client_auth(request)
+    if client is None:
+        return _oauth_error(401, "invalid_client", "Client authentication failed.")
+    machine = request.app.state.machine
+    if not machine.is_active:
+        return _oauth_error(
+            503,
+            "temporarily_unavailable",
+            "This control root is a standby; ask the active one.",
+        )
+    client_id = client["clientId"]
+    given = [
+        {"id": g["id"], "name": g["name"]}
+        for g in machine.state.permission_groups.values()
+        if g["apps"] is None or client_id in g["apps"]
+    ]
+    given.sort(key=lambda g: (g["name"].casefold(), g["id"]))
+    return JSONResponse({"groups": given}, headers=_NO_STORE)

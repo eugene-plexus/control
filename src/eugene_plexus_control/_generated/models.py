@@ -3530,6 +3530,24 @@ class OidcSubjectsResponse(BaseModel):
     )
 
 
+class OidcGroup(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(..., max_length=80, min_length=1)
+
+
+class OidcGroupsResponse(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    groups: list[OidcGroup] = Field(
+        ...,
+        description='The permission groups that give the calling app, sorted by name.',
+    )
+
+
 class PromoteRequest(BaseModel):
     passphrase: SecretStr = Field(
         ...,
