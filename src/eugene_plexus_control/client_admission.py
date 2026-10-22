@@ -174,9 +174,9 @@ def lineage_of(key: dict[str, Any] | None, key_id: str) -> str:
 def retired(key: dict[str, Any] | None) -> bool:
     """True once a replaced key's overlap has ended."""
     retires = (key or {}).get("retiresAt")
-    if not isinstance(retires, str):
-        return False
-    return datetime.fromisoformat(retires.replace("Z", "+00:00")).timestamp() <= time.time()
+    if isinstance(retires, str):
+        retires = datetime.fromisoformat(retires.replace("Z", "+00:00")).timestamp()
+    return isinstance(retires, int | float) and retires <= time.time()
 
 
 def decide(
