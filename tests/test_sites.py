@@ -594,6 +594,27 @@ def test_nothing_queued_for_one_enrollment_reaches_another(root: TestClient) -> 
     assert claim.status_code == 404
 
 
+def test_a_result_up_to_8_mib_is_accepted(root: TestClient) -> None:
+    c = root
+    a = ada_with_a_workspace(c)
+    ada_links(c, a)
+    with ThreadPoolExecutor() as pool:
+        pending = pool.submit(read, c, a, a.token)
+        ident, _ = deliver(c, a.keys, a.site, a.held.report())
+        value = {
+            "status": "done",
+            "response": {"jsonrpc": "2.0", "id": 3, "result": {"x": "y" * (8 * 1024 * 1024 - 200)}},
+        }
+        posted = c.post(
+            f"/v1/sites/operations/{ident}/result", headers=a.keys.bearer(a.site), json=value
+        )
+        if posted.status_code != 204:
+            answer(c, a.keys, a.site, ident, {"status": "failed", "message": "fixture rejected"})
+        result = pending.result(timeout=5)
+        assert posted.status_code == 204, posted.text
+        assert result.json()["response"] == value["response"]
+
+
 def test_a_result_larger_than_the_limit_is_refused(root: TestClient) -> None:
     c = root
     a = ada_with_a_workspace(c)
@@ -604,7 +625,7 @@ def test_a_result_larger_than_the_limit_is_refused(root: TestClient) -> None:
         big = c.post(
             f"/v1/sites/operations/{ident}/result",
             headers=a.keys.bearer(a.site),
-            json={"status": "done", "message": None, "result": {"x": "y" * 80_000}},
+            json={"status": "done", "message": None, "result": {"x": "y" * (8 * 1024 * 1024)}},
         )
         assert big.status_code == 413
         answer(c, a.keys, a.site, ident, {"status": "failed", "message": "too big"})
