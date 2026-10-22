@@ -229,6 +229,7 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
                 model=body.model,
                 person_token=body.personToken,
                 app_metadata_only=purpose in ("logs", "catalog"),
+                purpose=str(purpose or "inference"),
             )
         )
         return ClientAdmissionResult.model_validate(result)
