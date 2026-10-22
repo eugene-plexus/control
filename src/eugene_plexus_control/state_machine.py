@@ -183,7 +183,7 @@ class StateMachine:
         """Read, decide and commit under one lock, including policy edits."""
         from .applied import OP_PUT_CLIENT_ADMISSION
         from .client_admission import decide
-        from .person_access import check
+        from .person_access import check, queue_band
 
         with self._lock:
             if self._role != ROLE_ACTIVE:
@@ -220,7 +220,7 @@ class StateMachine:
                         "bucket": candidate["buckets"].get(key_id, {}),
                     },
                 )
-            return {**result, **identity}
+            return {**result, **identity, **queue_band(self._state, identity)}
 
     def first_available_index(self) -> int:
         with self._lock:

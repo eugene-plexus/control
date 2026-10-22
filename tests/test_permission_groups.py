@@ -165,3 +165,98 @@ def test_group_revocation_between_approval_and_code_exchange(active_client: Test
         },
     )
     assert response.status_code == 400 and response.json()["error"] == "invalid_grant"
+
+
+# --------------------------------------------------------------------------- #
+# row 70: policies per group
+# --------------------------------------------------------------------------- #
+
+UNSET = {"queueBand": None, "summaryContextPercent": None}
+
+
+def test_group_policies_are_set_kept_by_an_older_console_and_cleared(
+    active_client: TestClient,
+) -> None:
+    c = active_client
+    plain = group(c)
+    assert plain["policies"] == UNSET, "a root that knows policies always answers them"
+    assert "policies" not in c.app.state.machine.state.permission_groups[plain["id"]]
+    set_ = group(
+        c, name="Night shift", policies={"queueBand": "background", "summaryContextPercent": 70}
+    )
+    assert set_["policies"] == {"queueBand": "background", "summaryContextPercent": 70}
+    path = f"/v1/permission-groups/{set_['id']}"
+    # A console that predates policies sends none: the group keeps them.
+    kept = c.put(path, json={"name": "Night shift", "description": "Late"}).json()
+    assert kept["policies"] == set_["policies"] and kept["description"] == "Late"
+    # Policies are replaced whole: what is not sent is not set.
+    replaced = c.put(path, json={"name": "Night shift", "policies": {"summaryContextPercent": 90}})
+    assert replaced.json()["policies"] == {"queueBand": None, "summaryContextPercent": 90}
+    cleared = c.put(path, json={"name": "Night shift", "policies": UNSET}).json()
+    assert cleared["policies"] == UNSET
+    assert "policies" not in c.app.state.machine.state.permission_groups[set_["id"]]
+    listed = {g["id"]: g for g in c.get("/v1/permission-groups").json()["groups"]}
+    assert listed[set_["id"]]["policies"] == UNSET
+    for bad in (
+        {"queueBand": "urgent"},
+        {"summaryContextPercent": 49},
+        {"summaryContextPercent": 96},
+        {"routing": "fast"},
+    ):
+        refused = c.put(path, json={"name": "Night shift", "policies": bad})
+        assert refused.status_code == 422, bad
+
+
+def test_a_persons_policies_in_effect_name_the_groups_that_set_them(
+    active_client: TestClient,
+) -> None:
+    c = active_client
+    night = group(
+        c, name="Archive", policies={"queueBand": "background", "summaryContextPercent": 90}
+    )
+    desk = group(c, name="Desk", policies={"queueBand": "interactive", "summaryContextPercent": 70})
+    p = person(c, groups=[night["id"], desk["id"]])
+    assert p["policiesInEffect"] == {
+        "queueBand": "interactive",
+        "summaryContextPercent": 90,
+        "setBy": {"queueBand": [desk["id"]], "summaryContextPercent": [night["id"]]},
+    }
+    individual = c.patch(f"/v1/people/{p['id']}", json={"groups": None}).json()
+    assert individual["policiesInEffect"] == {}
+    c.patch(f"/v1/people/{p['id']}", json={"groups": [night["id"]]})
+    listed = c.get("/v1/people").json()["people"][0]
+    assert listed["policiesInEffect"]["queueBand"] == "background"
+    # Deleting the group takes its policies with it.
+    c.delete(f"/v1/permission-groups/{night['id']}")
+    assert c.get("/v1/people").json()["people"][0]["policiesInEffect"] == {}
+
+
+def test_a_group_administrator_sets_policies_and_a_member_cannot(
+    active_client: TestClient,
+) -> None:
+    from .test_administration import delegate
+
+    c = active_client
+    _, auth = delegate(c, manageGroups=True)
+    made = c.post(
+        "/v1/permission-groups",
+        headers=auth,
+        json={"name": "Batch", "policies": {"queueBand": "sheddable"}},
+    )
+    assert made.status_code == 201, made.text
+    assert made.json()["policies"]["queueBand"] == "sheddable"
+    _, people_only = delegate_people(c)
+    refused = c.put(
+        f"/v1/permission-groups/{made.json()['id']}",
+        headers=people_only,
+        json={"name": "Batch", "policies": {"queueBand": "interactive"}},
+    )
+    assert refused.status_code == 403
+
+
+def delegate_people(c: TestClient) -> tuple[dict[str, Any], dict[str, str]]:
+    p = person(c, name="Clerk")
+    c.put(f"/v1/people/{p['id']}/administration", json={"managePeople": True})
+    r = c.post("/v1/auth/administration/login", json={"name": "Clerk", "password": PASSWORD})
+    assert r.status_code == 200, r.text
+    return p, {"Authorization": "Bearer " + r.json()["sessionToken"]}

@@ -1084,18 +1084,18 @@ class ClientAdmissionRequest(BaseModel):
     )
 
 
-class ClientAdmissionResult(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    keyId: str
-    keyName: str
-    personId: str | None = Field(
-        None, description='Stable subject verified by the root, never caller supplied.'
-    )
-    appClientId: str | None = None
-    limits: ClientKeyLimits | None = None
-    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
+class QueueBand(StrEnum):
+    """
+    Which requests wait or are turned away first when the machines are
+    busy. From highest to lowest: `interactive` (a person waiting at a
+    chat), `background` (work nobody watches), `sheddable` (refused first
+    under load). With no policy the install's default is `interactive`.
+
+    """
+
+    interactive = 'interactive'
+    background = 'background'
+    sheddable = 'sheddable'
 
 
 class ClientKeyCreated(BaseModel):
@@ -3693,47 +3693,40 @@ class OwnerAccount(BaseModel):
     displayName: str
 
 
-class PermissionGroup(BaseModel):
+class GroupPolicies(BaseModel):
     """
-    A shared collection of app and job-site grants.
-    """
+    Policies a permission group sets for its members (row 70). Not set
+    is no policy: a person whose groups set none gets the install's
+    default. A person in several groups gets the most generous value of
+    each: the highest queue band, the larger percent.
 
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    id: str = Field(..., max_length=64, min_length=1)
-    name: str = Field(..., max_length=80, min_length=1)
-    description: str = Field(..., max_length=500)
-    apps: list[str] | None = Field(
-        ...,
-        description='Explicit app client IDs; null deliberately grants all apps.',
-        max_length=256,
-    )
-    permissions: list[PersonPermission] = Field(..., max_length=16)
-    createdAt: AwareDatetime
-    updatedAt: AwareDatetime
-
-
-class PermissionGroupWrite(BaseModel):
-    """
-    Complete replacement policy; omitted grants default to no access.
     """
 
     model_config = ConfigDict(
         extra='forbid',
     )
-    name: str = Field(..., max_length=80, min_length=1)
-    description: str | None = Field('', max_length=500)
-    apps: list[str] | None = Field([], max_length=256)
-    permissions: list[PersonPermission] | None = Field([], max_length=16)
+    queueBand: QueueBand | None = Field(
+        None,
+        description="Queue priority for the members' requests. The root returns it in the admission check of a verified person.",
+    )
+    summaryContextPercent: int | None = Field(
+        None,
+        description="The percent of a model's context at which Workbench starts summarising a long chat. With no policy, Workbench uses 80.",
+        ge=50,
+        le=95,
+    )
 
 
-class PermissionGroupList(BaseModel):
+class PoliciesSetBy(BaseModel):
     """
-    All permission groups in the central directory.
+    For each policy value in effect, the ids of the groups that set that value, sorted by group name.
     """
 
-    groups: list[PermissionGroup]
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    queueBand: list[str] | None = Field(None, max_length=64)
+    summaryContextPercent: list[str] | None = Field(None, max_length=64)
 
 
 class SitePersonLink(BaseModel):
@@ -4288,6 +4281,24 @@ class RootTls(BaseModel):
         description='The nodes name these keys were seen on, `https://host[:port]`.',
     )
     keys: list[RootTlsKey] = Field(..., max_length=8)
+
+
+class ClientAdmissionResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keyId: str
+    keyName: str
+    personId: str | None = Field(
+        None, description='Stable subject verified by the root, never caller supplied.'
+    )
+    appClientId: str | None = None
+    limits: ClientKeyLimits | None = None
+    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
+    queueBand: QueueBand | None = Field(
+        None,
+        description="The verified person's queue band from their permission groups\n(row 70): the highest band any of their groups sets. Present only\nwhen the root verified a person (`personId`) and one of their\ngroups sets a band. Absent for a key with no person, a release, or\na person whose groups set none: the key's own band, or the\ninstall's default, applies. Never taken from the caller.\n",
+    )
 
 
 class InputAudio(BaseModel):
@@ -4864,59 +4875,6 @@ class SnapshotPerson(BaseModel):
     passwordChangedAt: AwareDatetime
 
 
-class Person(BaseModel):
-    """
-    A stable account for apps. Explicit owner-granted administration may also
-    open directory management; it never grants owner or private-chat access.
-
-    """
-
-    administration: AdministrationGrants | None = None
-    groups: list[Group] | None = Field(
-        None,
-        description='Null or absent keeps individual access. A list uses only the union of these groups; an empty list grants no access. Individual app/permission settings are retained but inactive in group mode.',
-        max_length=64,
-    )
-    id: str = Field(..., description='Stable; the `sub` in their ID tokens.')
-    name: str = Field(
-        ..., description='What they sign in with. Unique, compared case-folded.'
-    )
-    displayName: str | None = None
-    email: str | None = Field(
-        None,
-        description='Optional, and unique compared case-folded. Given to an app that\nasks for the `email` scope, with `email_verified: false`: Eugene\nsends no mail and has proved nothing about it. Some apps (Open\nWebUI) identify people by it (C4).\n',
-    )
-    appsInEffect: list[str] | None = Field(
-        None,
-        description='Effective app grants, calculated from groups or individual access. Null means every app; an empty list means none.',
-    )
-    apps: list[str] | None = Field(
-        None,
-        description='The `clientId`s they may sign in to. Null is every app on the install.',
-    )
-    permissions: list[PersonPermission] | None = Field(
-        None,
-        description="Exactly these permissions (J77). Null is the install's defaults,\nthe root's settings `peopleMayAddJobSites` and\n`peopleMayUseJobSites`, so changing a default changes everyone\nleft on it.\n",
-        max_length=16,
-    )
-    permissionsInEffect: list[PersonPermission] | None = Field(
-        None,
-        description='Effective permissions from selected groups, or individual permissions/install defaults when groups is null.',
-    )
-    disabled: bool
-    createdAt: AwareDatetime
-    passwordChangedAt: AwareDatetime
-
-
-class PersonList(BaseModel):
-    owner: OwnerAccount | None = None
-    people: list[Person]
-    operatorName: str | None = Field(
-        None,
-        description='The name the owner signs in with, once the install has people.',
-    )
-
-
 class OidcSubjectsRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -4938,6 +4896,74 @@ class RuntimePlacementList(BaseModel):
         None,
         description='Nodes that could not be asked. A dashboard showing fewer\nruntimes than exist, with no indication why, is worse than\none that names the host it could not reach.\n',
     )
+
+
+class PermissionGroup(BaseModel):
+    """
+    A shared collection of app and job-site grants.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(..., max_length=80, min_length=1)
+    description: str = Field(..., max_length=500)
+    apps: list[str] | None = Field(
+        ...,
+        description='Explicit app client IDs; null deliberately grants all apps.',
+        max_length=256,
+    )
+    permissions: list[PersonPermission] = Field(..., max_length=16)
+    policies: GroupPolicies | None = Field(
+        None,
+        description='What the group sets for its members (row 70). A root that knows\npolicies always answers this object, with `null` for each policy\nnot set; an older root leaves it out, and a console hides its\nPolicies section then. In the replicated log and the snapshot it\nis kept only when a policy is set, holding only the policies set.\n',
+    )
+    createdAt: AwareDatetime
+    updatedAt: AwareDatetime
+
+
+class PermissionGroupWrite(BaseModel):
+    """
+    Complete replacement policy; omitted grants default to no access.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=80, min_length=1)
+    description: str | None = Field('', max_length=500)
+    apps: list[str] | None = Field([], max_length=256)
+    permissions: list[PersonPermission] | None = Field([], max_length=16)
+    policies: GroupPolicies | None = Field(
+        None,
+        description="The group's policies, replaced whole: a `null` or absent policy\ninside is not set. Omitted from a replace, the group keeps its\ncurrent policies, so a console that predates policies never\nclears them. Omitted from a create, the group sets none. An\nolder root refuses this field (`additionalProperties: false`).\n",
+    )
+
+
+class PoliciesInEffect(BaseModel):
+    """
+    The policies that apply to a person now (row 70), from the groups
+    they are in: the most generous value of each. An absent value is no
+    policy. Individual access (`groups` null) sets none. The same object
+    is the `eugene_policies` sign-in claim.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    queueBand: QueueBand | None = None
+    summaryContextPercent: int | None = Field(None, ge=50, le=95)
+    setBy: PoliciesSetBy | None = None
+
+
+class PermissionGroupList(BaseModel):
+    """
+    All permission groups in the central directory.
+    """
+
+    groups: list[PermissionGroup]
 
 
 class SiteAccess(BaseModel):
@@ -5634,6 +5660,63 @@ class Snapshot(BaseModel):
     revokedSignIns: list[RevokedSession] | None = Field(
         None,
         description='Sign-ins revoked at `/oidc/revoke` and not yet expired, by their `jti`.',
+    )
+
+
+class Person(BaseModel):
+    """
+    A stable account for apps. Explicit owner-granted administration may also
+    open directory management; it never grants owner or private-chat access.
+
+    """
+
+    administration: AdministrationGrants | None = None
+    groups: list[Group] | None = Field(
+        None,
+        description='Null or absent keeps individual access. A list uses only the union of these groups; an empty list grants no access. Individual app/permission settings are retained but inactive in group mode.',
+        max_length=64,
+    )
+    id: str = Field(..., description='Stable; the `sub` in their ID tokens.')
+    name: str = Field(
+        ..., description='What they sign in with. Unique, compared case-folded.'
+    )
+    displayName: str | None = None
+    email: str | None = Field(
+        None,
+        description='Optional, and unique compared case-folded. Given to an app that\nasks for the `email` scope, with `email_verified: false`: Eugene\nsends no mail and has proved nothing about it. Some apps (Open\nWebUI) identify people by it (C4).\n',
+    )
+    appsInEffect: list[str] | None = Field(
+        None,
+        description='Effective app grants, calculated from groups or individual access. Null means every app; an empty list means none.',
+    )
+    apps: list[str] | None = Field(
+        None,
+        description='The `clientId`s they may sign in to. Null is every app on the install.',
+    )
+    permissions: list[PersonPermission] | None = Field(
+        None,
+        description="Exactly these permissions (J77). Null is the install's defaults,\nthe root's settings `peopleMayAddJobSites` and\n`peopleMayUseJobSites`, so changing a default changes everyone\nleft on it.\n",
+        max_length=16,
+    )
+    permissionsInEffect: list[PersonPermission] | None = Field(
+        None,
+        description='Effective permissions from selected groups, or individual permissions/install defaults when groups is null.',
+    )
+    policiesInEffect: PoliciesInEffect | None = Field(
+        None,
+        description='The group policies that apply to them now, and which groups set each. Absent from an older root.',
+    )
+    disabled: bool
+    createdAt: AwareDatetime
+    passwordChangedAt: AwareDatetime
+
+
+class PersonList(BaseModel):
+    owner: OwnerAccount | None = None
+    people: list[Person]
+    operatorName: str | None = Field(
+        None,
+        description='The name the owner signs in with, once the install has people.',
     )
 
 

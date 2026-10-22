@@ -704,7 +704,14 @@ async def userinfo(request: Request) -> JSONResponse:
             headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
         )
     scope = str(claims.get("scope") or "openid")
-    return JSONResponse({"sub": subject.sub, **subject.claims(scope)}, headers=_NO_STORE)
+    return JSONResponse(
+        {
+            "sub": subject.sub,
+            **subject.claims(scope),
+            **oidc.group_claims(machine.state, subject.sub),
+        },
+        headers=_NO_STORE,
+    )
 
 
 @router.post("/oidc/revoke", operation_id="oidcRevoke")

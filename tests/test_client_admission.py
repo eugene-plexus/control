@@ -329,3 +329,66 @@ def test_a_search_names_no_model_and_an_inference_still_does(active_client):
     assert search_call(c, key, "acquire", "s1").status_code == 200
     # One request identifier is one kind of work.
     assert call(c, key, "acquire", "s1").status_code == 409
+
+
+# --------------------------------------------------------------------------- #
+# row 70: a verified person's queue band from their groups
+# --------------------------------------------------------------------------- #
+
+
+def _band_group(client, name, band):
+    from tests.test_permission_groups import group
+
+    made = group(client, name=name, apps=None, policies={"queueBand": band})
+    assert made["policies"]["queueBand"] == band
+    return made
+
+
+def test_a_verified_person_carries_their_groups_band(active_client):
+    from tests.test_person_access import call as person_call
+    from tests.test_person_access import setup
+
+    c = active_client
+    _, g, p, signed, key = setup(c)
+    proof = signed["access_token"]
+    # In a group that sets no band: no band, so the key's own or the default applies.
+    assert "queueBand" not in person_call(c, key, proof).json()
+    # Named to sort first, so taking the first group's band would be caught.
+    night = _band_group(c, "Archive", "background")
+    c.patch(f"/v1/people/{p['id']}", json={"groups": [g["id"], night["id"]]})
+    for action in ("check", "acquire", "renew"):
+        answer = person_call(c, key, proof, action)
+        assert answer.status_code == 200, answer.text
+        assert answer.json()["queueBand"] == "background", action
+    # The most generous band of all their groups, read now, not at sign-in.
+    desk = _band_group(c, "Desk", "interactive")
+    c.patch(f"/v1/people/{p['id']}", json={"groups": [g["id"], night["id"], desk["id"]]})
+    assert person_call(c, key, proof).json()["queueBand"] == "interactive"
+    # A band change is not a permission change: the lease renews.
+    assert person_call(c, key, proof, "renew").status_code == 200
+    assert "queueBand" not in person_call(c, key, action="release").json()
+    # The caller cannot name its own band.
+    forged = c.post(
+        "/v1/auth/client-keys/admission",
+        json={
+            "keyId": key,
+            "requestId": "forged",
+            "action": "check",
+            "personToken": proof,
+            "queueBand": "interactive",
+        },
+    )
+    assert forged.status_code == 422
+
+
+def test_a_key_without_a_person_carries_no_band(active_client):
+    from tests.test_permission_groups import person
+
+    c = active_client
+    night = _band_group(c, "Night shift", "background")
+    person(c, groups=[night["id"]])
+    key = mint(c)["key"]["id"]
+    for action in ("check", "acquire", "renew", "release"):
+        answer = call(c, key, action)
+        assert answer.status_code == 200, answer.text
+        assert "queueBand" not in answer.json() and "personId" not in answer.json()

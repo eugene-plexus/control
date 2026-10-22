@@ -83,6 +83,7 @@ def _view(machine: StateMachine, record: dict[str, Any]) -> Person:
             **{k: v for k, v in record.items() if k != "passwordVerifier"},
             "permissionsInEffect": permissions.in_effect(machine.state, record),
             "appsInEffect": permissions.apps_in_effect(machine.state, record),
+            "policiesInEffect": permissions.effective_policies(machine.state, record),
         }
     )
 
@@ -164,6 +165,30 @@ def _group(machine: StateMachine, group_id: str) -> dict[str, Any]:
     return group
 
 
+def _group_view(record: dict[str, Any]) -> PermissionGroup:
+    """A group as the API answers it: `policies` always present, with null
+    for each policy not set, so a console can tell this root knows them."""
+    kept = record.get("policies") or {}
+    return PermissionGroup.model_validate(
+        {**record, "policies": {policy: kept.get(policy) for policy in permissions.GROUP_POLICIES}}
+    )
+
+
+def _group_policies(body: PermissionGroupWrite, existing: dict[str, Any] | None) -> dict[str, Any]:
+    """The policies the group will set: only those set, as the log keeps them.
+
+    Omitted from a replace keeps the group's current policies, so a console
+    that predates them never clears them; omitted from a create sets none.
+    """
+    if "policies" not in body.model_fields_set:
+        kept: dict[str, Any] = (existing or {}).get("policies") or {}
+        return dict(kept)
+    if body.policies is None:
+        return {}
+    chosen = body.policies.model_dump(mode="json", exclude_none=True)
+    return {policy: chosen[policy] for policy in permissions.GROUP_POLICIES if policy in chosen}
+
+
 def _group_write(
     machine: StateMachine, body: PermissionGroupWrite, group_id: str
 ) -> dict[str, Any]:
@@ -177,7 +202,7 @@ def _group_write(
         raise problem(409, "Group name taken", "Another group already has that name.")
     when = oidc.utcnow_iso()
     existing = machine.state.permission_groups.get(group_id)
-    return {
+    record: dict[str, Any] = {
         "id": group_id,
         "name": name,
         "description": (body.description or "").strip(),
@@ -186,13 +211,19 @@ def _group_write(
         "createdAt": existing["createdAt"] if existing else when,
         "updatedAt": when,
     }
+    policies = _group_policies(body, existing)
+    if policies:
+        # Kept only when a policy is set: a group with none writes the same
+        # record a root before row 70 wrote, which an older standby applies.
+        record["policies"] = policies
+    return record
 
 
 @router.get("/v1/permission-groups", response_model=PermissionGroupList)
 async def list_groups(request: Request) -> PermissionGroupList:
     machine = _active(request)
     groups = sorted(machine.state.permission_groups.values(), key=lambda g: g["name"].casefold())
-    return PermissionGroupList(groups=[PermissionGroup.model_validate(g) for g in groups])
+    return PermissionGroupList(groups=[_group_view(g) for g in groups])
 
 
 @router.post("/v1/permission-groups", response_model=PermissionGroup, status_code=201)
@@ -204,7 +235,7 @@ async def create_group(
     record = _group_write(machine, body, uuid.uuid4().hex)
     machine.append(OP_PUT_PERMISSION_GROUP, {"group": record}, actor=admin.claims.sub)
     admin.audit("create-group", record["id"])
-    return PermissionGroup.model_validate(record)
+    return _group_view(record)
 
 
 @router.put("/v1/permission-groups/{group_id}", response_model=PermissionGroup)
@@ -217,7 +248,7 @@ async def replace_group(
     record = _group_write(machine, body, group_id)
     machine.append(OP_PUT_PERMISSION_GROUP, {"group": record}, actor=admin.claims.sub)
     admin.audit("edit-group", group_id)
-    return PermissionGroup.model_validate(record)
+    return _group_view(record)
 
 
 @router.delete("/v1/permission-groups/{group_id}", status_code=204)

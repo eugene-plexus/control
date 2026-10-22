@@ -758,3 +758,60 @@ def test_the_log_carries_an_email_and_refuses_a_bad_one() -> None:
     assert applied._person_record(dict(record))["email"] == "ada@example.org"
     with pytest.raises(applied.ApplyError, match="email"):
         applied._person_record({**record, "email": 7})
+
+
+def test_the_id_token_names_the_persons_groups_and_policies(active_client: TestClient) -> None:
+    """Row 70: `eugene_groups` and `eugene_policies`, from the root's state
+    at each sign-in, refresh and userinfo call; never from the app."""
+    c = active_client
+    made = _client(c)
+    app = made["client"]["clientId"]
+    night = c.post(
+        "/v1/permission-groups",
+        json={
+            "name": "Archive",
+            "apps": [app],
+            "policies": {"queueBand": "background", "summaryContextPercent": 70},
+        },
+    ).json()
+    desk = c.post(
+        "/v1/permission-groups",
+        json={
+            "name": "Desk",
+            "apps": [app],
+            "policies": {"queueBand": "interactive", "summaryContextPercent": 85},
+        },
+    ).json()
+    bo = c.post(
+        "/v1/people",
+        json={"name": "Bo", "password": FIRST, "groups": [night["id"], desk["id"]]},
+    ).json()
+    issued = _tokens(c, made, name="Bo", password=FIRST)
+    for claims in (_id_claims(issued), _userinfo(c, issued)):
+        assert claims["eugene_groups"] == [
+            {"id": night["id"], "name": "Archive"},
+            {"id": desk["id"], "name": "Desk"},
+        ]
+        assert claims["eugene_policies"] == {
+            "queueBand": "interactive",
+            "summaryContextPercent": 85,
+            "setBy": {"queueBand": [desk["id"]], "summaryContextPercent": [desk["id"]]},
+        }
+    # Taken out of Desk: the next refresh and userinfo say so.
+    c.patch(f"/v1/people/{bo['id']}", json={"groups": [night["id"]]})
+    refreshed = _refresh(c, made, issued["refresh_token"])
+    assert refreshed.status_code == 200, refreshed.text
+    for claims in (_id_claims(refreshed.json()), _userinfo(c, issued)):
+        assert claims["eugene_groups"] == [{"id": night["id"], "name": "Archive"}]
+        assert claims["eugene_policies"] == {
+            "queueBand": "background",
+            "summaryContextPercent": 70,
+            "setBy": {"queueBand": [night["id"]], "summaryContextPercent": [night["id"]]},
+        }
+    # Individual access and Eugene's owner: no groups, no policy.
+    c.patch(f"/v1/people/{bo['id']}", json={"groups": None})
+    plain = _refresh(c, made, issued["refresh_token"]).json()
+    assert _id_claims(plain)["eugene_groups"] == []
+    assert _id_claims(plain)["eugene_policies"] == {}
+    owner = _tokens(c, made, name="operator")
+    assert _id_claims(owner)["eugene_groups"] == [] and _id_claims(owner)["eugene_policies"] == {}
