@@ -3278,6 +3278,8 @@ class LogOp(StrEnum):
     putClientKey = 'putClientKey'
     revokeClientKey = 'revokeClientKey'
     setClientKeyLimits = 'setClientKeyLimits'
+    rotateClientKey = 'rotateClientKey'
+    touchClientKey = 'touchClientKey'
     putClientAdmission = 'putClientAdmission'
     rotateSigningKey = 'rotateSigningKey'
     revokeSession = 'revokeSession'
