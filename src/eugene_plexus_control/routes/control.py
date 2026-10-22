@@ -570,7 +570,7 @@ def _heard_from_standby(
             "at": datetime.now(UTC),
             "seen": time.perf_counter(),
             "version": version,
-            "matches": matches if version == __version__ else None,
+            "matches": matches,
         }
 
 
