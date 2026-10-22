@@ -243,8 +243,8 @@ class DraftWith(StrEnum):
       the others on the node (S1).
     * `mtpHead` — the model's own MTP head (`--spec-type draft-mtp`).
     * `companion` — a companion file (`draftModelPath`) with
-      `--spec-draft-model`, as `draft-mtp` or `draft-simple` by the
-      file's own tensors.
+      `--spec-draft-model`, by the file's own header: `draft-mtp`,
+      `draft-simple`, `draft-dflash`, `draft-dspark` or `draft-eagle3`.
 
     """
 
@@ -1997,6 +1997,13 @@ class ComponentStatus(StrEnum):
     exited = 'exited'
     crashed = 'crashed'
     unreachable = 'unreachable'
+
+
+class SignedMachineList(BaseModel):
+    jws: str = Field(
+        ...,
+        description='A JWS compact serialization with header\n`{"alg": "EdDSA", "typ": "ep-machines+jwt"}` whose payload is a\n`MachineList` (`control.yaml`), signed with the root identity\nthis node pinned at enrolment.\n',
+    )
 
 
 class LocalStandby(BaseModel):
@@ -5963,6 +5970,11 @@ class NodeIdentity(BaseModel):
     )
     controlUrl: AnyUrl | None = Field(
         None, description='The control root this node answers to.'
+    )
+    controlUrlEpoch: int | None = Field(
+        None,
+        description='The epoch `controlUrl` came with (row 4): the epoch at\nenrolment, or of the promoted root this node moved to. A node\nmoves only for a signed machine list at a higher epoch. Set to\nthe epoch held when a node updated to row 4 first starts, so an\nupdate never moves a node. Absent until enrolled.\n',
+        ge=0,
     )
     standby: LocalStandby | None = None
     hostsControl: bool | None = Field(
