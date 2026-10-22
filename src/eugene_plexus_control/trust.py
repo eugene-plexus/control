@@ -190,12 +190,16 @@ class TrustPublisher:
                 await task
 
 
-async def push(app: Any, bundle: tokens.TrustBundle) -> dict[str, bool]:
-    """POST the bundle to every node with an address. Returns who took it.
+async def push(
+    app: Any, bundle: tokens.TrustBundle, *, names: list[str] | None = None
+) -> dict[str, bool]:
+    """POST the bundle to every node with an address (`names` limits it).
+    Returns who took it.
 
     **No bearer.** The body is the credential: a JWS signed by the key
     every node pinned. A node that is down takes the bundle when it next
-    pulls, so nothing here retries.
+    pulls, so nothing here retries; a root that sees a node reachable and
+    behind on its epoch sends it again (row 4, `app.push_to_nodes_behind`).
     """
     machine = app.state.machine
     client = app.state.nodes_client
@@ -209,7 +213,11 @@ async def push(app: Any, bundle: tokens.TrustBundle) -> dict[str, bool]:
             log.info("node %s did not take trust bundle %d yet: %s", name, bundle.version, exc)
             results[name] = False
 
-    targets = [(r.name, r.url) for r in machine.state.nodes.values() if r.url]
+    targets = [
+        (r.name, r.url)
+        for r in machine.state.nodes.values()
+        if r.url and (names is None or r.name in names)
+    ]
     await asyncio.gather(*(one(name, str(url)) for name, url in targets))
     acks: dict[str, int] = getattr(app.state, "trust_acks", {})
     for name, took in results.items():

@@ -57,9 +57,12 @@ def client_plain(config: dict[str, Any]) -> str:
     return "off" if config.get(CLIENT_PLAIN_KEY) == "off" else "on"
 
 
-def content(state: Any, control_pins: list[str]) -> dict[str, Any]:
-    """What the list says, before it is dated and signed."""
-    return {
+def content(
+    state: Any, control_pins: list[str], *, control: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """What the list says, before it is dated and signed. `control` is
+    `control_block`'s answer (row 4); without it the list names no root."""
+    signed: dict[str, Any] = {
         "required": required(state.config),
         "clientPlainHttp": client_plain(state.config),
         # Row 3: this root records a next key (`tlsNextPin`), so a node may
@@ -76,6 +79,119 @@ def content(state: Any, control_pins: list[str]) -> dict[str, Any]:
             for record in sorted(state.nodes.values(), key=lambda r: r.name)
         ],
     }
+    if control is not None:
+        signed["control"] = control
+    return signed
+
+
+# --------------------------------------------------------------------------- #
+# Row 4: where this root is, for the nodes that must follow a promotion
+# --------------------------------------------------------------------------- #
+
+#: The door file is read again at most this often (it is a few hundred bytes).
+_DOOR_RECHECK_SECONDS = 1.0
+_DOOR_URLS: dict[str, tuple[float, str | None]] = {}
+
+
+def door_url(path: str | None) -> str | None:
+    """The machine port's URL in the door file this root's agent writes
+    (`{"pins": [...], "url": ...}`, row 3), or None when it names none or
+    cannot be read."""
+    if not path:
+        return None
+    now = time.perf_counter()
+    cached = _DOOR_URLS.get(path)
+    if cached is not None and now - cached[0] < _DOOR_RECHECK_SECONDS:
+        return cached[1]
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+        url = document.get("url") if isinstance(document, dict) else None
+        found = url if isinstance(url, str) and url.strip() else None
+    except (OSError, ValueError):
+        found = None
+    _DOOR_URLS[path] = (now, found)
+    return found
+
+
+def _plain(url: str | None) -> str | None:
+    """`http://host:port` of a machine port's `https://host:port`: the form
+    a node's machine table carries to TLS under `/control`."""
+    origin = _origin(url)
+    if origin is None:
+        return None
+    return "http://" + origin.split("://", 1)[1]
+
+
+def control_block(
+    state: Any, *, node: str | None, door_file: str | None, nodes_origin: str | None
+) -> dict[str, Any]:
+    """`MachineList.control`: this root's epoch, its node and where nodes
+    reach it (row 4).
+
+    The address is this machine's port in its plain form, from the door
+    file its agent rewrites while it runs, else from the machine port this
+    root's own node announced, else this root's nodes name. A promoted
+    standby signs its first list before its agent has written a door file
+    for it, so its own node record is what names it then."""
+    url = _plain(door_url(door_file))
+    if url is None and node is not None:
+        record = state.nodes.get(node)
+        url = _plain(getattr(record, "machineUrl", None))
+    if url is None and nodes_origin:
+        url = nodes_origin.strip().rstrip("/") or None
+    return {"epoch": int(state.epoch), "node": node, "url": url}
+
+
+def signed(app: Any) -> str | None:
+    """This root's current list, signed if it changed: what
+    `GET /v1/trust/machines` serves and what a promotion pushes."""
+    from .routes.nodes import machine_pins
+
+    settings = app.state.settings
+    machine = app.state.machine
+    publisher: MachineListPublisher = app.state.machine_list
+    return publisher.current(
+        machine.state,
+        machine_pins(settings),
+        app.state.auth_state.control_private_key,
+        control=control_block(
+            machine.state,
+            node=getattr(app.state, "node_name", None),
+            door_file=getattr(settings, "machine_door_file", None),
+            nodes_origin=getattr(settings, "nodes_origin", None),
+        ),
+    )
+
+
+async def push(app: Any, jws: str, *, names: list[str] | None = None) -> dict[str, bool]:
+    """POST the list to every node with an address (`names` limits it).
+
+    **No bearer**: the list is signed with the identity every node pinned,
+    the mirror of the trust bundle's push (`trust.push`). A node that is
+    down takes it from the next root it hears, or by its own pull."""
+    import asyncio
+
+    import httpx
+
+    machine = app.state.machine
+    client = app.state.nodes_client
+    results: dict[str, bool] = {}
+
+    async def one(name: str, url: str) -> None:
+        try:
+            await client.post_json(url, "/v1/node/machine-list", None, {"jws": jws})
+            results[name] = True
+        except (httpx.HTTPError, ValueError) as exc:
+            log.info("node %s did not take the machine list yet: %s", name, exc)
+            results[name] = False
+
+    targets = [
+        (record.name, str(record.url))
+        for record in machine.state.nodes.values()
+        if record.url and (names is None or record.name in names)
+    ]
+    await asyncio.gather(*(one(name, url) for name, url in targets))
+    return results
 
 
 def _origin(url: str | None) -> str | None:
@@ -335,12 +451,17 @@ class MachineListPublisher:
             return self._first_signed.get(name)
 
     def current(
-        self, state: Any, control_pins: list[str], control_private_key: str | None
+        self,
+        state: Any,
+        control_pins: list[str],
+        control_private_key: str | None,
+        *,
+        control: dict[str, Any] | None = None,
     ) -> str | None:
         """The list as a JWS: re-signed when its content changed and this root
         holds its identity key; the last one signed otherwise; None when it
         has never signed one."""
-        wanted = content(state, control_pins)
+        wanted = content(state, control_pins, control=control)
         with self._lock:
             if wanted == self._content and self.jws is not None:
                 return self.jws

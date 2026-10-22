@@ -105,6 +105,8 @@ class StateMachine:
         self._compact_threshold = compact_threshold
         self._entries_since_snapshot = 0
         self._dropped_tail_lines = 0
+        #: `applied_digest`'s last answer, for the state object it hashed.
+        self._digest: tuple[AppliedState, str] | None = None
 
     # ----- lifecycle --------------------------------------------------
 
@@ -249,6 +251,25 @@ class StateMachine:
     def canonical(self) -> bytes:
         with self._lock:
             return canonical_bytes(self._state)
+
+    def applied_digest(self) -> tuple[int, str]:
+        """`(index, SHA-256 hex of canonical_bytes)` of the state now
+        (`LogPage.appliedDigest`, row 4).
+
+        Kept for the state object it was computed from, not for the index:
+        a snapshot installed at the index already held replaces the state
+        and keeps the index, and that is exactly when a standby's digest
+        changes."""
+        import hashlib
+
+        with self._lock:
+            state = self._state
+            cached = self._digest
+            if cached is not None and cached[0] is state:
+                return state.index, cached[1]
+            digest = hashlib.sha256(canonical_bytes(state)).hexdigest()
+            self._digest = (state, digest)
+            return state.index, digest
 
     # ----- the write path ---------------------------------------------
 

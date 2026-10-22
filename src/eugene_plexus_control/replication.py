@@ -45,7 +45,7 @@ from typing import Any
 
 import httpx
 
-from . import tokens
+from . import __version__, tokens
 from ._http import internal_client
 from .applied import ApplyError
 from .state_machine import StateMachine
@@ -59,6 +59,16 @@ PAGE_LIMIT = 500
 
 #: A token with less than this left is traded again before it is sent.
 TOKEN_REFRESH_MARGIN_SECONDS = 120
+
+#: Row 4: a copy that differs from the root's is replaced at most this often.
+#: A copy that still differs after a fresh snapshot says so (`matches`)
+#: instead of taking one every two seconds.
+RESNAPSHOT_EVERY_SECONDS = 600.0
+
+#: Row 4: the headers a standby and the root say their versions and the
+#: copy's digest in (`control.yaml`, `readLog`).
+VERSION_HEADER = "Eugene-Plexus-Version"
+COPY_DIGEST_HEADER = "Eugene-Plexus-Copy-Digest"
 
 
 class ReplicationRefused(Exception):
@@ -145,6 +155,10 @@ class FollowerStatus:
     active_applied_index: int | None = None
     local_index: int = 0
     last_error: str | None = None
+    matches: bool | None = None
+    """Row 4: whether this copy was the root's, byte for byte, at the last
+    pull made at the root's index on the root's version. None until one
+    was."""
 
     @property
     def lag_entries(self) -> int | None:
@@ -184,6 +198,8 @@ class Follower:
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self.status = FollowerStatus(active_url=active_url)
+        #: When this copy last replaced itself because it differed (row 4).
+        self._resnapshot_at: float | None = None
 
     # ----- lifecycle --------------------------------------------------
 
@@ -256,7 +272,7 @@ class Follower:
 
         after = self._machine.state.index
         try:
-            page = await self._get_page(url, after)
+            page, root_version = await self._get_page(url, after)
         except _Compacted:
             log.info(
                 "standby at index %d fell behind the active root's compaction; "
@@ -295,12 +311,44 @@ class Follower:
                 applied,
                 self._machine.state.index,
             )
+        await self._compare(url, page, root_version)
 
-    async def _get_page(self, url: str, after: int) -> dict[str, Any]:
+    async def _compare(self, url: str, page: dict[str, Any], root_version: str | None) -> None:
+        """Row 4 (LT-OLDSB): is this copy the root's, byte for byte?
+
+        Only when caught up (this copy is at the page's `appliedIndex`) and
+        on the root's own version: two versions may write one state in
+        different bytes, and comparing them would replace the copy at every
+        rolling update. A copy that differs is replaced by a fresh snapshot,
+        at most once in `RESNAPSHOT_EVERY_SECONDS`; one that still differs
+        after that says so (`matches`), and the root hears it from the
+        digest this copy sends on its next pull."""
+        digest = page.get("appliedDigest")
+        index, own = self._machine.applied_digest()
+        if (
+            not isinstance(digest, str)
+            or root_version != __version__
+            or page.get("appliedIndex") != index
+        ):
+            return
+        if own == digest:
+            self.status.matches = True
+            return
+        now = time.perf_counter()
+        if self._resnapshot_at is not None and now - self._resnapshot_at < RESNAPSHOT_EVERY_SECONDS:
+            self.status.matches = False
+            return
+        self._resnapshot_at = now
+        log.warning("this copy differs from the root at index %d; taking a fresh snapshot", index)
+        await self._install_snapshot(url)
+
+    async def _get_page(self, url: str, after: int) -> tuple[dict[str, Any], str | None]:
+        """A log page, and the root's version from its header."""
+        _, own = self._machine.applied_digest()
         response = await self._client.get(
             f"{url.rstrip('/')}/v1/control/log",
             params={"after": after, "limit": PAGE_LIMIT},
-            headers=await self._headers(),
+            headers={**await self._headers(), COPY_DIGEST_HEADER: own},
             timeout=max(5.0, self._interval * 2),
         )
         if response.status_code == 409:
@@ -310,7 +358,7 @@ class Follower:
         body = response.json()
         if not isinstance(body, dict):
             raise ValueError("malformed log page")
-        return body
+        return body, response.headers.get(VERSION_HEADER)
 
     async def _install_snapshot(self, url: str) -> None:
         response = await self._client.get(
@@ -333,7 +381,11 @@ class Follower:
         token = provider() if callable(provider) else None
         if inspect.isawaitable(token):
             token = await token
-        return {"Authorization": f"Bearer {token}"} if token else {}
+        # Row 4: the root records the version this standby runs.
+        headers = {VERSION_HEADER: __version__}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
 
 
 class _Compacted(Exception):
