@@ -64,6 +64,7 @@ from eugene_plexus_control.applied import (
     OP_REVOKE_NODE,
     OP_REVOKE_SESSION,
     OP_REVOKE_SIGN_IN,
+    OP_ROTATE_CLIENT_KEY,
     OP_ROTATE_SIGNING_KEY,
     OP_SET_CLIENT_KEY_LIMITS,
     OP_SET_INSTALL_CA,
@@ -73,6 +74,7 @@ from eugene_plexus_control.applied import (
     OP_SET_SITE_DEV_GRANTS,
     OP_SET_SITE_HOST,
     OP_SET_STANDBY,
+    OP_TOUCH_CLIENT_KEY,
     OP_UPDATE_NODE,
     AppliedState,
     ApplyError,
@@ -115,6 +117,8 @@ EXERCISED_OPS = {
     OP_SET_CLIENT_KEY_LIMITS,
     OP_PUT_CLIENT_ADMISSION,
     OP_REVOKE_CLIENT_KEY,
+    OP_ROTATE_CLIENT_KEY,
+    OP_TOUCH_CLIENT_KEY,
     OP_ROTATE_SIGNING_KEY,
     OP_REVOKE_SESSION,
     OP_PROMOTE,
@@ -342,6 +346,22 @@ def _write_history(machine: StateMachine) -> bytes:
         },
     )
 
+    machine.append(OP_TOUCH_CLIENT_KEY, {"id": "app-key", "usedAt": "2026-09-09T11:21:00+00:00"})
+    machine.append(
+        OP_ROTATE_CLIENT_KEY,
+        {
+            "oldId": "app-key",
+            "retiresAt": "2026-09-10T11:21:00+00:00",
+            "key": {
+                "id": "app-key-2",
+                "name": "Example",
+                "tail": "second",
+                "createdAt": "2026-09-09T11:21:00+00:00",
+                "expiresAt": "2027-09-09T11:21:00+00:00",
+                "replaces": "app-key",
+            },
+        },
+    )
     machine.append(
         OP_REVOKE_CLIENT_KEY, {"id": "app-key", "revokedAt": "2026-09-09T11:22:00+00:00"}
     )

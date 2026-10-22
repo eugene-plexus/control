@@ -19,11 +19,13 @@ from .._generated.models import (
     ClientKeyLimits,
     ClientKeyList,
     ClientKeyPolicy,
+    ClientKeyRotateRequest,
     ClientKeyUpdateRequest,
 )
 from ..applied import (
     OP_PUT_CLIENT_KEY,
     OP_REVOKE_CLIENT_KEY,
+    OP_ROTATE_CLIENT_KEY,
     OP_SET_CLIENT_KEY_LIMITS,
     ApplyError,
 )
@@ -63,6 +65,18 @@ def records(machine: StateMachine) -> list[ClientKey]:
         key=lambda key: key.createdAt,
         reverse=True,
     )
+
+
+def policy_entry(key: ClientKey) -> dict[str, object]:
+    """What the gateway sees of a key. A replaced key's expiry is its retirement.
+
+    `ClientKeyPolicyEntry` is `extra=forbid`, so a new field would break every
+    older gateway; they already refuse a token past `expiresAt`.
+    """
+    entry = key.model_dump(mode="json", include={"id", "expiresAt", "revokedAt"}, exclude_none=True)
+    if key.retiresAt is not None and key.retiresAt < key.expiresAt:
+        entry["expiresAt"] = key.retiresAt.isoformat().replace("+00:00", "Z")
+    return entry
 
 
 def listing(machine: StateMachine) -> ClientKeyList:
@@ -106,17 +120,7 @@ async def create_key(
     issued = int(time.time())
     expires = issued + (body.ttlDays or 365) * 86400
     key_id = secrets.token_hex(16)
-    signer = request.app.state.auth_state.signer()
-    if signer is None:
-        raise problem(503, "Locked", "This root's token key is not in memory. Sign in first.")
-    token, _ = signer.mint(
-        typ=tokens.TYP_CLIENT,
-        sub=name,
-        aud=[tokens.RECIPIENT_GATEWAY],
-        ttl_seconds=expires - issued,
-        now=issued,
-        jti=key_id,
-    )
+    token = _mint(request, name=name, key_id=key_id, issued=issued, expires=expires)
     try:
         limits = validate_limits((body.limits or ClientKeyLimits()).model_dump(exclude_none=True))
     except ValueError as exc:
@@ -139,6 +143,83 @@ async def create_key(
     return ClientKeyCreated(key=key, token=token)
 
 
+def _mint(request: Request, *, name: str, key_id: str, issued: int, expires: int) -> str:
+    signer = request.app.state.auth_state.signer()
+    if signer is None:
+        raise problem(503, "Locked", "This root's token key is not in memory. Sign in first.")
+    token, _ = signer.mint(
+        typ=tokens.TYP_CLIENT,
+        sub=name,
+        aud=[tokens.RECIPIENT_GATEWAY],
+        ttl_seconds=expires - issued,
+        now=issued,
+        jti=key_id,
+    )
+    return str(token)
+
+
+@router.post(
+    "/v1/auth/client-keys/{key_id}/rotate",
+    response_model=ClientKeyCreated,
+    status_code=201,
+    response_model_exclude_none=True,
+)
+async def rotate_key(
+    request: Request,
+    key_id: str,
+    op: ActingOperator,
+    body: ClientKeyRotateRequest | None = None,
+) -> ClientKeyCreated:
+    machine = active(request)
+    body = body or ClientKeyRotateRequest()
+    raw = machine.state.client_keys.get(key_id)
+    if raw is None:
+        raise problem(404, "No such key", "This key is not in the install's registry.")
+    old = ClientKey.model_validate(raw)
+    if not op.may_name(old.name):
+        raise refuse_for_node(op, "rotate keys")
+    now = datetime.now(UTC)
+    if old.revokedAt is not None:
+        raise problem(409, "Key is off", "This key is turned off.")
+    if old.expiresAt <= now:
+        raise problem(409, "Key is off", "This key has expired.")
+    if old.replacedBy is not None:
+        raise problem(
+            409, "Key is replaced", f"This key is already replaced by ...{old.replacedBy[-6:]}."
+        )
+    issued = int(now.timestamp())
+    lifetime = (
+        body.ttlDays * 86400
+        if body.ttlDays is not None
+        else max(86400, int((old.expiresAt - old.createdAt).total_seconds()))
+    )
+    new_id = secrets.token_hex(16)
+    token = _mint(request, name=old.name, key_id=new_id, issued=issued, expires=issued + lifetime)
+    new = ClientKey(
+        id=new_id,
+        name=old.name,
+        tail=token[-6:],
+        createdAt=datetime.fromtimestamp(issued, UTC),
+        expiresAt=datetime.fromtimestamp(issued + lifetime, UTC),
+        limits=old.limits,
+        replaces=old.id,
+    )
+    retires = datetime.fromtimestamp(issued + body.overlapSeconds, UTC)
+    machine.append(
+        OP_ROTATE_CLIENT_KEY,
+        {
+            "oldId": old.id,
+            "retiresAt": retires.isoformat(),
+            "key": new.model_dump(mode="json", exclude_none=True),
+        },
+        actor=op.claims.sub,
+    )
+    log.info("rotated key %r (id %s) into %s", old.name, old.id, new_id)
+    return ClientKeyCreated(
+        key=ClientKey.model_validate(machine.state.client_keys[new_id]), token=token
+    )
+
+
 @router.get(
     "/v1/auth/client-keys/policy",
     response_model=ClientKeyPolicy,
@@ -153,12 +234,7 @@ async def policy(request: Request, response: Response) -> ClientKeyPolicy:
             authority=authority(machine),
             revision=machine.state.index,
             generatedAt=time.time(),
-            keys=[
-                key.model_dump(
-                    mode="json", include={"id", "expiresAt", "revokedAt"}, exclude_none=True
-                )
-                for key in records(machine)
-            ],
+            keys=[policy_entry(key) for key in records(machine)],
         )
     )
 
