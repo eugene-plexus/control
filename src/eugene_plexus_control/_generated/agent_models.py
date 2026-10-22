@@ -2217,6 +2217,18 @@ class MachineKeyChangeState(StrEnum):
     failed = 'failed'
 
 
+class MachineKeyChangeReason(StrEnum):
+    """
+    * `requested`: an operator asked for it (`POST /v1/node/machine-key`).
+    * `scheduled`: the key was older than `machineKeyChangeDays`, and the
+      machine started the change by itself (part 3b).
+
+    """
+
+    requested = 'requested'
+    scheduled = 'scheduled'
+
+
 class MachineKeyChange(BaseModel):
     """
     A change of this node's machine key (row 3): two pins across an
@@ -2225,6 +2237,7 @@ class MachineKeyChange(BaseModel):
     """
 
     state: MachineKeyChangeState
+    reason: MachineKeyChangeReason | None = None
     nextPin: str | None = Field(
         None,
         description='The pin of the key it changes to, while `waiting` or\n`switched`. `null` otherwise.\n',
@@ -2794,7 +2807,24 @@ class ClientKey(BaseModel):
     expiresAt: AwareDatetime
     revokedAt: AwareDatetime | None = None
     lastUsedAt: AwareDatetime | None = Field(
-        None, description='Reserved; not currently measured.'
+        None,
+        description='When the authority last admitted a check or acquisition with this key, to the minute. Absent, no use recorded.',
+    )
+    retiresAt: AwareDatetime | None = Field(
+        None,
+        description='Set when the key was rotated. The token works until then, and new requests on it are refused as replaced afterwards. Running requests finish.',
+    )
+    replaces: str | None = Field(
+        None,
+        description='The id of the key this one replaced.',
+        max_length=128,
+        min_length=1,
+    )
+    replacedBy: str | None = Field(
+        None,
+        description='The id of the key that replaced this one.',
+        max_length=128,
+        min_length=1,
     )
     limits: ClientKeyLimits | None = Field(
         None,
@@ -2822,6 +2852,24 @@ class ClientKeyCreateRequest(BaseModel):
     name: str = Field(..., max_length=64, min_length=1)
     ttlDays: int | None = Field(365, ge=1, le=3650)
     limits: ClientKeyLimits | None = None
+
+
+class ClientKeyRotateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    overlapSeconds: int | None = Field(
+        86400,
+        description='How long the old token keeps working. 0 stops it now. The old and new tokens share one concurrency and rate allowance during the overlap.',
+        ge=0,
+        le=2592000,
+    )
+    ttlDays: int | None = Field(
+        None,
+        description="Lifetime of the new key. Absent, the old key's lifetime.",
+        ge=1,
+        le=3650,
+    )
 
 
 class ClientKeyUpdateRequest(BaseModel):
@@ -4629,6 +4677,21 @@ class MachinePort(BaseModel):
     keyChange: MachineKeyChange | None = Field(
         None,
         description="This node's last machine key change (`POST\n/v1/node/machine-key`), or `null` when it never had one.\n",
+    )
+    keyMadeAt: AwareDatetime | None = Field(
+        None, description='When the key the machine port presents was made (part 3b).\n'
+    )
+    keyChangeDueAt: AwareDatetime | None = Field(
+        None,
+        description='When this machine changes its key by itself next: `keyMadeAt`\nplus the `machineKeyChangeDays` config field (365 by default),\nplus a spread of up to a twelfth of it (about a month a year),\ndrawn from the key itself: the same for one key, different for\neach, so the machines of one install do not change on the same\nday. `null` when the field is 0 (only on request).\n',
+    )
+    keyChangeNextAttemptAt: AwareDatetime | None = Field(
+        None,
+        description='When this machine next tries to start that change: at\n`keyChangeDueAt`; for a key already overdue when first seen (an\ninstall updated to this version, a machine that was off), at a\ntime up to 7 days later drawn from the key, so the machines of an\ninstall do not all change at once; a day after a change that was\nstopped or refused; an hour after a start that could not happen\n(`keyChangeBlocked`). `null` when the key does not change by\nitself or a change is under way.\n',
+    )
+    keyChangeBlocked: str | None = Field(
+        None,
+        description='Why the last start of a scheduled change could not happen, in\nthe words of the cause (a root older than row 3, a key that\ncould not be written). `null` when the last start did not fail.\n',
     )
 
 
