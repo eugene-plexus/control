@@ -296,6 +296,10 @@ _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
 
 MODE_CHANGED_AT = "installModeChangedAt"
 
+#: Applied config that is no setting: the mode's date, and since when root
+#: tokens carry their epoch (row 4, `trust.TOKEN_EPOCHS`).
+INTERNAL = frozenset({MODE_CHANGED_AT, "tokenEpochs"})
+
 
 def as_schema() -> ConfigSchema:
     return ConfigSchema(component="control", fields=list(FIELDS), categories=CATEGORY_LABELS)
@@ -373,7 +377,7 @@ def as_document(values: dict[str, Any]) -> ConfigDocument:
     # dates, and is not a setting anyone edits.
     merged = {
         **defaults(),
-        **{k: v for k, v in values.items() if k != MODE_CHANGED_AT and k not in RETIRED},
+        **{k: v for k, v in values.items() if k not in INTERNAL and k not in RETIRED},
     }
     return ConfigDocument.model_validate(merged)
 

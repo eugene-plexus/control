@@ -65,6 +65,10 @@ TOKEN_REFRESH_MARGIN_SECONDS = 120
 #: instead of taking one every two seconds.
 RESNAPSHOT_EVERY_SECONDS = 600.0
 
+#: Row 4: after a snapshot that failed, or did not help, the next is taken no
+#: sooner than this.
+SNAPSHOT_RETRY_SECONDS = 30.0
+
 #: Row 4: the headers a standby and the root say their versions and the
 #: copy's digest in (`control.yaml`, `readLog`).
 VERSION_HEADER = "Eugene-Plexus-Version"
@@ -200,6 +204,9 @@ class Follower:
         self.status = FollowerStatus(active_url=active_url)
         #: When this copy last replaced itself because it differed (row 4).
         self._resnapshot_at: float | None = None
+        #: No snapshot before this (`perf_counter`), after one that failed
+        #: or did not help (row 4).
+        self._snapshot_after = 0.0
 
     # ----- lifecycle --------------------------------------------------
 
@@ -268,7 +275,13 @@ class Follower:
         # failure this component exists to prevent.
         if self._machine.state.identity.salt is None:
             log.info("standby has no install identity yet; bootstrapping from a snapshot")
-            await self._install_snapshot(url)
+            if not await self._install_snapshot(url, recovering=True):
+                return
+            if self._machine.state.identity.salt is None:
+                # The root has no identity to give (not initialized): ask
+                # again only after a while, not on every pull.
+                self._snapshot_after = time.perf_counter() + SNAPSHOT_RETRY_SECONDS
+                return
 
         after = self._machine.state.index
         try:
@@ -279,7 +292,7 @@ class Follower:
                 "re-snapshotting rather than reading around the gap",
                 after,
             )
-            await self._install_snapshot(url)
+            await self._install_snapshot(url, recovering=False)
             return
 
         self.status.reachable = True
@@ -300,7 +313,7 @@ class Follower:
                 # roots end up disagreeing while both report healthy.
                 log.error("rejecting replicated entry: %s", exc)
                 self.status.last_error = str(exc)
-                await self._install_snapshot(url)
+                await self._install_snapshot(url, recovering=True)
                 return
             applied += 1
 
@@ -338,9 +351,11 @@ class Follower:
         if self._resnapshot_at is not None and now - self._resnapshot_at < RESNAPSHOT_EVERY_SECONDS:
             self.status.matches = False
             return
+        if not self._snapshot_due():
+            return
         self._resnapshot_at = now
         log.warning("this copy differs from the root at index %d; taking a fresh snapshot", index)
-        await self._install_snapshot(url)
+        await self._install_snapshot(url, recovering=False)
 
     async def _get_page(self, url: str, after: int) -> tuple[dict[str, Any], str | None]:
         """A log page, and the root's version from its header."""
@@ -360,21 +375,48 @@ class Follower:
             raise ValueError("malformed log page")
         return body, response.headers.get(VERSION_HEADER)
 
-    async def _install_snapshot(self, url: str) -> None:
-        response = await self._client.get(
-            f"{url.rstrip('/')}/v1/control/snapshot",
-            headers=await self._headers(),
-            timeout=max(10.0, self._interval * 4),
+    def _snapshot_due(self) -> bool:
+        """Whether a snapshot may be taken now (row 4): not within
+        `SNAPSHOT_RETRY_SECONDS` of one that failed, or of one taken to
+        recover from an entry that would not apply. Says so when not."""
+        left = self._snapshot_after - time.perf_counter()
+        if left <= 0:
+            return True
+        self.status.last_error = (
+            f"{self.status.last_error or 'the last snapshot did not help'}; "
+            f"the next snapshot is taken in {left:.0f} s"
         )
-        _refused(response, "snapshot read")
-        response.raise_for_status()
-        document = response.json()
-        if not isinstance(document, dict):
-            raise ValueError("malformed snapshot")
-        self._machine.install_snapshot(document)
+        return False
+
+    async def _install_snapshot(self, url: str, *, recovering: bool) -> bool:
+        """Take the root's snapshot, unless one failed lately. Returns
+        whether it was taken. A snapshot that fails, or one taken to
+        recover from an entry that would not apply (`recovering`), holds
+        the next one off for `SNAPSHOT_RETRY_SECONDS`: a root that keeps
+        sending what cannot be used is not asked again on every pull."""
+        if not self._snapshot_due():
+            return False
+        try:
+            response = await self._client.get(
+                f"{url.rstrip('/')}/v1/control/snapshot",
+                headers=await self._headers(),
+                timeout=max(10.0, self._interval * 4),
+            )
+            _refused(response, "snapshot read")
+            response.raise_for_status()
+            document = response.json()
+            if not isinstance(document, dict):
+                raise ValueError("malformed snapshot")
+            self._machine.install_snapshot(document)
+        except BaseException:
+            self._snapshot_after = time.perf_counter() + SNAPSHOT_RETRY_SECONDS
+            raise
+        if recovering:
+            self._snapshot_after = time.perf_counter() + SNAPSHOT_RETRY_SECONDS
         self.status.local_index = self._machine.state.index
         self.status.reachable = True
         self.status.last_contact_at = datetime.now(UTC).isoformat()
+        return True
 
     async def _headers(self) -> dict[str, str]:
         provider = self._token_provider

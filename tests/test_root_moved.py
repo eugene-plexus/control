@@ -214,3 +214,108 @@ def test_the_root_pushes_to_a_node_behind_at_most_once_a_minute(
     assert pushes.posts == [], "not again within the minute"
     push(clock + 61)
     assert len(pushes.posts) == 4
+
+
+# --------------------------------------------------------------------------- the review
+
+
+def test_root_tokens_carry_the_epoch_and_an_older_one_is_refused(
+    active_client: TestClient,
+) -> None:
+    """A promotion keeps the root's token key. Every token the root signs
+    says the epoch it was signed at, so a verifier refuses the root it no
+    longer follows (row 4 review, blocker 1)."""
+    from eugene_plexus_control import tokens
+
+    app: Any = active_client.app
+    machine: StateMachine = app.state.machine
+    session = active_client.headers["Authorization"].removeprefix("Bearer ")
+    assert _claims(session)["ep"] == machine.state.epoch
+    _keys, joined = enroll(active_client, "gpu")
+    assert joined.status_code == 201, joined.text
+    bundle = app.state.trust.current
+    assert bundle is not None and bundle.token_epochs is not None
+    assert bundle.token_epochs[1] == machine.state.epoch
+    assert "tokenEpochs" not in active_client.get("/v1/config").json().get("values", {})
+
+    signer = app.state.auth_state.signer()
+    stale = tokens.Signer(key=signer.key, issuer=signer.issuer, epoch=machine.state.epoch - 1)
+    old, _ = stale.mint(typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=600)
+    refused = active_client.get("/v1/nodes", headers={"Authorization": f"Bearer {old}"})
+    assert refused.status_code == 401
+    assert "no longer follows (epoch 0; it follows epoch 1)" in refused.text
+
+
+def test_a_copy_promoted_here_starts_as_the_root(tmp_path: Path) -> None:
+    """A copy that crashed after its promotion, before its agent heard of
+    it, is started as a standby again; its own log says it is the root at
+    a higher epoch than the agent holds, so it starts as the root (row 4
+    review, blocker 3). A copy whose agent holds that epoch, or one that
+    names another machine, stays a standby."""
+    from eugene_plexus_control.state_machine import ROLE_ACTIVE
+
+    from .conftest import machine_at, standby_at
+
+    root = machine_at(tmp_path / "root")
+    root.seed_identity({"salt": "c2FsdA==", "passphraseVerifier": "v", "controlPublicKey": "k"})
+    root.append(
+        OP_ENROLL_NODE,
+        {
+            "name": "attic",
+            "role": "agent",
+            "url": "http://10.0.0.9:8079",
+            "publicKey": "cHVibGljLWtleS1ieXRlcy0zMi1jaGFyYWN0ZXJzLWs=",
+            "enrolledAt": "2026-10-20T10:00:00+00:00",
+        },
+    )
+    for name, follow, node, active in (
+        ("crashed", 1, "attic", True),
+        ("heard", 2, "attic", False),
+        ("other", 1, "shed", False),
+    ):
+        copy = standby_at(tmp_path / name / "state")
+        copy.install_snapshot(root.snapshot_document())
+        copy.promote(node="attic")
+        assert copy.state.epoch == 2
+        settings = settings_for(tmp_path / name, role="standby")
+        settings.node_name = node
+        settings.follow_epoch = follow
+        app = create_app(settings)
+        with TestClient(app):
+            assert (app.state.machine.role == ROLE_ACTIVE) is active, name
+            assert (app.state.follower is None) is active, name
+            assert (app.state.node_poller is not None) is active, name
+
+
+def test_one_slow_machine_does_not_hold_up_the_others(active_client: TestClient) -> None:
+    """Each machine's bundle and list on its own, with a deadline: one that
+    never answers is given up on, and the rest have both at once (row 4
+    review)."""
+    import asyncio
+
+    from eugene_plexus_control import trust
+
+    app: Any = active_client.app
+    for name, ip in (("slow", "192.0.2.21"), ("quick", "192.0.2.22")):
+        _keys, joined = enroll(active_client, name, url=f"http://{ip}:8079")
+        assert joined.status_code == 201, joined.text
+
+    class _Client(_Pushes):
+        async def post_json(
+            self, url: str, path: str, token: str | None, body: dict[str, Any]
+        ) -> Any:
+            if "192.0.2.21" in url:
+                await asyncio.Event().wait()
+            return await super().post_json(url, path, token, body)
+
+    pushes = _Client()
+    app.state.nodes_client = pushes
+    bundle = app.state.trust.current
+    started = time.perf_counter()
+    taken = active_client.portal.call(lambda: trust.push_pairs(app, bundle, "a-list", deadline=0.5))
+    assert time.perf_counter() - started < 5
+    assert taken == {"slow": False, "quick": True}
+    assert [p for u, p, _b in pushes.posts if "192.0.2.22" in u] == [
+        "/v1/node/trust-bundle",
+        "/v1/node/machine-list",
+    ]

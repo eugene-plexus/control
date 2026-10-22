@@ -38,6 +38,42 @@ log = logging.getLogger(__name__)
 
 BUNDLE_FILE = "trust_bundle.json"
 
+#: Row 4: since when, and at which epoch, every token this install's roots
+#: sign carries `ep`. Kept in applied config (one `patchConfig`, so an older
+#: standby applies it), never shown as a setting, and written once.
+TOKEN_EPOCHS = "tokenEpochs"
+
+
+def token_epochs(state: AppliedState) -> tuple[int, int] | None:
+    """`(since, epoch)` from applied config, or None before it is written."""
+    marked = state.config.get(TOKEN_EPOCHS)
+    if not isinstance(marked, dict):
+        return None
+    since, epoch = marked.get("since"), marked.get("epoch")
+    if type(since) is not int or type(epoch) is not int:
+        return None
+    return since, epoch
+
+
+def mark_token_epochs(app: Any) -> bool:
+    """Write `tokenEpochs` once, on an active root that can sign: from now on
+    a verifier refuses a root token without `ep` that is newer than this, or
+    held across a promotion (row 4, `tokens._check_epoch`). Returns whether
+    it wrote it."""
+    from .applied import OP_PATCH_CONFIG
+
+    machine = app.state.machine
+    if not machine.is_active or app.state.auth_state.signing_key is None:
+        return False
+    if token_epochs(machine.state) is not None:
+        return False
+    machine.append(
+        OP_PATCH_CONFIG,
+        {"values": {TOKEN_EPOCHS: {"since": int(time.time()), "epoch": machine.state.epoch}}},
+    )
+    log.info("every token this root signs now carries its epoch")
+    return True
+
 
 def trust_keys(state: AppliedState) -> list[tokens.TrustKey]:
     """Every key the install trusts: this root's, and each enrolled node's."""
@@ -107,6 +143,7 @@ def view(state: AppliedState, *, now: int | None = None) -> tokens.TrustBundle:
         revoked_sessions=frozenset(jti for jti, _ in _revoked(state, issued)),
         jws="",
         payload={},
+        token_epochs=token_epochs(state),
     )
 
 
@@ -156,6 +193,7 @@ class TrustPublisher:
             epoch=state.epoch,
             keys=trust_keys(state),
             revoked_sessions=_revoked(state, int(time.time())),
+            token_epochs=token_epochs(state),
         )
         self.current = bundle
         self._view_cache = None
@@ -169,6 +207,7 @@ class TrustPublisher:
 
     def publish(self, app: Any) -> tokens.TrustBundle | None:
         """Sign for the current state and push it to every node, in the background."""
+        mark_token_epochs(app)
         bundle = self.sign(app.state.machine.state, app.state.auth_state)
         if bundle is None:
             log.warning(
@@ -224,6 +263,65 @@ async def push(
         if took:
             acks[name] = max(acks.get(name, 0), bundle.version)
     app.state.trust_acks = acks
+    return results
+
+
+#: Row 4: machines sent the bundle and the machine list at once, and the most
+#: one machine's pair may take before it is given up on (it takes both from
+#: its own pull, or the next push).
+PUSH_CONCURRENCY = 16
+PAIR_DEADLINE_SECONDS = 30.0
+
+
+async def push_pairs(
+    app: Any,
+    bundle: tokens.TrustBundle | None,
+    jws: str | None,
+    *,
+    names: list[str] | None = None,
+    deadline: float = PAIR_DEADLINE_SECONDS,
+) -> dict[str, bool]:
+    """The bundle, then the machine list, to each machine with an address
+    (`names` limits it). Returns who took both (row 4).
+
+    Each machine on its own: one that answers slowly, or trickles its
+    answer, holds up nobody else's pair, and gives up after `deadline`. At
+    most `PUSH_CONCURRENCY` at once. The bundle goes first so a machine
+    takes the list from a root whose epoch it already holds. No bearer: both
+    are signed by the identity every node pinned."""
+    machine = app.state.machine
+    client = app.state.nodes_client
+    gate = asyncio.Semaphore(PUSH_CONCURRENCY)
+    results: dict[str, bool] = {}
+    acks: dict[str, int] = getattr(app.state, "trust_acks", {})
+    app.state.trust_acks = acks
+
+    async def pair(name: str, url: str) -> None:
+        async with gate:
+            try:
+                async with asyncio.timeout(deadline):
+                    if bundle is not None:
+                        await client.post_json(
+                            url, "/v1/node/trust-bundle", None, {"jws": bundle.jws}
+                        )
+                        acks[name] = max(acks.get(name, 0), bundle.version)
+                    if jws is not None:
+                        await client.post_json(url, "/v1/node/machine-list", None, {"jws": jws})
+                results[name] = True
+            except (httpx.HTTPError, ValueError, TimeoutError) as exc:
+                log.info(
+                    "node %s did not take the bundle and machine list yet: %s",
+                    name,
+                    str(exc) or type(exc).__name__,
+                )
+                results[name] = False
+
+    targets = [
+        (record.name, str(record.url))
+        for record in machine.state.nodes.values()
+        if record.url and (names is None or record.name in names)
+    ]
+    await asyncio.gather(*(pair(name, url) for name, url in targets))
     return results
 
 

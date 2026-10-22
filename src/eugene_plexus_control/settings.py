@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     sets it for the standby it runs, so a promotion names that node: the
     registry marks it the root and its standby grant goes
     (warm-standby.md)."""
+    follow_epoch: int | None = None
+    """The epoch the agent that starts this standby holds (row 4). A copy
+    whose own log says this node was promoted at a higher epoch starts as the
+    root, not as a standby of the root it replaced: its agent had not yet
+    heard of the promotion when it crashed or restarted."""
     service_token: str | None = None
     """A standby's only credential: the token its agent spawned it with
     (`sub: standby`, good on this machine alone). The follower trades it at

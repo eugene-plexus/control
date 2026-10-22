@@ -276,19 +276,21 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
 
     # Announce the epoch: a trust bundle at the new epoch, signed with the
     # identity key promotion deliberately preserved (`sealedControlKey`).
-    # Agents record it and refuse the old root's lower one. Best-effort;
-    # a node that is down takes it when it next pulls.
-    if request.app.state.trust.publish(request.app) is None:
+    # Agents record it and refuse the old root's lower one. Then where this
+    # root is (row 4): its machine list, the pair to each machine on its own.
+    # Best-effort; a node that is down takes both when it next pulls, or
+    # from the poll this copy now runs.
+    trust.mark_token_epochs(request.app)
+    bundle = request.app.state.trust.sign(machine.state, auth)
+    if bundle is None:
         log.warning(
             "promoted without the control identity key in memory; nodes will learn epoch %d "
             "when this root is next unlocked",
             machine.state.epoch,
         )
     else:
-        # Row 4: then where this root is. The copy is not restarted, so it
-        # starts polling here, and the poll sends both again to a node behind.
         request.app.state.machine_list_push = asyncio.create_task(
-            _announce_root(request.app), name="control-machine-list-push"
+            _announce_root(request.app, bundle), name="control-machine-list-push"
         )
     from ..app import start_root_tasks
 
@@ -509,20 +511,19 @@ async def get_root_tls(request: Request) -> SignedRootTls:
 # --------------------------------------------------------------------------- #
 
 
-async def _announce_root(app: Any) -> dict[str, bool]:
-    """After a promotion: the signed machine list, which names this root,
-    its node and the new epoch, pushed to every node once the bundle push
-    has finished (row 4). The epoch goes first, so a node takes the list
-    from a root whose epoch it already holds; one that takes the list first
-    raises its epoch from the list, which the same key signed."""
-    await app.state.trust.wait()
+async def _announce_root(app: Any, bundle: tokens.TrustBundle) -> dict[str, bool]:
+    """After a promotion: the bundle at the new epoch and the signed machine
+    list, which names this root, its node and the new epoch, to every node,
+    each machine's pair on its own (row 4, `trust.push_pairs`). The epoch
+    goes first, so a node takes the list from a root whose epoch it already
+    holds; one that takes the list first raises its epoch from the list,
+    which the same key signed."""
     jws = machine_list.signed(app)
     if jws is None:
         log.warning(
             "promoted, but no machine list could be signed; nodes keep the address they have"
         )
-        return {}
-    taken = await machine_list.push(app, jws)
+    taken = await trust.push_pairs(app, bundle, jws)
     log.warning(
         "told %d of %d node(s) where this root is now; the others take it from the next "
         "poll that reaches them, or ask this machine",

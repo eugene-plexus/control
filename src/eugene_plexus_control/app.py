@@ -112,11 +112,26 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         store = LogStore(settings.state_dir)
         machine = StateMachine(store, role=role)
         machine.load()
+    if role == ROLE_STANDBY and _promoted_here(machine, settings):
+        # Row 4: this copy was promoted, and its agent, which started it as
+        # a standby, has not heard yet (a crash before the new root's bundle
+        # reached it). Its own log is the evidence: the promote entry names
+        # this node, at an epoch above the one the agent holds.
+        log.warning(
+            "this copy was promoted to the root at epoch %d (its log says so; its agent "
+            "holds epoch %s): it starts as the root, not as a standby",
+            machine.state.epoch,
+            settings.follow_epoch,
+        )
+        machine.force_role(ROLE_ACTIVE)
+        role = ROLE_ACTIVE
     app.state.machine = machine
     app.state.admission_worker = AdmissionWorker()
 
     if not hasattr(app.state, "auth_state"):
         app.state.auth_state = AuthState()
+    # Row 4: every token this root signs carries the epoch it is at.
+    app.state.auth_state.epoch_source = lambda: app.state.machine.state.epoch
 
     # The last bundle this root signed, so a sealed root still serves one.
     app.state.trust = TrustPublisher(Path(settings.state_dir))
@@ -224,6 +239,25 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await app.state.machine_list_push
         await app.state.nodes_client.aclose()
         await app.state.admission_worker.close()
+
+
+def _promoted_here(machine: StateMachine, settings: Settings) -> bool:
+    """A copy started as a standby whose own log says this node is the
+    root, at an epoch above the one its agent holds (row 4).
+
+    The promote entry is written by this copy alone, after the passphrase,
+    and only it makes a node's record `control`; a later promotion of
+    another machine records this one as a standby again. The epoch test
+    keeps a stale copy (one that was the root, and was replaced while it
+    was off) a standby of the root that replaced it."""
+    from .state_machine import active_node_name
+
+    name = settings.node_name
+    if not name or settings.follow_epoch is None:
+        return False
+    return active_node_name(machine.state) == name and machine.state.epoch > int(
+        settings.follow_epoch
+    )
 
 
 def _set_aside(store: LogStore) -> list[str]:
@@ -418,11 +452,12 @@ async def push_to_nodes_behind(
     for name in due:
         pushed[name] = clock
     bundle = app.state.trust.current
-    if bundle is not None and bundle.epoch == epoch:
-        await trust_module.push(app, bundle, names=due)
-    jws = machine_list_module.signed(app)
-    if jws is not None:
-        await machine_list_module.push(app, jws, names=due)
+    await trust_module.push_pairs(
+        app,
+        bundle if bundle is not None and bundle.epoch == epoch else None,
+        machine_list_module.signed(app),
+        names=due,
+    )
     log.info(
         "sent the bundle and machine list of epoch %d again to %s: behind this root",
         epoch,

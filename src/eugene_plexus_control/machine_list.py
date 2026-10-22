@@ -163,37 +163,6 @@ def signed(app: Any) -> str | None:
     )
 
 
-async def push(app: Any, jws: str, *, names: list[str] | None = None) -> dict[str, bool]:
-    """POST the list to every node with an address (`names` limits it).
-
-    **No bearer**: the list is signed with the identity every node pinned,
-    the mirror of the trust bundle's push (`trust.push`). A node that is
-    down takes it from the next root it hears, or by its own pull."""
-    import asyncio
-
-    import httpx
-
-    machine = app.state.machine
-    client = app.state.nodes_client
-    results: dict[str, bool] = {}
-
-    async def one(name: str, url: str) -> None:
-        try:
-            await client.post_json(url, "/v1/node/machine-list", None, {"jws": jws})
-            results[name] = True
-        except (httpx.HTTPError, ValueError) as exc:
-            log.info("node %s did not take the machine list yet: %s", name, exc)
-            results[name] = False
-
-    targets = [
-        (record.name, str(record.url))
-        for record in machine.state.nodes.values()
-        if record.url and (names is None or record.name in names)
-    ]
-    await asyncio.gather(*(one(name, url) for name, url in targets))
-    return results
-
-
 def _origin(url: str | None) -> str | None:
     from urllib.parse import urlsplit
 

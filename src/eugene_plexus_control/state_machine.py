@@ -53,6 +53,10 @@ log = logging.getLogger(__name__)
 ROLE_ACTIVE = "control"
 ROLE_STANDBY = "standby"
 
+#: Every field a `Snapshot` document carries (`to_canonical`), all of which
+#: a snapshot must hold to replace a replica's state (row 4).
+_SNAPSHOT_KEYS = frozenset(to_canonical(AppliedState()))
+
 # Compact once the log is longer than this. Chosen so an operator's
 # ordinary session never triggers one, and a long-lived install does not
 # accumulate an unbounded file. Compaction is the reason a snapshot
@@ -354,12 +358,34 @@ class StateMachine:
         root" should be an error rather than a quiet rewind.
         """
         with self._lock:
+            # Row 4: a standby now replaces its copy by itself, so what it
+            # takes is checked first. A snapshot that leaves out a field
+            # would clear it (a document of `{"index": 100}` once cleared
+            # the install's identity), and one from another install, or from
+            # a root at a lower epoch, is not this install's state.
+            missing = sorted(_SNAPSHOT_KEYS - set(document))
+            if missing:
+                raise ApplyError(
+                    f"refusing a snapshot that is incomplete: it has no {', '.join(missing)}"
+                )
             incoming = from_canonical(document)
             if incoming.index < self._state.index:
                 raise ApplyError(
                     f"refusing a snapshot at index {incoming.index}: this replica has "
                     f"already applied {self._state.index}"
                 )
+            if incoming.epoch < self._state.epoch:
+                raise ApplyError(
+                    f"refusing a snapshot at epoch {incoming.epoch}: this replica holds "
+                    f"epoch {self._state.epoch}"
+                )
+            held, offered = self._state.identity, incoming.identity
+            for name in ("controlPublicKey", "salt"):
+                mine, theirs = getattr(held, name), getattr(offered, name)
+                if mine is not None and theirs != mine:
+                    raise ApplyError(
+                        f"refusing a snapshot of another install: its {name} is not this replica's"
+                    )
             self._store.write_snapshot(document, compact_through=incoming.index)
             self._state = incoming
             self._entries_since_snapshot = 0

@@ -16,6 +16,7 @@ hears the standby's version and its copy's digest on every pull
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -188,3 +189,73 @@ def test_the_root_reports_the_standby_s_version_and_whether_its_copy_matches(
 
 def _standby_token(keys: NodeKeys) -> str:
     return keys.service_token(sub="standby")
+
+
+# --------------------------------------------------------------------------- the review
+
+
+def test_an_incomplete_foreign_or_older_snapshot_is_refused(tmp_path: Path) -> None:
+    """A standby replaces its copy by itself now, so what it takes is
+    checked first (row 4 review, blocker 4). Nothing changes on a refusal."""
+    from eugene_plexus_control.applied import ApplyError
+
+    from .conftest import machine_at
+
+    root = machine_at(tmp_path / "root")
+    root.seed_identity({"salt": "c2FsdA==", "passphraseVerifier": "v", "controlPublicKey": "k"})
+    root.append(OP_PATCH_CONFIG, {"values": {"joinTokenTtlSeconds": 60}})
+    copy = standby_at(tmp_path / "copy")
+    copy.install_snapshot(root.snapshot_document())
+    before = copy.canonical()
+
+    with pytest.raises(ApplyError, match="incomplete"):
+        copy.install_snapshot({"index": 100})
+    foreign = root.snapshot_document() | {"index": 100, "controlPublicKey": "another"}
+    with pytest.raises(ApplyError, match="another install"):
+        copy.install_snapshot(foreign)
+    assert copy.canonical() == before
+    copy.promote(node=None)
+    assert copy.state.epoch == 2
+    before = copy.canonical()
+    older = root.snapshot_document() | {"index": 100}
+    with pytest.raises(ApplyError, match="epoch 1"):
+        copy.install_snapshot(older)
+    assert copy.canonical() == before
+
+
+async def test_a_root_that_gives_no_usable_snapshot_is_not_asked_on_every_pull(
+    tmp_path: Path,
+) -> None:
+    """A snapshot with no install identity (the root is not initialized),
+    or one that fails, holds the next one off: three pulls ask once (row 4
+    review, blocker 4)."""
+    from eugene_plexus_control.applied import AppliedState, to_canonical
+
+    asked: list[str] = []
+    answer = {"snapshot": 200}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        asked.append(request.url.path)
+        if request.url.path.endswith("/snapshot"):
+            if answer["snapshot"] != 200:
+                return httpx.Response(answer["snapshot"], json={"detail": "no"})
+            return httpx.Response(200, json=to_canonical(AppliedState()))
+        return httpx.Response(200, json={"entries": [], "appliedIndex": 0})
+
+    for status in (200, 500):
+        answer["snapshot"] = status
+        asked.clear()
+        follower = Follower(
+            standby_at(tmp_path / f"copy-{status}"),
+            active_url="http://root.test",
+            interval_seconds=0.01,
+            token_provider=lambda: None,
+        )
+        follower._client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+        try:
+            for _ in range(3):
+                with contextlib.suppress(httpx.HTTPError):
+                    await follower.tick()
+            assert asked.count("/v1/control/snapshot") == 1, (status, asked)
+        finally:
+            await follower.stop()
