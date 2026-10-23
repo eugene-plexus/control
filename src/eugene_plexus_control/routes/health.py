@@ -48,6 +48,9 @@ async def healthz(request: Request) -> Health:
         "appliedIndex": state.index,
         "nodes": len(state.nodes),
         "initialized": initialized,
+        # Row 4: an initialized root without its token key cannot sign
+        # anything until the owner signs in. Its agent says so on Home.
+        "locked": initialized and request.app.state.auth_state.signing_key is None,
     }
 
     follower = getattr(request.app.state, "follower", None)
