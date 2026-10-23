@@ -318,14 +318,45 @@ def test_a_snapshot_with_a_null_or_mistyped_field_is_refused(tmp_path: Path) -> 
     assert set(copy.state.nodes) == {"gpu"}
 
 
+#: The top-level `Snapshot` fields a v0.2.0 root writes (control 3c378a1,
+#: `applied.to_canonical`); v0.2 is the oldest supported version.
+_WRITTEN_BY_V0_2_0 = frozenset(
+    {
+        "index",
+        "epoch",
+        "nodes",
+        "components",
+        "runtimes",
+        "config",
+        "clientKeys",
+        "clientAdmission",
+        "salt",
+        "passphraseVerifier",
+        "sealedSigningKey",
+        "rootTokenPublicKey",
+        "revokedSessions",
+        "sealedControlKey",
+        "controlPublicKey",
+        "sealedRecoveryKey",
+        "signingKeyId",
+        "people",
+        "sites",
+        "nodeHelpers",
+        "oidcClients",
+        "oidcKeys",
+        "revokedSignIns",
+    }
+)
+
+
 def test_a_snapshot_from_a_root_that_writes_fewer_fields_is_taken(tmp_path: Path) -> None:
     """A field added after the oldest supported root is optional: a root
     that does not write it is followed, and its absence reads as empty (row
     4 re-review)."""
     root, copy = _copy_of(tmp_path)
-    older = root.snapshot_document()
-    for name in ("browserSignIn", "accessAudit", "permissionGroups", "oidcKeys", "sites"):
-        older.pop(name)
+    document = root.snapshot_document()
+    older = {name: value for name, value in document.items() if name in _WRITTEN_BY_V0_2_0}
+    assert set(document) - set(older), "the root writes fields v0.2.0 did not"
     copy.install_snapshot(older | {"index": older["index"] + 1})
     assert set(copy.state.nodes) == {"gpu"}
 
