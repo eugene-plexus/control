@@ -3218,6 +3218,11 @@ class StandbyStatus(BaseModel):
         None,
         description="Whether the standby's copy is the root's, byte for byte (row\n4). Read at a pull made at this root's own applied index, from\nthe `Eugene-Plexus-Copy-Digest` header: true when that digest\nis this root's `LogPage.appliedDigest`, false when it differs.\nA standby whose copy differs takes a fresh snapshot by itself\n(at most once in 10 minutes), so false that stays means the\nfresh copy differs too. Absent until a standby on this root's\nversion has pulled at this root's index: two versions may write\nthe same state in different bytes.\n",
     )
+    logVersion: int | None = Field(
+        None,
+        description="The log version the standby applies, from the\n`Eugene-Plexus-Log-Version` header of its last pull (row 5);\n0 when its pull carried none (a standby older than row 5).\nAbsent until it has pulled since this root started. Log\nversion 1 adds `retireOidcKeys` and `changePassphrase`: this\nroot refuses to write either while its standby reports less,\nbecause the standby's copy would stop there.\n",
+        ge=0,
+    )
 
 
 class AccessAuditEvent(BaseModel):
@@ -3237,6 +3242,22 @@ class AccessAudit(BaseModel):
 
 class LogOp(StrEnum):
     """
+    **`retireOidcKeys` (row 5, log version 1)** keeps only the sign-in
+    keys named in `keep` (`{keep: [kid]}`, at least one held key) and
+    drops the others, so every token they signed stops verifying. It
+    follows a `putOidcKey` when the owner ends every app sign-in after
+    a suspected leak.
+
+    **`changePassphrase` (row 5, log version 1)** changes Eugene's
+    passphrase: `{salt, passphraseVerifier, sealed}`, where `sealed`
+    holds every value the old master key sealed, sealed again under
+    the new one by the writer (`signingKey`, `controlKey`,
+    `recoveryKey`, `installCaKey`, `oidcKeys` by `kid`, and
+    `externalProviders` by id). It must name exactly the sealed values
+    the state holds, no more and no fewer, or it does not apply. Every
+    root that applies it writes a snapshot and compacts its log
+    through it, so no value sealed under the old key stays in the log.
+
     **`setNodeCertificateNames` (LT2, 2026-10-20)** replaces the names
     the owner listed for one node's client certificate (`{name,
     names}`). An operator's, unsigned, like `labelNode`.
@@ -3346,6 +3367,8 @@ class LogOp(StrEnum):
     labelNode = 'labelNode'
     setInstallCa = 'setInstallCa'
     setNodeCertificateNames = 'setNodeCertificateNames'
+    retireOidcKeys = 'retireOidcKeys'
+    changePassphrase = 'changePassphrase'
 
 
 class Group(RootModel[str]):
@@ -3507,6 +3530,104 @@ class OidcClient(BaseModel):
         description='`app:<id>@<node>` for an app the registry installed; absent for one the operator added.',
     )
     createdAt: AwareDatetime
+
+
+class OidcKey(BaseModel):
+    """
+    One sign-in key (row 5), without its key material.
+    """
+
+    kid: str = Field(
+        ..., description="The key's RFC 7638 thumbprint, as the JWKS names it."
+    )
+    createdAt: AwareDatetime
+    signs: bool = Field(
+        ..., description='True for the newest key, which signs every new token.'
+    )
+    verifiesUntil: AwareDatetime | None = Field(
+        None,
+        description='For a key that no longer signs: when the last refresh token\nit signed expires (30 days after the next key was made). It\nis dropped at the next change after that. Absent for the key\nthat signs.\n',
+    )
+
+
+class OidcKeyList(BaseModel):
+    keys: list[OidcKey] = Field(
+        ..., description='Newest first. Empty before the first sign-in made a key.'
+    )
+    nextChangeAt: AwareDatetime | None = Field(
+        None,
+        description='When the active root changes the key by itself:\n`signInKeyDays` after the newest key was made. It checks once\nan hour while it is unlocked. Absent when `signInKeyDays` is 0\n(never) or there is no key yet.\n',
+    )
+
+
+class OidcKeyChangeRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    endSignIns: bool | None = Field(
+        False,
+        description='True after a suspected leak: the old key stops verifying at\nonce, and every app signs in again.\n',
+    )
+
+
+class PassphraseChangeRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    current: SecretStr = Field(
+        ..., description="Eugene's passphrase now.", min_length=1
+    )
+    new: SecretStr = Field(
+        ..., description='The new passphrase, at least 12 characters.', min_length=12
+    )
+
+
+class PassphraseMachineState(StrEnum):
+    """
+    * `changed`: the machine took the new passphrase.
+    * `pending`: it was not reached, or could not take it now; it
+      takes it at its next sign-in with the new passphrase.
+    * `plain`: it is reached in plain HTTP, so nothing was sent to
+      it; it takes the new passphrase at its next sign-in.
+
+    """
+
+    changed = 'changed'
+    pending = 'pending'
+    plain = 'plain'
+
+
+class PassphraseMachine(BaseModel):
+    node: str
+    state: PassphraseMachineState
+    detail: str | None = Field(
+        None, description='The observed cause, for `pending` and `plain`.'
+    )
+
+
+class PassphraseFileState(StrEnum):
+    """
+    The passphrase file this root unlocks from (`securityMode:
+    passphrase_file`), checked at each start, every hour and after a
+    change: `matches` holds this install's passphrase; `old` holds
+    another (after a change this root could not write it), so after a
+    restart the root stays locked until someone signs in; `none`
+    means this root does not unlock from a file.
+
+    """
+
+    matches = 'matches'
+    old = 'old'
+    none = 'none'
+
+
+class PassphraseChangeResult(BaseModel):
+    changedAt: AwareDatetime
+    machines: list[PassphraseMachine] = Field(
+        ...,
+        description='Each machine that keeps a passphrase of its own, or that could\nnot be asked whether it does, by node name.\n',
+    )
+    passphraseFile: PassphraseFileState
 
 
 class OidcClientList(BaseModel):
@@ -3745,6 +3866,7 @@ class AuthStatus(BaseModel):
         None,
         description="Whether this host's OS keyring accepted a write, read and\ndelete of a probe entry from this process — measured once per\nprocess run. False in a container or on a headless box, where\n`passphrase_file` is the unattended answer. Absent when the\nprobe was not run or did not finish within its budget.\n",
     )
+    passphraseFile: PassphraseFileState | None = None
 
 
 class AuthInitializeRequest(BaseModel):
