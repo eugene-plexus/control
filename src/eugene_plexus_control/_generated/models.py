@@ -3400,8 +3400,12 @@ class LogOp(StrEnum):
     `recoveryKey`, `installCaKey`, `oidcKeys` by `kid`, and
     `externalProviders` by id). It must name exactly the sealed values
     the state holds, no more and no fewer, or it does not apply. Every
-    root that applies it writes a snapshot and compacts its log
-    through it, so no value sealed under the old key stays in the log.
+    root that applies it writes a snapshot and drops every entry
+    before it, so no value sealed under the old key stays in the log;
+    a root that could not, does at its next start. The writer appends
+    every entry that carries a sealed value (`putOidcKey`,
+    `rotateSigningKey`, `setInstallCa`, `putExternalProvider`,
+    `changePassphrase`) only while the salt is the one it sealed under.
 
     **`setNodeCertificateNames` (LT2, 2026-10-20)** replaces the names
     the owner listed for one node's client certificate (`{name,
@@ -3713,7 +3717,7 @@ class OidcKeyChangeRequest(BaseModel):
     )
     endSignIns: bool | None = Field(
         False,
-        description='True after a suspected leak: the old key stops verifying at\nonce, and every app signs in again.\n',
+        description='True after a suspected leak: tokens the old key signed stop\nverifying at once. An app that renews them asks the person to\nsign in again (Workbench within five minutes, its JWKS cache);\nan app that keeps its own session (Open WebUI) keeps it until\nit expires or the person signs out.\n',
     )
 
 
@@ -3748,7 +3752,8 @@ class PassphraseMachine(BaseModel):
     node: str
     state: PassphraseMachineState
     detail: str | None = Field(
-        None, description='The observed cause, for `pending` and `plain`.'
+        None,
+        description='The observed cause, for `pending` and `plain`. For `changed`,\nwhat the machine could not do with the new passphrase:\n*this machine could not save its passphrase file: <cause>*\n(after a restart it stays locked until someone signs in).\n',
     )
 
 
@@ -3775,6 +3780,10 @@ class PassphraseChangeResult(BaseModel):
         description='Each machine that keeps a passphrase of its own, or that could\nnot be asked whether it does, by node name.\n',
     )
     passphraseFile: PassphraseFileState
+    cleanup: str | None = Field(
+        None,
+        description='Present when the passphrase changed but the copies sealed\nunder the old key could not be removed yet: the cause. The\nroot tries again every hour and at its next start.\n',
+    )
 
 
 class OidcClientList(BaseModel):
