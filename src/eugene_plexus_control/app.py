@@ -54,6 +54,7 @@ from .routes import health as health_routes
 from .routes import nodes as node_routes
 from .routes import oidc as oidc_routes
 from .routes import people as people_routes
+from .routes import people_known as people_known_routes
 from .routes import topology as topology_routes
 from .routes.nodes import service_token_for
 from .settings import Settings, load_settings
@@ -520,6 +521,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(oidc_routes.router)
     app.include_router(external_sign_in_routes.router)
     app.include_router(external_sign_in_routes.management)
+    # Row 53, before the people routes: `/v1/people/known` is not a person id.
+    app.include_router(people_known_routes.router)
     app.include_router(people_routes.router)
     app.include_router(administration_routes.router)
     app.include_router(people_routes.app_clients)
