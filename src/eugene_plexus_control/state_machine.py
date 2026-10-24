@@ -53,6 +53,89 @@ log = logging.getLogger(__name__)
 ROLE_ACTIVE = "control"
 ROLE_STANDBY = "standby"
 
+#: The `Snapshot` fields every supported root writes (row 4 re-review): a
+#: snapshot without one would clear what it holds. A field added later is
+#: optional, so a root older than the standby is still followed, and its
+#: absence reads as empty.
+_REQUIRED_SNAPSHOT_KEYS = frozenset(
+    {
+        "index",
+        "epoch",
+        "nodes",
+        "components",
+        "runtimes",
+        "config",
+        "salt",
+        "passphraseVerifier",
+        "sealedSigningKey",
+        "controlPublicKey",
+        "sealedControlKey",
+        "rootTokenPublicKey",
+        "revokedSessions",
+    }
+)
+#: Fields that are lists, and fields that are objects, wherever they appear.
+_LIST_KEYS = frozenset(
+    {
+        "nodes",
+        "components",
+        "runtimes",
+        "clientKeys",
+        "accessAudit",
+        "revokedSessions",
+        "people",
+        "permissionGroups",
+        "sites",
+        "oidcClients",
+        "oidcKeys",
+        "revokedSignIns",
+    }
+)
+_OBJECT_KEYS = frozenset({"config", "clientAdmission", "browserSignIn"})
+_TEXT_OR_NONE_KEYS = frozenset(
+    {
+        "salt",
+        "passphraseVerifier",
+        "sealedSigningKey",
+        "rootTokenPublicKey",
+        "sealedControlKey",
+        "controlPublicKey",
+        "sealedRecoveryKey",
+        "signingKeyId",
+        "installCaCertificate",
+        "sealedInstallCaKey",
+    }
+)
+
+
+def _unusable_snapshot(document: Any) -> str | None:
+    """Why `document` cannot replace a replica's state, or None (row 4
+    re-review). Presence alone is not enough: the parser reads `nodes: null`
+    as no nodes, so a snapshot saying so would clear the registry."""
+    if not isinstance(document, dict):
+        return "is not an object"
+    missing = sorted(_REQUIRED_SNAPSHOT_KEYS - set(document))
+    if missing:
+        return f"is incomplete: it has no {', '.join(missing)}"
+    for name in ("index", "epoch"):
+        value = document[name]
+        if type(value) is not int or value < (1 if name == "epoch" else 0):
+            return f"has an unusable {name} ({value!r})"
+    for name in sorted(_LIST_KEYS & set(document)):
+        if not isinstance(document[name], list):
+            return f"has {name} that is not a list ({type(document[name]).__name__})"
+    for name in sorted(_OBJECT_KEYS & set(document)):
+        if not isinstance(document[name], dict):
+            return f"has {name} that is not an object ({type(document[name]).__name__})"
+    for name in sorted(_TEXT_OR_NONE_KEYS & set(document)):
+        if document[name] is not None and not isinstance(document[name], str):
+            return f"has {name} that is not text"
+    for node in document["nodes"]:
+        if not isinstance(node, dict) or not isinstance(node.get("name"), str) or not node["name"]:
+            return "lists a node with no name"
+    return None
+
+
 # Compact once the log is longer than this. Chosen so an operator's
 # ordinary session never triggers one, and a long-lived install does not
 # accumulate an unbounded file. Compaction is the reason a snapshot
@@ -105,6 +188,8 @@ class StateMachine:
         self._compact_threshold = compact_threshold
         self._entries_since_snapshot = 0
         self._dropped_tail_lines = 0
+        #: `applied_digest`'s last answer, for the state object it hashed.
+        self._digest: tuple[AppliedState, str] | None = None
 
     # ----- lifecycle --------------------------------------------------
 
@@ -258,6 +343,25 @@ class StateMachine:
         with self._lock:
             return canonical_bytes(self._state)
 
+    def applied_digest(self) -> tuple[int, str]:
+        """`(index, SHA-256 hex of canonical_bytes)` of the state now
+        (`LogPage.appliedDigest`, row 4).
+
+        Kept for the state object it was computed from, not for the index:
+        a snapshot installed at the index already held replaces the state
+        and keeps the index, and that is exactly when a standby's digest
+        changes."""
+        import hashlib
+
+        with self._lock:
+            state = self._state
+            cached = self._digest
+            if cached is not None and cached[0] is state:
+                return state.index, cached[1]
+            digest = hashlib.sha256(canonical_bytes(state)).hexdigest()
+            self._digest = (state, digest)
+            return state.index, digest
+
     # ----- the write path ---------------------------------------------
 
     def append(
@@ -339,12 +443,32 @@ class StateMachine:
         root" should be an error rather than a quiet rewind.
         """
         with self._lock:
+            # Row 4: a standby now replaces its copy by itself, so what it
+            # takes is checked first. A snapshot that leaves out a field
+            # would clear it (a document of `{"index": 100}` once cleared
+            # the install's identity), and one from another install, or from
+            # a root at a lower epoch, is not this install's state.
+            why = _unusable_snapshot(document)
+            if why is not None:
+                raise ApplyError(f"refusing a snapshot that {why}")
             incoming = from_canonical(document)
             if incoming.index < self._state.index:
                 raise ApplyError(
                     f"refusing a snapshot at index {incoming.index}: this replica has "
                     f"already applied {self._state.index}"
                 )
+            if incoming.epoch < self._state.epoch:
+                raise ApplyError(
+                    f"refusing a snapshot at epoch {incoming.epoch}: this replica holds "
+                    f"epoch {self._state.epoch}"
+                )
+            held, offered = self._state.identity, incoming.identity
+            for name in ("controlPublicKey", "salt"):
+                mine, theirs = getattr(held, name), getattr(offered, name)
+                if mine is not None and theirs != mine:
+                    raise ApplyError(
+                        f"refusing a snapshot of another install: its {name} is not this replica's"
+                    )
             self._store.write_snapshot(document, compact_through=incoming.index)
             self._state = incoming
             self._entries_since_snapshot = 0

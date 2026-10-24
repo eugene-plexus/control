@@ -9,6 +9,7 @@ firewall between buildings.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -17,7 +18,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 
-from .. import machine_list, root_tls, security, tokens, trust
+from .. import __version__, machine_list, root_tls, security, tokens, trust
 from .._generated.models import (
     ControlStatus,
     LogPage,
@@ -115,9 +116,11 @@ async def read_log(
     root knows its lag (warm-standby.md SB4).
     """
     machine: StateMachine = request.app.state.machine
-    _heard_from_standby(request, claims, after)
+    # One read of the state for the index and its digest, so the page
+    # never pairs one index with another state's digest (row 4).
+    applied, digest = machine.applied_digest()
+    _heard_from_standby(request, claims, after, root=(applied, digest))
     first_available = machine.first_available_index()
-    applied = machine.state.index
 
     if after < applied and after + 1 < first_available:
         raise problem(
@@ -132,10 +135,12 @@ async def read_log(
         "entries": machine.read_page(after, limit),
         "appliedIndex": applied,
         "firstAvailableIndex": first_available,
+        "appliedDigest": digest,
     }
     return Response(
         content=json.dumps(page, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
         media_type="application/json",
+        headers={VERSION_HEADER: __version__},
     )
 
 
@@ -258,22 +263,39 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
 
     node_name = getattr(request.app.state, "node_name", None)
     try:
+        replaced = machine.state.epoch
         machine.promote(node=node_name)
     except AlreadyActive as exc:
         raise problem(
             status.HTTP_409_CONFLICT, "Already active", "This control root is already active."
         ) from exc
 
+    # Row 4: this root's own machine table from its own records, before
+    # anything is pushed, so the pushes and every poll after go over TLS to
+    # the keys this copy holds for each node.
+    machine_list.install_table(machine.state, node_name)
+
     # Announce the epoch: a trust bundle at the new epoch, signed with the
     # identity key promotion deliberately preserved (`sealedControlKey`).
-    # Agents record it and refuse the old root's lower one. Best-effort;
-    # a node that is down takes it when it next pulls.
-    if request.app.state.trust.publish(request.app) is None:
+    # Agents record it and refuse the old root's lower one. Then where this
+    # root is (row 4): its machine list, the pair to each machine on its own.
+    # Best-effort; a node that is down takes both when it next pulls, or
+    # from the poll this copy now runs.
+    trust.mark_token_epochs(request.app, epoch=replaced)
+    bundle = request.app.state.trust.sign(machine.state, auth)
+    if bundle is None:
         log.warning(
             "promoted without the control identity key in memory; nodes will learn epoch %d "
             "when this root is next unlocked",
             machine.state.epoch,
         )
+    else:
+        request.app.state.machine_list_push = asyncio.create_task(
+            _announce_root(request.app, bundle), name="control-machine-list-push"
+        )
+    from ..app import start_root_tasks
+
+    start_root_tasks(request.app)
 
     log.warning(
         "PROMOTED to active control root at epoch %d, applied index %d%s",
@@ -384,14 +406,7 @@ async def get_machine_list(request: Request) -> SignedMachineList:
     list signed while this root is sealed.
     """
     _members_only_off_the_network(request, "the machine list")
-    from ..routes.nodes import machine_pins
-
-    machine: StateMachine = request.app.state.machine
-    auth: AuthState = request.app.state.auth_state
-    publisher: machine_list.MachineListPublisher = request.app.state.machine_list
-    jws = publisher.current(
-        machine.state, machine_pins(request.app.state.settings), auth.control_private_key
-    )
+    jws = machine_list.signed(request.app)
     if jws is None:
         raise problem(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -497,19 +512,67 @@ async def get_root_tls(request: Request) -> SignedRootTls:
 # --------------------------------------------------------------------------- #
 
 
+async def _announce_root(app: Any, bundle: tokens.TrustBundle) -> dict[str, bool]:
+    """After a promotion: the bundle at the new epoch and the signed machine
+    list, which names this root, its node and the new epoch, to every node,
+    each machine's pair on its own (row 4, `trust.push_pairs`). The epoch
+    goes first, so a node takes the list from a root whose epoch it already
+    holds; one that takes the list first raises its epoch from the list,
+    which the same key signed."""
+    jws = machine_list.signed(app)
+    if jws is None:
+        log.warning(
+            "promoted, but no machine list could be signed; nodes keep the address they have"
+        )
+    taken = await trust.push_pairs(app, bundle, jws)
+    log.warning(
+        "told %d of %d node(s) where this root is now; the others take it from the next "
+        "poll that reaches them, or ask this machine",
+        sum(taken.values()),
+        len(taken),
+    )
+    return taken
+
+
 #: A standby heard from within this many follow intervals is reachable.
 STANDBY_HEARD_INTERVALS = 3
 
+#: Row 4: the version of control a standby runs, sent on its pulls, and this
+#: root's own on a log page.
+VERSION_HEADER = "Eugene-Plexus-Version"
+#: Row 4: the digest of the standby's copy at the `after` of a log read.
+COPY_DIGEST_HEADER = "Eugene-Plexus-Copy-Digest"
 
-def _heard_from_standby(request: Request, claims: tokens.Claims, applied: int) -> None:
+
+def _heard_from_standby(
+    request: Request,
+    claims: tokens.Claims,
+    applied: int,
+    *,
+    root: tuple[int, str] | None = None,
+) -> None:
     """Record where the standby is, from its own pull (warm-standby.md SB4).
-    An operator reading the log is not a standby, and records nothing."""
+    An operator reading the log is not a standby, and records nothing.
+
+    Row 4: and the version it runs, and, for a log read made at this root's
+    own index (`root`, with its digest) by a standby on this root's version,
+    whether its copy is this root's. Two versions may write one state in
+    different bytes, so another version is not compared; a pull behind this
+    root's index says nothing new about the copy."""
     if claims.is_service and claims.sub == tokens.SUB_STANDBY and claims.issuer_node:
         reports: dict[str, dict[str, Any]] = request.app.state.standby_reports
+        before = reports.get(claims.issuer_node) or {}
+        version = request.headers.get(VERSION_HEADER) or None
+        matches = before.get("matches") if before.get("version") == version else None
+        copy = request.headers.get(COPY_DIGEST_HEADER)
+        if root is not None and copy and version == __version__ and applied == root[0]:
+            matches = copy.strip().lower() == root[1]
         reports[claims.issuer_node] = {
             "appliedIndex": applied,
             "at": datetime.now(UTC),
             "seen": time.perf_counter(),
+            "version": version,
+            "matches": matches,
         }
 
 
@@ -546,5 +609,7 @@ def _standby_statuses(request: Request) -> list[StandbyStatus]:
             ),
             lastContactAt=report["at"] if report else None,
             reachable=recent,
+            version=report.get("version") if report else None,
+            matches=report.get("matches") if report else None,
         )
     ]
