@@ -432,3 +432,70 @@ def test_the_standby_forgets_the_old_key_and_its_keyring_entry(
     passphrase_change.standby_followed(app, salt)
     assert app.state.auth_state.master_key is None  # type: ignore[attr-defined]
     assert deleted == [keyring_store.install_id_for(salt)]
+
+
+class _Nodes:
+    """The root's view of its machines, and what it sent each one."""
+
+    def __init__(self, probes: dict[str, Any], answers: dict[str, tuple[int, Any]]) -> None:
+        self.probes, self.answers = probes, answers
+        self.sent: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def probe_all(self, targets: Any, token_for: Any) -> dict[str, Any]:
+        return self.probes
+
+    async def post(self, url: str, path: str, token: Any, body: dict[str, Any]) -> Any:
+        self.sent.append((url, path, body))
+        for name, answer in self.answers.items():
+            if name in url:
+                return answer
+        raise OSError("connection refused")
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_the_new_passphrase_goes_only_where_it_is_kept_and_never_in_plain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eugene_plexus_control import _http
+    from eugene_plexus_control.applied import OP_ENROLL_NODE
+    from eugene_plexus_control.nodes_client import NodeProbe
+
+    app = create_app(settings_for(tmp_path / "root"))
+    app.state.settings.agent_url = "http://127.0.0.1:18079"
+    with TestClient(app):
+        machine = app.state.machine
+        for name in ("root-box", "tls-box", "plain-box", "none-box", "old-box", "off-box"):
+            machine.append(
+                OP_ENROLL_NODE,
+                {"name": name, "url": f"http://{name}:8079/", "enrolledAt": utcnow_iso()},
+            )
+        app.state.node_name = "root-box"
+        probes = {
+            "root-box": NodeProbe(name="root-box", reachable=True, own_passphrase=True),
+            "tls-box": NodeProbe(name="tls-box", reachable=True, own_passphrase=True),
+            "plain-box": NodeProbe(name="plain-box", reachable=True, own_passphrase=True),
+            "none-box": NodeProbe(name="none-box", reachable=True, own_passphrase=False),
+            "old-box": NodeProbe(name="old-box", reachable=True, own_passphrase=None),
+            "off-box": NodeProbe(name="off-box", reachable=False, error="timed out"),
+        }
+        nodes = _Nodes(probes, {"127.0.0.1": (204, None), "tls-box": (204, None)})
+        app.state.nodes_client = nodes
+        monkeypatch.setattr(
+            _http, "machine_route", lambda url: "https://tls-box:8083" if "tls-box" in url else None
+        )
+        results = await passphrase_change.tell_machines(app, PASSPHRASE, NEW)
+
+    states = {r["node"]: r["state"] for r in results}
+    assert states == {
+        "root-box": "changed",
+        "tls-box": "changed",
+        "plain-box": "plain",
+        "old-box": "pending",
+        "off-box": "pending",
+    }
+    assert [url for url, _, _ in nodes.sent] == ["http://127.0.0.1:18079/", "http://tls-box:8079/"]
+    assert all(path == "/v1/node/passphrase" for _, path, _ in nodes.sent)
+    assert all(body == {"current": PASSPHRASE, "new": NEW} for _, _, body in nodes.sent)
+    assert all(NEW not in json.dumps(r) and PASSPHRASE not in json.dumps(r) for r in results)

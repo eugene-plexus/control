@@ -423,6 +423,10 @@ async def tell_machines(app: Any, current: str, new: str) -> list[dict[str, Any]
                 }
             )
             continue
+        if name == own:
+            # This machine's own agent, on loopback, where the agent takes a
+            # passphrase without TLS: never its LAN address.
+            url = normalize_url(getattr(app.state.settings, "agent_url", None))
         if url is None:
             results.append({"node": name, "state": "pending", "detail": "No address on record."})
             continue
