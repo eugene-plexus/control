@@ -39,6 +39,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.security import HTTPBearer
+from pydantic import ValidationError
 
 from .. import config as config_module
 from .. import keyring_store, machine_list, peer, sealing, security, tokens
@@ -46,6 +47,10 @@ from .._generated.models import (
     AuthInitializeRequest,
     AuthLoginResponse,
     AuthStatus,
+    PassphraseChangeRequest,
+    PassphraseChangeResult,
+    PassphraseFileState,
+    PassphraseMachine,
     TokenExchangeRequest,
     TokenExchangeResponse,
 )
@@ -127,10 +132,19 @@ async def auth_status(request: Request) -> AuthStatus:
             KEYRING_PROBE_BUDGET_SECONDS,
         )
         available = None
+    from .. import passphrase_change
+
+    file_state = (
+        await asyncio.to_thread(passphrase_change.current_file_state, request.app)
+        if machine.state.identity.salt is not None
+        else None
+    )
     return AuthStatus(
         initialized=machine.state.identity.salt is not None,
         unlocked=auth.master_key is not None,
         keyringAvailable=available,
+        # Row 5: checked at each start, every hour and after a change.
+        passphraseFile=PassphraseFileState(file_state) if file_state else None,
     )
 
 
@@ -378,6 +392,141 @@ async def logout(request: Request) -> None:
         ) from exc
     request.app.state.trust.publish(request.app)
     log.info("session signed out")
+
+
+#: The log version `changePassphrase` came with (row 5).
+_CHANGE_LOG_VERSION = 1
+
+
+async def _change_body(request: Request) -> tuple[str, str]:
+    """`{current, new}`, checked here and not by FastAPI: a validation error
+    would echo the passphrase it refused back in its `input`."""
+    try:
+        raw = await request.json()
+    except ValueError:
+        raw = None
+    if not isinstance(raw, dict):
+        raise problem(422, "Passphrases required", "Send the current passphrase and the new one.")
+    try:
+        body = PassphraseChangeRequest.model_validate(raw)
+    except ValidationError as exc:
+        if any(e.get("loc") == ("new",) for e in exc.errors(include_input=False)):
+            raise problem(
+                422,
+                "Passphrase too short",
+                f"Choose a new passphrase of at least {MIN_PASSPHRASE_LENGTH} characters. A few "
+                "ordinary words in a row works.",
+            ) from None
+        raise problem(
+            422, "Passphrases required", "Send the current passphrase and the new one."
+        ) from None
+    return body.current.get_secret_value(), body.new.get_secret_value()
+
+
+@router.post(
+    "/v1/auth/passphrase",
+    response_model=PassphraseChangeResult,
+    response_model_exclude_none=True,
+)
+async def change_passphrase(request: Request) -> PassphraseChangeResult:
+    """Change Eugene's passphrase (row 5, 5b): see `passphrase_change`.
+
+    The owner's session, the current passphrase, and the login limiter,
+    which a wrong `current` counts against like a failed sign-in. Neither
+    passphrase is logged or put in a problem detail."""
+    claims = require_operator(request, await _bearer_scheme(request))
+    if claims.sub != tokens.SUB_OPERATOR:
+        raise problem(status.HTTP_403_FORBIDDEN, "Owner required", "Only Eugene's owner may.")
+    current, new = await _change_body(request)
+    machine: StateMachine = request.app.state.machine
+    auth: AuthState = request.app.state.auth_state
+    remote = (
+        peer.peer_of(
+            request.client.host if request.client else None,
+            request.headers.get(peer.PEER_HEADER),
+        )
+        or "unknown"
+    )
+    if auth.is_login_rate_limited(
+        remote, window_seconds=_RATE_LIMIT_WINDOW_SECONDS, max_in_window=_RATE_LIMIT_MAX_FAILURES
+    ):
+        raise problem(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Rate limited",
+            f"Too many wrong passphrases from {remote}. Wait {_RATE_LIMIT_WINDOW_SECONDS} "
+            "seconds and try again.",
+        )
+    if not machine.is_active:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "Not the active root",
+            "Change the passphrase on the active control root; this one is a standby.",
+        )
+    if auth.master_key is None:
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Locked",
+            "Eugene is locked. Sign in once with the passphrase, then change it.",
+        )
+    verifier = machine.state.identity.passphraseVerifier
+    if verifier is None or not await asyncio.to_thread(
+        security.verify_passphrase, current, verifier
+    ):
+        auth.record_login_failure(
+            remote,
+            window_seconds=_RATE_LIMIT_WINDOW_SECONDS,
+            max_in_window=_RATE_LIMIT_MAX_FAILURES,
+        )
+        log.warning("a passphrase change from %s gave the wrong current passphrase", remote)
+        raise problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Wrong passphrase",
+            "The current passphrase did not match. Nothing changed.",
+        )
+    auth.clear_login_failures(remote)
+    from .control import standby_short_of
+
+    behind = standby_short_of(request.app, _CHANGE_LOG_VERSION)
+    if behind is not None:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "Standby too old",
+            f"Update {behind} first; its copy would stop at this change.",
+        )
+    from .. import passphrase_change
+
+    try:
+        changed = await asyncio.to_thread(
+            passphrase_change.change, request.app, new, actor="operator"
+        )
+    except passphrase_change.CannotOpen as exc:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "A sealed value did not open",
+            f"The {exc.what} did not open with this install's key, so nothing changed. "
+            "Restore it from a copy of the install made before it changed.",
+        ) from exc
+    except passphrase_change.StillOpens as exc:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "A sealed value was missed",
+            "Nothing changed: these values would still open with the old passphrase: "
+            f"{', '.join(exc.paths[:5])}. This version of Eugene does not know them; update it.",
+        ) from exc
+    except passphrase_change.Moved as exc:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "Changed meanwhile",
+            "Something sealed changed while the passphrase was being changed, so nothing "
+            "changed. Try again.",
+        ) from exc
+    request.app.state.trust.publish(request.app)
+    machines = await passphrase_change.tell_machines(request.app, current, new)
+    return PassphraseChangeResult(
+        changedAt=changed.at,
+        machines=[PassphraseMachine.model_validate(m) for m in machines],
+        passphraseFile=PassphraseFileState(changed.passphrase_file),
+    )
 
 
 @router.post("/v1/auth/token", response_model=TokenExchangeResponse)

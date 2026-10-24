@@ -326,6 +326,13 @@ class Provider:
         with self._lock:
             self._keys.clear()
 
+    def keep_only(self, kids: set[str]) -> None:
+        """Drop every unsealed key the state no longer holds (row 5): a
+        retired key is not kept in memory either."""
+        with self._lock:
+            for kid in [k for k in self._keys if k not in kids]:
+                del self._keys[kid]
+
     # --- keys ---------------------------------------------------------
 
     def signing_key(self, machine: Any, auth: Any) -> tuple[str, Any]:

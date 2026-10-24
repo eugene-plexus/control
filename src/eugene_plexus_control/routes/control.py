@@ -541,6 +541,32 @@ STANDBY_HEARD_INTERVALS = 3
 VERSION_HEADER = "Eugene-Plexus-Version"
 #: Row 4: the digest of the standby's copy at the `after` of a log read.
 COPY_DIGEST_HEADER = "Eugene-Plexus-Copy-Digest"
+#: Row 5: the log version a standby applies (`applied.LOG_VERSION`).
+LOG_VERSION_HEADER = "Eugene-Plexus-Log-Version"
+
+
+def _log_version(raw: str | None) -> int:
+    """A standby's log version from its header: 0 when it sent none (older
+    than row 5) or one that is not a number."""
+    try:
+        return max(0, int((raw or "0").strip()))
+    except ValueError:
+        return 0
+
+
+def standby_short_of(app: Any, needed: int) -> str | None:
+    """Row 5: the standby's node when its last pull said it applies a log
+    version below `needed`, so an op of that version would stop its copy.
+    None when there is no standby, or it has not pulled since this root
+    started (default built: a change after a leak does not wait for a machine
+    that is off; one that comes back older is told by its own copy)."""
+    from ..applied import standby_node
+
+    holder = standby_node(app.state.machine.state)
+    report = getattr(app.state, "standby_reports", {}).get(holder) if holder else None
+    if report is None:
+        return None
+    return holder if _log_version(str(report.get("logVersion") or 0)) < needed else None
 
 
 def _heard_from_standby(
@@ -572,6 +598,7 @@ def _heard_from_standby(
             "seen": time.perf_counter(),
             "version": version,
             "matches": matches,
+            "logVersion": _log_version(request.headers.get(LOG_VERSION_HEADER)),
         }
 
 
@@ -610,5 +637,6 @@ def _standby_statuses(request: Request) -> list[StandbyStatus]:
             reachable=recent,
             version=report.get("version") if report else None,
             matches=report.get("matches") if report else None,
+            logVersion=_log_version(str(report.get("logVersion") or 0)) if report else None,
         )
     ]

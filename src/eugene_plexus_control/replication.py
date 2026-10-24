@@ -39,6 +39,7 @@ import contextlib
 import inspect
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -47,7 +48,7 @@ import httpx
 
 from . import __version__, tokens
 from ._http import internal_client
-from .applied import ApplyError
+from .applied import LOG_VERSION, ApplyError
 from .state_machine import StateMachine
 
 log = logging.getLogger(__name__)
@@ -73,6 +74,8 @@ SNAPSHOT_RETRY_SECONDS = 30.0
 #: copy's digest in (`control.yaml`, `readLog`).
 VERSION_HEADER = "Eugene-Plexus-Version"
 COPY_DIGEST_HEADER = "Eugene-Plexus-Copy-Digest"
+#: Row 5: the log version this standby applies (`applied.LOG_VERSION`).
+LOG_VERSION_HEADER = "Eugene-Plexus-Log-Version"
 
 
 class ReplicationRefused(Exception):
@@ -192,9 +195,13 @@ class Follower:
         active_url: str | None,
         interval_seconds: float,
         token_provider: object | None = None,
+        on_passphrase_changed: Callable[[str], None] | None = None,
     ) -> None:
         self._machine = machine
         self._interval = interval_seconds
+        #: Row 5: told the old salt when this copy takes a passphrase change,
+        #: from an entry or a snapshot.
+        self._on_passphrase_changed = on_passphrase_changed
         # See `_http`: shared SSL context, and no proxy between a
         # standby and the active root.
         self._client = internal_client()
@@ -260,7 +267,24 @@ class Follower:
         machine — which persists each before committing it, so a standby
         killed mid-catch-up restarts from a state that matches what it
         had durably accepted.
+
+        Row 5: a pull that changed the install's salt took a passphrase
+        change, and `on_passphrase_changed` hears the old one.
         """
+        before = self._machine.state.identity.salt
+        try:
+            await self._pull()
+        finally:
+            after = self._machine.state.identity.salt
+            if (
+                before is not None
+                and after is not None
+                and after != before
+                and self._on_passphrase_changed is not None
+            ):
+                self._on_passphrase_changed(before)
+
+    async def _pull(self) -> None:
         url = self.status.active_url
         if url is None:
             return
@@ -423,8 +447,9 @@ class Follower:
         token = provider() if callable(provider) else None
         if inspect.isawaitable(token):
             token = await token
-        # Row 4: the root records the version this standby runs.
-        headers = {VERSION_HEADER: __version__}
+        # Row 4: the root records the version this standby runs; row 5, the
+        # log version it applies (every build says the same `__version__`).
+        headers = {VERSION_HEADER: __version__, LOG_VERSION_HEADER: str(LOG_VERSION)}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         return headers

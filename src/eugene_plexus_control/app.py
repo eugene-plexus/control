@@ -148,6 +148,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # config back to an endpoint, and a hanging keyring backend or a
     # missing secret mount is one more thing between the operator and
     # that.
+    # Row 5: a passphrase change that stopped between its entry and the
+    # keyring leaves the old entry behind; it opens nothing now.
+    from . import passphrase_change
+
+    if not settings.safe_mode:
+        passphrase_change.finish_interrupted(app)
     if (
         not settings.safe_mode
         and machine.state.identity.salt is not None
@@ -187,6 +193,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.follower = None
     app.state.node_poller = None
+    # Row 5: whether the passphrase file holds this install's passphrase,
+    # at start and every hour; and the sign-in key's schedule.
+    app.state.passphrase_file_state = None
+    if not settings.safe_mode and machine.state.identity.salt is not None:
+        await asyncio.to_thread(passphrase_change.recheck_file, app)
+    app.state.hourly = asyncio.create_task(_hourly(app), name="control-hourly")
 
     if role == ROLE_STANDBY:
         follower = Follower(
@@ -201,6 +213,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 if settings.agent_url and settings.service_token
                 else None
             ),
+            on_passphrase_changed=lambda old: passphrase_change.standby_followed(app, old),
         )
         follower.start()
         app.state.follower = follower
@@ -233,6 +246,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.root_tls_task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await app.state.root_tls_task
+        app.state.hourly.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await app.state.hourly
         if app.state.machine_list_push is not None:
             app.state.machine_list_push.cancel()
             with suppress(asyncio.CancelledError, Exception):
@@ -258,6 +274,22 @@ def _promoted_here(machine: StateMachine, settings: Settings) -> bool:
     return active_node_name(machine.state) == name and machine.state.epoch > int(
         settings.follow_epoch
     )
+
+
+async def _hourly(app: FastAPI) -> None:
+    """Row 5, once an hour on every root: the passphrase file checked again,
+    and, on the active root, the sign-in key changed when it is due. The
+    first check of the key is an hour after start, so a restart loop never
+    changes it twice."""
+    from . import oidc_keys, passphrase_change
+
+    while True:
+        await asyncio.sleep(oidc_keys.CHECK_EVERY_SECONDS)
+        try:
+            await asyncio.to_thread(passphrase_change.recheck_file, app)
+            await asyncio.to_thread(oidc_keys.tick, app)
+        except Exception as exc:
+            log.warning("the hourly check failed: %s", exc)
 
 
 def _set_aside(store: LogStore) -> list[str]:
@@ -635,6 +667,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(admin_routes.router)
     # Signing in with Eugene (C2): the provider's endpoints, and people.
     app.include_router(oidc_routes.router)
+    from .routes import oidc_keys as oidc_key_routes
+
+    app.include_router(oidc_key_routes.router)
     app.include_router(external_sign_in_routes.router)
     app.include_router(external_sign_in_routes.management)
     app.include_router(people_routes.router)

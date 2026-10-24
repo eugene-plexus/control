@@ -37,6 +37,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .applied import (
+    OP_CHANGE_PASSPHRASE,
     ROLE_CONTROL,
     AppliedState,
     ApplyError,
@@ -62,6 +63,11 @@ _SNAPSHOT_KEYS = frozenset(to_canonical(AppliedState()))
 # accumulate an unbounded file. Compaction is the reason a snapshot
 # exists, and the reason `firstAvailableIndex` is on every log page.
 DEFAULT_COMPACT_THRESHOLD = 512
+
+#: Ops after which every root writes a snapshot and compacts at once (row 5):
+#: the entries before a passphrase change hold values sealed under the key
+#: it replaced, and compaction is what takes them off the disk.
+COMPACT_AFTER = frozenset({OP_CHANGE_PASSPHRASE})
 
 
 class NotActive(Exception):
@@ -327,7 +333,7 @@ class StateMachine:
             self._state = candidate
             self._entries_since_snapshot += 1
 
-            self._maybe_compact_locked()
+            self._maybe_compact_locked(op)
             return entry
 
     def accept_replicated(self, entry: dict[str, Any]) -> None:
@@ -346,7 +352,7 @@ class StateMachine:
             self._store.append(entry)
             self._state = candidate
             self._entries_since_snapshot += 1
-            self._maybe_compact_locked()
+            self._maybe_compact_locked(entry.get("op"))
 
     def install_snapshot(self, document: dict[str, Any]) -> None:
         """Adopt a snapshot wholesale. How a standby starts, and how one
@@ -380,7 +386,12 @@ class StateMachine:
                     f"epoch {self._state.epoch}"
                 )
             held, offered = self._state.identity, incoming.identity
-            for name in ("controlPublicKey", "salt"):
+            # The identity key names the install. The salt names it too, but
+            # only until the passphrase changes (row 5, `changePassphrase`
+            # makes a new one and keeps the identity key), so it is the test
+            # only for a replica that holds no identity key.
+            names = ("controlPublicKey",) if held.controlPublicKey is not None else ("salt",)
+            for name in names:
                 mine, theirs = getattr(held, name), getattr(offered, name)
                 if mine is not None and theirs != mine:
                     raise ApplyError(
@@ -398,7 +409,18 @@ class StateMachine:
             self._store.write_snapshot(document, compact_through=self._state.index)
             self._entries_since_snapshot = 0
 
-    def _maybe_compact_locked(self) -> None:
+    def _maybe_compact_locked(self, op: Any = None) -> None:
+        if op in COMPACT_AFTER:
+            # Row 5: after a passphrase change, at once and on every root that
+            # applies it, so no value sealed under the old key stays in the
+            # log. The change itself stays (it holds only values sealed under
+            # the new key), so a standby one entry behind reads it from the
+            # log instead of taking a snapshot.
+            document = to_canonical(self._state)
+            self._store.write_snapshot(document, compact_through=self._state.index - 1)
+            self._entries_since_snapshot = 0
+            log.info("snapshot written at index %d after %s; log compacted", self._state.index, op)
+            return
         if self._entries_since_snapshot < self._compact_threshold:
             return
         document = to_canonical(self._state)

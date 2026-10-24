@@ -117,6 +117,18 @@ OP_SET_STANDBY = "setStandby"
 OP_LABEL_NODE = "labelNode"
 OP_SET_INSTALL_CA = "setInstallCa"
 OP_SET_NODE_CERTIFICATE_NAMES = "setNodeCertificateNames"
+# Row 5 (`specs/docs/design/rows/row-05.md`), log version 1.
+OP_RETIRE_OIDC_KEYS = "retireOidcKeys"
+OP_CHANGE_PASSPHRASE = "changePassphrase"
+
+#: The log version this build applies (`Eugene-Plexus-Log-Version`, row 5):
+#: which ops it knows. Every build reports the same `__version__`, so a root
+#: asks this number, not that one, whether its standby can apply an op. Raise
+#: it with the op that needs it, and name the op here.
+#:
+#: * 0: every op before row 5 (what a standby that sends no number applies).
+#: * 1: `retireOidcKeys`, `changePassphrase`.
+LOG_VERSION = 1
 
 #: The grant that makes a node the install's warm standby (warm-standby.md).
 GRANT_STANDBY = "standby"
@@ -163,6 +175,8 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_LABEL_NODE,
         OP_SET_INSTALL_CA,
         OP_SET_NODE_CERTIFICATE_NAMES,
+        OP_RETIRE_OIDC_KEYS,
+        OP_CHANGE_PASSPHRASE,
     }
 )
 
@@ -345,7 +359,9 @@ class InstallIdentity:
     """The trust root's own replicated material.
 
     Established once by `POST /v1/auth/initialize` and thereafter
-    mutated only by `rotateSigningKey`. **Initialization is not a log
+    mutated only by `rotateSigningKey`, `setInstallCa` and (row 5)
+    `changePassphrase`, which replaces the salt, the verifier and every
+    sealed value at once. **Initialization is not a log
     op**, and that is correct rather than an omission: it happens
     exactly once, before any standby can exist, so the snapshot always
     carries it forward and it never needs to replicate as an entry.
@@ -1362,6 +1378,96 @@ def _apply_put_oidc_key(state: AppliedState, payload: dict[str, Any], index: int
     return replace(state, oidc_keys=(record, *state.oidc_keys)[:OIDC_KEYS_KEPT])
 
 
+def _apply_retire_oidc_keys(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    """Keep only the sign-in keys `keep` names (row 5): after a suspected
+    leak, every token the others signed stops verifying. At least one held
+    key stays, or nothing could verify a sign-in at all."""
+    keep = payload.get("keep")
+    if not isinstance(keep, list) or not keep or any(not isinstance(k, str) for k in keep):
+        raise ApplyError(f"entry {index}: retireOidcKeys needs `keep`, a list of key ids")
+    held = {k["kid"] for k in state.oidc_keys}
+    if not set(keep) <= held:
+        raise ApplyError(f"entry {index}: retireOidcKeys keeps a sign-in key that is not here")
+    return replace(state, oidc_keys=tuple(k for k in state.oidc_keys if k["kid"] in keep))
+
+
+#: The identity's sealed values, as `changePassphrase`'s `sealed` names them.
+SEALED_IDENTITY = {
+    "signingKey": "sealedSigningKey",
+    "controlKey": "sealedControlKey",
+    "recoveryKey": "sealedRecoveryKey",
+    "installCaKey": "sealedInstallCaKey",
+}
+
+
+def sealed_inventory(state: AppliedState) -> dict[str, Any]:
+    """Every value in applied state sealed under the master key, by where it
+    is, in the shape `changePassphrase`'s `sealed` takes (row 5).
+
+    The one list of them. A sealed field added later must be added here, or
+    a passphrase change refuses to apply: `passphrase_change` also walks
+    every string of the state it would write and refuses one that still
+    opens with the old key, so a field missing here is found, not lost."""
+    identity = state.identity
+    inventory: dict[str, Any] = {
+        name: getattr(identity, attribute)
+        for name, attribute in SEALED_IDENTITY.items()
+        if getattr(identity, attribute)
+    }
+    inventory["oidcKeys"] = {k["kid"]: k["sealedKey"] for k in state.oidc_keys}
+    inventory["externalProviders"] = {
+        ident: record["sealedSecret"]
+        for ident, record in sorted((state.browser_sign_in.get("providers") or {}).items())
+        if record.get("sealedSecret")
+    }
+    return inventory
+
+
+def _apply_change_passphrase(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    """A new salt and verifier, and every sealed value sealed again under the
+    new master key by the writer (row 5). `sealed` must name exactly what
+    `sealed_inventory` holds: a value it missed would stay sealed under the
+    old key, which nobody can derive any more, and one it adds is not here."""
+    salt = _require_str(payload, "salt", index)
+    verifier = _require_str(payload, "passphraseVerifier", index)
+    sealed = payload.get("sealed")
+    if not isinstance(sealed, dict):
+        raise ApplyError(f"entry {index}: changePassphrase needs `sealed`")
+    held = sealed_inventory(state)
+
+    def shape(value: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: sorted(item) if isinstance(item, dict) else None for key, item in value.items()
+        }
+
+    if shape(sealed) != shape(held):
+        raise ApplyError(
+            f"entry {index}: changePassphrase does not name exactly the sealed values held"
+        )
+    for key, item in sealed.items():
+        values = item.values() if isinstance(item, dict) else [item]
+        if any(not isinstance(v, str) or not v for v in values):
+            raise ApplyError(f"entry {index}: changePassphrase's {key} must be sealed strings")
+
+    identity = replace(
+        state.identity,
+        salt=salt,
+        passphraseVerifier=verifier,
+        **{SEALED_IDENTITY[name]: sealed[name] for name in SEALED_IDENTITY if name in sealed},
+    )
+    keys = tuple({**k, "sealedKey": sealed["oidcKeys"][k["kid"]]} for k in state.oidc_keys)
+    sign_in = dict(state.browser_sign_in)
+    providers = dict(sign_in.get("providers") or {})
+    for ident, secret in sealed["externalProviders"].items():
+        providers[ident] = {**providers[ident], "sealedSecret": secret}
+    sign_in["providers"] = providers
+    return replace(state, identity=identity, oidc_keys=keys, browser_sign_in=sign_in)
+
+
 def _apply_revoke_sign_in(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
     """As `revokeSession`, for a sign-in at `/oidc/revoke`."""
     sid = _require_str(payload, "sid", index)
@@ -1524,6 +1630,8 @@ _HANDLERS: dict[str, _Handler] = {
     OP_LABEL_NODE: _apply_label_node,
     OP_SET_INSTALL_CA: _apply_set_install_ca,
     OP_SET_NODE_CERTIFICATE_NAMES: _apply_set_node_certificate_names,
+    OP_RETIRE_OIDC_KEYS: _apply_retire_oidc_keys,
+    OP_CHANGE_PASSPHRASE: _apply_change_passphrase,
     **{op: partial(sign_in_state.apply, op=op) for op in sign_in_state.OPS},
 }
 

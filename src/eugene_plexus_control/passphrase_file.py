@@ -176,4 +176,37 @@ def _warn_if_widely_readable(path: Path) -> None:
         )
 
 
-__all__ = ["MAX_BYTES", "read_passphrase"]
+def _write(path: Path, text: str) -> None:
+    from ._private_files import write_private_text
+
+    write_private_text(path, text)
+
+
+def write_passphrase(path: Path, passphrase: str) -> bool:
+    """After a passphrase change (row 5): put the new one in the file, so the
+    next start unlocks. False when it cannot be written, which is the usual
+    case for a container secret (a read-only mount): the caller reports the
+    file as `old` and the operator puts the new passphrase there.
+
+    Never deletes the file and never logs the passphrase. The file as it was
+    is left alone on a failure."""
+    try:
+        if path.is_file() and path.read_bytes() == passphrase.encode("utf-8"):
+            return True
+    except OSError:
+        pass  # unreadable is a reason to try writing it, not to give up
+    try:
+        _write(path, passphrase)
+    except OSError as exc:
+        log.warning(
+            "could not write the new passphrase to %s (%s); it holds the old one, so after a "
+            "restart this root stays locked until someone signs in",
+            path,
+            exc,
+        )
+        return False
+    log.info("the new passphrase is in %s for unlocking after a restart", path)
+    return True
+
+
+__all__ = ["MAX_BYTES", "read_passphrase", "write_passphrase"]

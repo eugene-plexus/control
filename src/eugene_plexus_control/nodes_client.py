@@ -75,6 +75,10 @@ class NodeProbe:
     """The epoch the node's root address came with (`controlUrlEpoch`, row 4):
     below this root's epoch, the node still follows the root it had. None
     from an agent older than row 4."""
+    own_passphrase: bool | None = None
+    """Whether the node's agent keeps a passphrase of its own
+    (`ownPassphrase`, row 5): a changed passphrase is sent only to these.
+    None from an agent older than row 5."""
 
 
 TokenFor = Callable[[str], str | None]
@@ -185,6 +189,9 @@ class NodesClient:
             if isinstance(listed, int) and not isinstance(listed, bool)
             else None,
             control_url_epoch=_int_or_none(body.get("controlUrlEpoch")),
+            own_passphrase=body["ownPassphrase"]
+            if isinstance(body.get("ownPassphrase"), bool)
+            else None,
         )
 
     async def probe_all(
@@ -266,6 +273,20 @@ class NodesClient:
             return response.json()
         except ValueError:
             return None
+
+    async def post(
+        self, url: str, path: str, token: str | None, body: dict[str, Any]
+    ) -> tuple[int, Any]:
+        """POST to one node. The status and body come back as the agent gave
+        them (row 5: a passphrase change reads the agent's own refusal)."""
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        response = await self._client.post(
+            f"{self._transport_url(url)}{path}", headers=headers, json=body, timeout=self._timeout
+        )
+        try:
+            return response.status_code, response.json()
+        except ValueError:
+            return response.status_code, {"detail": response.text}
 
     async def delete(self, url: str, path: str, token: str | None) -> tuple[int, Any]:
         """DELETE on one node. The status and body come back as the agent
