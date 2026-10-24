@@ -471,6 +471,11 @@ async def test_the_new_passphrase_goes_only_where_it_is_kept_and_never_in_plain(
                 OP_ENROLL_NODE,
                 {"name": name, "url": f"http://{name}:8079/", "enrolledAt": utcnow_iso()},
             )
+        # A second agent on this machine: loopback crosses no network.
+        machine.append(
+            OP_ENROLL_NODE,
+            {"name": "loop-box", "url": "http://127.0.0.2:18080/", "enrolledAt": utcnow_iso()},
+        )
         app.state.node_name = "root-box"
         probes = {
             "root-box": NodeProbe(name="root-box", reachable=True, own_passphrase=True),
@@ -479,8 +484,12 @@ async def test_the_new_passphrase_goes_only_where_it_is_kept_and_never_in_plain(
             "none-box": NodeProbe(name="none-box", reachable=True, own_passphrase=False),
             "old-box": NodeProbe(name="old-box", reachable=True, own_passphrase=None),
             "off-box": NodeProbe(name="off-box", reachable=False, error="timed out"),
+            "loop-box": NodeProbe(name="loop-box", reachable=True, own_passphrase=True),
         }
-        nodes = _Nodes(probes, {"127.0.0.1": (204, None), "tls-box": (204, None)})
+        nodes = _Nodes(
+            probes,
+            {"127.0.0.1": (204, None), "tls-box": (204, None), "127.0.0.2": (204, None)},
+        )
         app.state.nodes_client = nodes
         monkeypatch.setattr(
             _http, "machine_route", lambda url: "https://tls-box:8083" if "tls-box" in url else None
@@ -494,8 +503,13 @@ async def test_the_new_passphrase_goes_only_where_it_is_kept_and_never_in_plain(
         "plain-box": "plain",
         "old-box": "pending",
         "off-box": "pending",
+        "loop-box": "changed",
     }
-    assert [url for url, _, _ in nodes.sent] == ["http://127.0.0.1:18079/", "http://tls-box:8079/"]
+    assert [url for url, _, _ in nodes.sent] == [
+        "http://127.0.0.2:18080/",
+        "http://127.0.0.1:18079/",
+        "http://tls-box:8079/",
+    ]
     assert all(path == "/v1/node/passphrase" for _, path, _ in nodes.sent)
     assert all(body == {"current": PASSPHRASE, "new": NEW} for _, _, body in nodes.sent)
     assert all(NEW not in json.dumps(r) and PASSPHRASE not in json.dumps(r) for r in results)

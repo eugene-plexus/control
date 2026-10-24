@@ -370,6 +370,21 @@ def current_file_state(app: Any) -> str | None:
 # --------------------------------------------------------------------------- #
 
 
+def _on_this_machine(url: str) -> bool:
+    """A loopback address never leaves this machine (two agents on one
+    host), so a passphrase sent there crosses no network."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(url).hostname or "").strip("[]").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _problem_type(body: Any) -> str:
     if isinstance(body, dict):
         for holder in (body, body.get("detail")):
@@ -430,7 +445,7 @@ async def tell_machines(app: Any, current: str, new: str) -> list[dict[str, Any]
         if url is None:
             results.append({"node": name, "state": "pending", "detail": "No address on record."})
             continue
-        if name != own and machine_route(url) is None:
+        if name != own and not _on_this_machine(url) and machine_route(url) is None:
             results.append(
                 {
                     "node": name,
