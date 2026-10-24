@@ -2,6 +2,7 @@
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 import pytest
 
@@ -392,3 +393,51 @@ def test_a_key_without_a_person_carries_no_band(active_client):
         answer = call(c, key, action)
         assert answer.status_code == 200, answer.text
         assert "queueBand" not in answer.json() and "personId" not in answer.json()
+
+
+def _rotate(c, key_id, overlap=600):
+    response = c.post(f"/v1/auth/client-keys/{key_id}/rotate", json={"overlapSeconds": overlap})
+    assert response.status_code == 201, response.text
+    return response.json()["key"]["id"]
+
+
+def test_acquire_records_last_used_to_the_minute(active_client, tmp_path):
+    c = active_client
+    key = mint(c)["key"]["id"]
+    assert "lastUsedAt" not in c.get("/v1/auth/client-keys").json()["keys"][0]
+    assert call(c, key, "acquire").status_code == 200
+    used = c.get("/v1/auth/client-keys").json()["keys"][0]["lastUsedAt"]
+    assert used.endswith("00Z") or ":00" in used  # to the minute
+    assert datetime.fromisoformat(used.replace("Z", "+00:00")).second == 0
+    # A check writes at most one log entry a minute, and the value survives a restart.
+    machine = c.app.state.machine
+    before = machine.state.index
+    for n in range(5):
+        assert call(c, key, "check", f"c{n}").status_code == 200
+    assert machine.state.index - before <= 1
+    recovered = machine_at(tmp_path / "active" / "state")
+    stored = recovered.state.client_keys[key]["lastUsedAt"]
+    assert datetime.fromisoformat(stored) == datetime.fromisoformat(used.replace("Z", "+00:00"))
+
+
+def test_old_and_new_tokens_share_one_concurrency_limit(active_client):
+    c = active_client
+    old = mint(c, maxConcurrentRequests=1, requestsPerMinute=60)["key"]["id"]
+    new = _rotate(c, old)
+    assert call(c, old, "acquire", "stream").status_code == 200
+    assert call(c, new, "acquire", "other").status_code == 429
+    assert call(c, old, "release", "stream").status_code == 200
+    assert call(c, new, "acquire", "other").status_code == 200
+
+
+def test_a_retired_key_renews_but_cannot_acquire(active_client):
+    c = active_client
+    old = mint(c, maxConcurrentRequests=2)["key"]["id"]
+    assert call(c, old, "acquire", "stream").status_code == 200
+    new = _rotate(c, old, overlap=0)
+    refused = call(c, old, "acquire", "next")
+    assert refused.status_code == 401 and "replaced" in refused.text
+    assert call(c, old, "check", "chk").status_code == 401
+    assert call(c, old, "renew", "stream").status_code == 200
+    assert call(c, old, "release", "stream").status_code == 200
+    assert call(c, new, "acquire", "next").status_code == 200

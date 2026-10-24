@@ -266,8 +266,8 @@ class StateMachine:
         purpose: str = "inference",
     ) -> dict[str, Any]:
         """Read, decide and commit under one lock, including policy edits."""
-        from .applied import OP_PUT_CLIENT_ADMISSION
-        from .client_admission import decide
+        from .applied import OP_PUT_CLIENT_ADMISSION, OP_TOUCH_CLIENT_KEY
+        from .client_admission import decide, lineage_of
         from .person_access import check, queue_band
 
         with self._lock:
@@ -296,15 +296,21 @@ class StateMachine:
                 principal=identity,
                 purpose=purpose,
             )
+            key = self._state.client_keys.get(key_id)
+            used = _minute_after(key, action)
             if candidate is not None:
-                self.append(
-                    OP_PUT_CLIENT_ADMISSION,
-                    {
-                        "clock": candidate["clock"],
-                        "keyId": key_id,
-                        "bucket": candidate["buckets"].get(key_id, {}),
-                    },
-                )
+                bucket_id = lineage_of(key, key_id)
+                payload = {
+                    "clock": candidate["clock"],
+                    "keyId": bucket_id,
+                    "bucket": candidate["buckets"].get(bucket_id, {}),
+                }
+                if used is not None:
+                    payload |= {"usedId": key_id, "usedAt": used}
+                self.append(OP_PUT_CLIENT_ADMISSION, payload)
+            elif used is not None:
+                # A check writes at most one entry a minute for each key.
+                self.append(OP_TOUCH_CLIENT_KEY, {"id": key_id, "usedAt": used})
             return {**result, **identity, **queue_band(self._state, identity)}
 
     def first_available_index(self) -> int:
@@ -568,3 +574,18 @@ def active_node_name(state: AppliedState) -> str | None:
         if record.role == ROLE_CONTROL:
             return record.name
     return None
+
+
+def _minute_after(key: dict[str, Any] | None, action: str) -> str | None:
+    """The current minute, when a check or acquisition should move `lastUsedAt`.
+
+    None when the key already carries this minute, so a poll loop writes one
+    log entry a minute for each key, not one for each request.
+    """
+    if key is None or action not in ("check", "acquire"):
+        return None
+    minute = datetime.now(UTC).replace(second=0, microsecond=0)
+    last = key.get("lastUsedAt")
+    if last is not None and datetime.fromisoformat(last) >= minute:
+        return None
+    return minute.isoformat()
