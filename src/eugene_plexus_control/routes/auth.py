@@ -106,7 +106,7 @@ def install_id_of(machine: StateMachine) -> str:
     return keyring_store.install_id_for(salt) if salt else ""
 
 
-@router.get("/v1/auth/status", response_model=AuthStatus)
+@router.get("/v1/auth/status", response_model=AuthStatus, response_model_exclude_unset=True)
 async def auth_status(request: Request) -> AuthStatus:
     """Has this install been through first-run setup, is it unlocked, and
     can this host's keyring keep it that way?
@@ -139,12 +139,14 @@ async def auth_status(request: Request) -> AuthStatus:
         if machine.state.identity.salt is not None
         else None
     )
+    # Row 5: checked at each start, every hour and after a change; absent
+    # when it could not be read.
+    extra = {"passphraseFile": PassphraseFileState(file_state)} if file_state else {}
     return AuthStatus(
         initialized=machine.state.identity.salt is not None,
         unlocked=auth.master_key is not None,
         keyringAvailable=available,
-        # Row 5: checked at each start, every hour and after a change.
-        passphraseFile=PassphraseFileState(file_state) if file_state else None,
+        **extra,
     )
 
 

@@ -288,11 +288,10 @@ FIELDS: list[ConfigField] = [
         key="signInKeyDays",
         label="Days before the sign-in key changes",
         description=(
-            "How many days the key that signs app sign-ins is used before the "
-            "active root makes a new one by itself. Apps stay signed in: the old "
-            "key keeps working until the last sign-in it made has to be renewed "
-            "(30 days). At least 31 days; 0 means never.\n\n"
-            "To change it now, or after a leak, use Change sign-in key on People."
+            "How often the active root makes a new sign-in key for apps, in days.\n\n"
+            "Apps stay signed in: the old key keeps working until the last sign-in "
+            "it made must be renewed (30 days). At least 31; 0 means never. To "
+            "change the key now, or after a leak, use Change sign-in key on People."
         ),
         category="security",
         valueType=ConfigValueType.integer,
