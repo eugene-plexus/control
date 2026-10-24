@@ -257,6 +257,50 @@ def redirect_allowed(client: dict[str, Any], uri: str, issuer: str | None = None
     return uri in client["redirectUris"]
 
 
+#: The most bytes the group claims may add to an ID token (row 70c): an app may keep the
+#: token in a cookie, and a browser drops a cookie over 4 KB. `/oidc/userinfo` is not cut.
+ID_TOKEN_GROUP_BYTES = 1024
+
+
+def _json_bytes(value: Any) -> int:
+    """The bytes `value` takes in a signed token's payload: compact JSON with non-ASCII
+    escaped, as PyJWT writes it (`json.dumps` with its default `ensure_ascii`). Counting UTF-8
+    instead undercounts a name outside the Basic Multilingual Plane sixfold (row 70c review)."""
+    return len(json.dumps(value, separators=(",", ":")).encode("ascii"))
+
+
+def capped_group_claims(
+    groups: list[dict[str, str]], policies: dict[str, Any], cap: int
+) -> dict[str, Any]:
+    """The group claims as an ID token carries them: whole when they fit in `cap` bytes.
+
+    Past the cap: the groups that fit, from the start of the name-ordered list; every
+    policy value; in `setBy`, only the groups listed; and `eugene_groups_truncated: true`,
+    so an app that needs them all reads `/oidc/userinfo`. Everything this adds to the
+    token, the flag included, fits in `cap` (as signed: `_json_bytes`)."""
+    whole = {"eugene_groups": groups, "eugene_policies": policies}
+    if _json_bytes(whole) <= cap:
+        return whole
+
+    def cut(count: int) -> dict[str, Any]:
+        kept = groups[:count]
+        named = {g["id"] for g in kept}
+        trimmed = {k: v for k, v in policies.items() if k != "setBy"}
+        set_by = {
+            policy: [g for g in ids if g in named]
+            for policy, ids in (policies.get("setBy") or {}).items()
+        }
+        set_by = {policy: ids for policy, ids in set_by.items() if ids}
+        if set_by:
+            trimmed["setBy"] = set_by
+        return {"eugene_groups": kept, "eugene_policies": trimmed, "eugene_groups_truncated": True}
+
+    count = 0
+    while count < len(groups) and _json_bytes(cut(count + 1)) <= cap:
+        count += 1
+    return cut(count)
+
+
 def group_claims(state: Any, sub: str) -> dict[str, Any]:
     """`eugene_groups` and `eugene_policies` (row 70), from the root's state
     now: the person's groups as `{id, name}`, and the policies in effect
@@ -472,7 +516,12 @@ def token_response(
     if client_id in machine.state.oidc_clients:
         # Worked out at each sign-in and refresh, so a change reaches the
         # app within one ID token's life. Never for a built-in client.
-        id_claims.update(group_claims(machine.state, subject.sub))
+        found = group_claims(machine.state, subject.sub)
+        id_claims.update(
+            capped_group_claims(
+                found["eugene_groups"], found["eugene_policies"], ID_TOKEN_GROUP_BYTES
+            )
+        )
     access = {
         **base,
         "exp": issued + ACCESS_TOKEN_TTL_SECONDS,

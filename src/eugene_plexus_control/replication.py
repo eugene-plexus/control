@@ -377,9 +377,11 @@ class Follower:
             return
         if not self._snapshot_due():
             return
-        self._resnapshot_at = now
         log.warning("this copy differs from the root at index %d; taking a fresh snapshot", index)
-        await self._install_snapshot(url, recovering=False)
+        # The 10 minutes start only once a snapshot was taken (re-review): a
+        # failed one is retried after `SNAPSHOT_RETRY_SECONDS`.
+        if await self._install_snapshot(url, recovering=False):
+            self._resnapshot_at = now
 
     async def _get_page(self, url: str, after: int) -> tuple[dict[str, Any], str | None]:
         """A log page, and the root's version from its header."""

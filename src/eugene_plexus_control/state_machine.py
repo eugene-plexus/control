@@ -54,9 +54,88 @@ log = logging.getLogger(__name__)
 ROLE_ACTIVE = "control"
 ROLE_STANDBY = "standby"
 
-#: Every field a `Snapshot` document carries (`to_canonical`), all of which
-#: a snapshot must hold to replace a replica's state (row 4).
-_SNAPSHOT_KEYS = frozenset(to_canonical(AppliedState()))
+#: The `Snapshot` fields every supported root writes (row 4 re-review): a
+#: snapshot without one would clear what it holds. A field added later is
+#: optional, so a root older than the standby is still followed, and its
+#: absence reads as empty.
+_REQUIRED_SNAPSHOT_KEYS = frozenset(
+    {
+        "index",
+        "epoch",
+        "nodes",
+        "components",
+        "runtimes",
+        "config",
+        "salt",
+        "passphraseVerifier",
+        "sealedSigningKey",
+        "controlPublicKey",
+        "sealedControlKey",
+        "rootTokenPublicKey",
+        "revokedSessions",
+    }
+)
+#: Fields that are lists, and fields that are objects, wherever they appear.
+_LIST_KEYS = frozenset(
+    {
+        "nodes",
+        "components",
+        "runtimes",
+        "clientKeys",
+        "accessAudit",
+        "revokedSessions",
+        "people",
+        "permissionGroups",
+        "sites",
+        "oidcClients",
+        "oidcKeys",
+        "revokedSignIns",
+    }
+)
+_OBJECT_KEYS = frozenset({"config", "clientAdmission", "browserSignIn"})
+_TEXT_OR_NONE_KEYS = frozenset(
+    {
+        "salt",
+        "passphraseVerifier",
+        "sealedSigningKey",
+        "rootTokenPublicKey",
+        "sealedControlKey",
+        "controlPublicKey",
+        "sealedRecoveryKey",
+        "signingKeyId",
+        "installCaCertificate",
+        "sealedInstallCaKey",
+    }
+)
+
+
+def _unusable_snapshot(document: Any) -> str | None:
+    """Why `document` cannot replace a replica's state, or None (row 4
+    re-review). Presence alone is not enough: the parser reads `nodes: null`
+    as no nodes, so a snapshot saying so would clear the registry."""
+    if not isinstance(document, dict):
+        return "is not an object"
+    missing = sorted(_REQUIRED_SNAPSHOT_KEYS - set(document))
+    if missing:
+        return f"is incomplete: it has no {', '.join(missing)}"
+    for name in ("index", "epoch"):
+        value = document[name]
+        if type(value) is not int or value < (1 if name == "epoch" else 0):
+            return f"has an unusable {name} ({value!r})"
+    for name in sorted(_LIST_KEYS & set(document)):
+        if not isinstance(document[name], list):
+            return f"has {name} that is not a list ({type(document[name]).__name__})"
+    for name in sorted(_OBJECT_KEYS & set(document)):
+        if not isinstance(document[name], dict):
+            return f"has {name} that is not an object ({type(document[name]).__name__})"
+    for name in sorted(_TEXT_OR_NONE_KEYS & set(document)):
+        if document[name] is not None and not isinstance(document[name], str):
+            return f"has {name} that is not text"
+    for node in document["nodes"]:
+        if not isinstance(node, dict) or not isinstance(node.get("name"), str) or not node["name"]:
+            return "lists a node with no name"
+    return None
+
 
 # Compact once the log is longer than this. Chosen so an operator's
 # ordinary session never triggers one, and a long-lived install does not
@@ -193,8 +272,8 @@ class StateMachine:
         purpose: str = "inference",
     ) -> dict[str, Any]:
         """Read, decide and commit under one lock, including policy edits."""
-        from .applied import OP_PUT_CLIENT_ADMISSION
-        from .client_admission import decide
+        from .applied import OP_PUT_CLIENT_ADMISSION, OP_TOUCH_CLIENT_KEY
+        from .client_admission import decide, lineage_of
         from .person_access import check, queue_band
 
         with self._lock:
@@ -223,15 +302,21 @@ class StateMachine:
                 principal=identity,
                 purpose=purpose,
             )
+            key = self._state.client_keys.get(key_id)
+            used = _minute_after(key, action)
             if candidate is not None:
-                self.append(
-                    OP_PUT_CLIENT_ADMISSION,
-                    {
-                        "clock": candidate["clock"],
-                        "keyId": key_id,
-                        "bucket": candidate["buckets"].get(key_id, {}),
-                    },
-                )
+                bucket_id = lineage_of(key, key_id)
+                payload = {
+                    "clock": candidate["clock"],
+                    "keyId": bucket_id,
+                    "bucket": candidate["buckets"].get(bucket_id, {}),
+                }
+                if used is not None:
+                    payload |= {"usedId": key_id, "usedAt": used}
+                self.append(OP_PUT_CLIENT_ADMISSION, payload)
+            elif used is not None:
+                # A check writes at most one entry a minute for each key.
+                self.append(OP_TOUCH_CLIENT_KEY, {"id": key_id, "usedAt": used})
             return {**result, **identity, **queue_band(self._state, identity)}
 
     def first_available_index(self) -> int:
@@ -369,11 +454,9 @@ class StateMachine:
             # would clear it (a document of `{"index": 100}` once cleared
             # the install's identity), and one from another install, or from
             # a root at a lower epoch, is not this install's state.
-            missing = sorted(_SNAPSHOT_KEYS - set(document))
-            if missing:
-                raise ApplyError(
-                    f"refusing a snapshot that is incomplete: it has no {', '.join(missing)}"
-                )
+            why = _unusable_snapshot(document)
+            if why is not None:
+                raise ApplyError(f"refusing a snapshot that {why}")
             incoming = from_canonical(document)
             if incoming.index < self._state.index:
                 raise ApplyError(
@@ -513,3 +596,18 @@ def active_node_name(state: AppliedState) -> str | None:
         if record.role == ROLE_CONTROL:
             return record.name
     return None
+
+
+def _minute_after(key: dict[str, Any] | None, action: str) -> str | None:
+    """The current minute, when a check or acquisition should move `lastUsedAt`.
+
+    None when the key already carries this minute, so a poll loop writes one
+    log entry a minute for each key, not one for each request.
+    """
+    if key is None or action not in ("check", "acquire"):
+        return None
+    minute = datetime.now(UTC).replace(second=0, microsecond=0)
+    last = key.get("lastUsedAt")
+    if last is not None and datetime.fromisoformat(last) >= minute:
+        return None
+    return minute.isoformat()

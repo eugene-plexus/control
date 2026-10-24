@@ -55,11 +55,17 @@ def token_epochs(state: AppliedState) -> tuple[int, int] | None:
     return since, epoch
 
 
-def mark_token_epochs(app: Any) -> bool:
+def mark_token_epochs(app: Any, *, epoch: int | None = None) -> bool:
     """Write `tokenEpochs` once, on an active root that can sign: from now on
     a verifier refuses a root token without `ep` that is newer than this, or
     held across a promotion (row 4, `tokens._check_epoch`). Returns whether
-    it wrote it."""
+    it wrote it.
+
+    `epoch` is the last epoch whose root may have signed tokens without
+    `ep`: this root's own, unless it was just promoted (re-review): a root
+    promoted from a copy never signed a token without `ep`, so the one it
+    replaced is named, and that root's tokens without `ep` are refused at
+    once, wherever this mark is first written."""
     from .applied import OP_PATCH_CONFIG
 
     machine = app.state.machine
@@ -67,9 +73,10 @@ def mark_token_epochs(app: Any) -> bool:
         return False
     if token_epochs(machine.state) is not None:
         return False
+    legacy = machine.state.epoch if epoch is None else epoch
     machine.append(
         OP_PATCH_CONFIG,
-        {"values": {TOKEN_EPOCHS: {"since": int(time.time()), "epoch": machine.state.epoch}}},
+        {"values": {TOKEN_EPOCHS: {"since": int(time.time()), "epoch": legacy}}},
     )
     log.info("every token this root signs now carries its epoch")
     return True

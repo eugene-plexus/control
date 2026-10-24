@@ -263,6 +263,7 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
 
     node_name = getattr(request.app.state, "node_name", None)
     try:
+        replaced = machine.state.epoch
         machine.promote(node=node_name)
     except AlreadyActive as exc:
         raise problem(
@@ -280,7 +281,7 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
     # root is (row 4): its machine list, the pair to each machine on its own.
     # Best-effort; a node that is down takes both when it next pulls, or
     # from the poll this copy now runs.
-    trust.mark_token_epochs(request.app)
+    trust.mark_token_epochs(request.app, epoch=replaced)
     bundle = request.app.state.trust.sign(machine.state, auth)
     if bundle is None:
         log.warning(

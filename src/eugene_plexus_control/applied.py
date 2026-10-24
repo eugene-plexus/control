@@ -91,6 +91,9 @@ OP_PROMOTE = "promote"
 OP_PUT_CLIENT_KEY = "putClientKey"
 OP_REVOKE_CLIENT_KEY = "revokeClientKey"
 OP_SET_CLIENT_KEY_LIMITS = "setClientKeyLimits"
+# Row 24: a new token for the same key (shared allowance), and the last-use stamp.
+OP_ROTATE_CLIENT_KEY = "rotateClientKey"
+OP_TOUCH_CLIENT_KEY = "touchClientKey"
 OP_PUT_CLIENT_ADMISSION = "putClientAdmission"
 OP_REVOKE_SESSION = "revokeSession"
 # Signing in with Eugene (C2, docs/design/sign-in-with-eugene.md).
@@ -127,7 +130,8 @@ OP_CHANGE_PASSPHRASE = "changePassphrase"
 #: it with the op that needs it, and name the op here.
 #:
 #: * 0: every op before row 5 (what a standby that sends no number applies).
-#: * 1: `retireOidcKeys`, `changePassphrase`.
+#: * 1: `retireOidcKeys`, `changePassphrase`, and every op merged before them
+#:   (`rotateClientKey` and `touchClientKey` among them).
 LOG_VERSION = 1
 
 #: The grant that makes a node the install's warm standby (warm-standby.md).
@@ -155,6 +159,8 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_PUT_CLIENT_KEY,
         OP_REVOKE_CLIENT_KEY,
         OP_SET_CLIENT_KEY_LIMITS,
+        OP_ROTATE_CLIENT_KEY,
+        OP_TOUCH_CLIENT_KEY,
         OP_PUT_CLIENT_ADMISSION,
         OP_REVOKE_SESSION,
         OP_PUT_PERSON,
@@ -951,7 +957,7 @@ def _key_record(raw: Any) -> dict[str, Any]:
     for key in ("id", "name", "tail", "createdAt", "expiresAt"):
         if not isinstance(raw.get(key), str) or (not raw[key] and key != "tail"):
             raise ApplyError(f"invalid client-key {key}")
-    for key in ("createdAt", "expiresAt", "revokedAt"):
+    for key in ("createdAt", "expiresAt", "revokedAt", "lastUsedAt", "retiresAt"):
         if raw.get(key) is not None:
             try:
                 parsed = datetime.fromisoformat(raw[key])
@@ -969,6 +975,11 @@ def _key_record(raw: Any) -> dict[str, Any]:
         "revokedAt",
         "lastUsedAt",
         "limits",
+        # Row 24: set by a rotation only (`_apply_rotate_client_key`).
+        "retiresAt",
+        "replaces",
+        "replacedBy",
+        "lineage",
     }
     if raw.keys() - allowed:
         raise ApplyError("unexpected client-key property")
@@ -997,7 +1008,74 @@ def _apply_put_client_key(state: AppliedState, payload: dict[str, Any], index: i
     record = _key_record(payload.get("key"))
     if record["id"] in state.client_keys:
         raise ApplyError("client-key identifier already exists")
+    if record.keys() & _ROTATION_FIELDS:
+        # A forged lineage would let a key borrow another key's allowance.
+        raise ApplyError("rotation fields are set by a rotation only")
     return replace(state, client_keys={**state.client_keys, record["id"]: record})
+
+
+_ROTATION_FIELDS = frozenset({"retiresAt", "replaces", "replacedBy", "lineage"})
+
+
+def _apply_rotate_client_key(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    old_id = payload.get("oldId")
+    old = state.client_keys.get(old_id) if isinstance(old_id, str) else None
+    if old is None or not isinstance(old_id, str):
+        raise ApplyError("unknown client-key identifier")
+    if old.get("revokedAt"):
+        raise ApplyError("this key is turned off and cannot be rotated")
+    if old.get("replacedBy"):
+        raise ApplyError("this key is already replaced")
+    new = _key_record(payload.get("key"))
+    if new["id"] in state.client_keys:
+        raise ApplyError("client-key identifier already exists")
+    if new.get("replaces") != old_id or new.keys() & {
+        "replacedBy",
+        "retiresAt",
+        "revokedAt",
+        "lastUsedAt",
+    }:
+        raise ApplyError("invalid replacement record")
+    retires = payload.get("retiresAt")
+    _key_record({**old, "retiresAt": retires})  # validates the timestamp
+    # The replacement keeps the old key's name and limits and joins its allowance,
+    # whatever the payload says.
+    new = {**new, "name": old["name"], "lineage": old.get("lineage") or old_id}
+    if old.get("limits") is None:
+        new.pop("limits", None)
+    else:
+        new["limits"] = old["limits"]
+    return replace(
+        state,
+        client_keys={
+            **state.client_keys,
+            old_id: {**old, "retiresAt": retires, "replacedBy": new["id"]},
+            new["id"]: new,
+        },
+    )
+
+
+def _apply_touch_client_key(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    key_id, used = payload.get("id"), payload.get("usedAt")
+    if key_id not in state.client_keys:
+        raise ApplyError("unknown client-key identifier")
+    return replace(state, client_keys={**state.client_keys, key_id: _touched(state, key_id, used)})
+
+
+def _touched(state: AppliedState, key_id: str, used: Any) -> dict[str, Any]:
+    """The key's record with `lastUsedAt` moved forward to `used`, never back."""
+    from datetime import datetime
+
+    record = state.client_keys[key_id]
+    candidate = _key_record({**record, "lastUsedAt": used})
+    current = record.get("lastUsedAt")
+    if current is not None and datetime.fromisoformat(current) >= datetime.fromisoformat(used):
+        return record
+    return candidate
 
 
 def _apply_set_client_key_limits(
@@ -1007,7 +1085,17 @@ def _apply_set_client_key_limits(
     if key_id not in state.client_keys or not isinstance(payload.get("limits"), dict):
         raise ApplyError("unknown key or missing limits")
     record = _key_record({**state.client_keys[key_id], "limits": payload["limits"]})
-    return replace(state, client_keys={**state.client_keys, key_id: record})
+    keys = {**state.client_keys, key_id: record}
+    # A rotated key's tokens share one allowance, so they share one policy.
+    lineage = record.get("lineage") or key_id
+    for other_id, other in state.client_keys.items():
+        if (
+            other_id != key_id
+            and not other.get("revokedAt")
+            and (other.get("lineage") or other_id) == lineage
+        ):
+            keys[other_id] = _key_record({**other, "limits": payload["limits"]})
+    return replace(state, client_keys=keys)
 
 
 def _apply_put_client_admission(
@@ -1022,9 +1110,13 @@ def _apply_put_client_admission(
         buckets = clean_buckets(state.client_admission["buckets"], now)
         buckets[payload["keyId"]] = payload["bucket"]
         ledger = validate_ledger({"clock": now, "buckets": buckets})
-    except (ValueError, TypeError, KeyError) as exc:
+        used = payload.get("usedId")
+        keys = state.client_keys
+        if used is not None and used in keys:
+            keys = {**keys, used: _touched(state, used, payload["usedAt"])}
+    except (ValueError, TypeError, KeyError, ApplyError) as exc:
         raise ApplyError("invalid admission update") from exc
-    return replace(state, client_admission=ledger)
+    return replace(state, client_admission=ledger, client_keys=keys)
 
 
 def _apply_revoke_client_key(
@@ -1610,6 +1702,8 @@ _HANDLERS: dict[str, _Handler] = {
     OP_PUT_CLIENT_KEY: _apply_put_client_key,
     OP_REVOKE_CLIENT_KEY: _apply_revoke_client_key,
     OP_SET_CLIENT_KEY_LIMITS: _apply_set_client_key_limits,
+    OP_ROTATE_CLIENT_KEY: _apply_rotate_client_key,
+    OP_TOUCH_CLIENT_KEY: _apply_touch_client_key,
     OP_PUT_CLIENT_ADMISSION: _apply_put_client_admission,
     OP_REVOKE_SESSION: _apply_revoke_session,
     OP_PUT_PERSON: _apply_put_person,

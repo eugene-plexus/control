@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import jwt
+import pytest
 from fastapi.testclient import TestClient
 
 from eugene_plexus_control import _http, machine_list
@@ -319,3 +320,68 @@ def test_one_slow_machine_does_not_hold_up_the_others(active_client: TestClient)
         "/v1/node/trust-bundle",
         "/v1/node/machine-list",
     ]
+
+
+# --------------------------------------------------------------------------- the re-review
+
+
+def test_a_promotion_ends_the_old_roots_tokens_without_an_epoch(tmp_path: Path) -> None:
+    """A root promoted from a copy never signed a token without `ep`. When it
+    is the first to record since when roots mark theirs (the root it replaced
+    ran code older than row 4), it names the epoch it replaced, so that
+    root's tokens without `ep` are refused at once (row 4 re-review,
+    blocker 1b)."""
+    from eugene_plexus_control import tokens
+
+    from .conftest import standby_at
+
+    root_app = create_app(settings_for(tmp_path / "root"))
+    with TestClient(root_app) as root:
+        assert root.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
+        document = root_app.state.machine.snapshot_document()
+    # The root it replaced never wrote the mark.
+    document["config"] = {k: v for k, v in document["config"].items() if k != "tokenEpochs"}
+    standby_at(tmp_path / "copy" / "state").install_snapshot(document)
+
+    app = create_app(settings_for(tmp_path / "copy", role="standby"))
+    with TestClient(app) as client:
+        token = client.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
+        assert app.state.machine.state.config.get("tokenEpochs") is None, "no mark yet"
+        promoted = client.post(
+            "/v1/control/promote",
+            json={"passphrase": PASSPHRASE},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert promoted.status_code == 200, promoted.text
+        bundle = app.state.trust.current
+        assert bundle is not None and bundle.epoch == 2
+        assert bundle.token_epochs is not None and bundle.token_epochs[1] == 1
+        legacy = tokens.Signer(key=app.state.auth_state.signer().key, issuer="control")
+        before, _ = legacy.mint(
+            typ=tokens.TYP_SESSION,
+            sub="operator",
+            aud=["control"],
+            ttl_seconds=600,
+            now=bundle.token_epochs[0] - 30,
+        )
+        with pytest.raises(tokens.TokenError, match="no longer follows"):
+            tokens.verify(before, bundle=bundle, recipient="control", classes=(tokens.TYP_SESSION,))
+
+
+def test_the_root_says_when_it_is_locked(tmp_path: Path) -> None:
+    """`/healthz` says a root that holds no token key is locked: its agent
+    tells Home (row 4 re-review, blocker 3)."""
+    settings = settings_for(tmp_path / "root")
+    first = create_app(settings)
+    with TestClient(first) as client:
+        assert (
+            client.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
+        )
+        assert client.get("/healthz").json()["details"]["locked"] is False
+    again = create_app(settings)
+    with TestClient(again) as client:
+        assert client.get("/healthz").json()["details"]["locked"] is True
+        client.post("/v1/auth/login", json={"passphrase": PASSPHRASE})
+        assert client.get("/healthz").json()["details"]["locked"] is False

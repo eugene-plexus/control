@@ -259,3 +259,141 @@ async def test_a_root_that_gives_no_usable_snapshot_is_not_asked_on_every_pull(
             assert asked.count("/v1/control/snapshot") == 1, (status, asked)
         finally:
             await follower.stop()
+
+
+# --------------------------------------------------------------------------- the re-review
+
+
+def _copy_of(tmp_path: Path) -> tuple[StateMachine, StateMachine]:
+    from .conftest import machine_at
+
+    root = machine_at(tmp_path / "root")
+    root.seed_identity(
+        {
+            "salt": "c2FsdA==",
+            "passphraseVerifier": "v",
+            "controlPublicKey": "k",
+            "sealedSigningKey": "s",
+            "sealedControlKey": "c",
+            "rootTokenPublicKey": "r",
+        }
+    )
+    root.append(
+        "enrollNode",
+        {
+            "name": "gpu",
+            "role": "agent",
+            "url": "http://192.0.2.7:8079",
+            "publicKey": "Z3B1LXB1YmxpYy1rZXktYnl0ZXMtMzItY2hhcnMtaz0=",
+            "enrolledAt": "2026-10-20T10:00:00+00:00",
+        },
+    )
+    copy = standby_at(tmp_path / "copy")
+    copy.install_snapshot(root.snapshot_document())
+    return root, copy
+
+
+def test_a_snapshot_with_a_null_or_mistyped_field_is_refused(tmp_path: Path) -> None:
+    """Presence is not enough: the parser reads `nodes: null` as no nodes,
+    so a snapshot saying so would clear the registry (row 4 re-review,
+    blocker 4)."""
+    from eugene_plexus_control.applied import ApplyError
+
+    root, copy = _copy_of(tmp_path)
+    before = copy.canonical()
+    good = root.snapshot_document()
+    for name, bad in (
+        ("nodes", None),
+        ("nodes", {}),
+        ("config", []),
+        ("revokedSessions", None),
+        ("people", "everyone"),
+        ("salt", 7),
+        ("epoch", "1"),
+        ("nodes", [{"role": "agent"}]),
+    ):
+        with pytest.raises(ApplyError, match="refusing a snapshot"):
+            copy.install_snapshot(good | {name: bad})
+        assert copy.canonical() == before, name
+    assert set(copy.state.nodes) == {"gpu"}
+
+
+#: The top-level `Snapshot` fields a v0.2.0 root writes (control 3c378a1,
+#: `applied.to_canonical`); v0.2 is the oldest supported version.
+_WRITTEN_BY_V0_2_0 = frozenset(
+    {
+        "index",
+        "epoch",
+        "nodes",
+        "components",
+        "runtimes",
+        "config",
+        "clientKeys",
+        "clientAdmission",
+        "salt",
+        "passphraseVerifier",
+        "sealedSigningKey",
+        "rootTokenPublicKey",
+        "revokedSessions",
+        "sealedControlKey",
+        "controlPublicKey",
+        "sealedRecoveryKey",
+        "signingKeyId",
+        "people",
+        "sites",
+        "nodeHelpers",
+        "oidcClients",
+        "oidcKeys",
+        "revokedSignIns",
+    }
+)
+
+
+def test_a_snapshot_from_a_root_that_writes_fewer_fields_is_taken(tmp_path: Path) -> None:
+    """A field added after the oldest supported root is optional: a root
+    that does not write it is followed, and its absence reads as empty (row
+    4 re-review)."""
+    root, copy = _copy_of(tmp_path)
+    document = root.snapshot_document()
+    older = {name: value for name, value in document.items() if name in _WRITTEN_BY_V0_2_0}
+    assert set(document) - set(older), "the root writes fields v0.2.0 did not"
+    copy.install_snapshot(older | {"index": older["index"] + 1})
+    assert set(copy.state.nodes) == {"gpu"}
+
+
+async def test_a_failed_fresh_snapshot_is_retried_after_the_short_wait(
+    root: tuple[_LiveServer, StateMachine, str], tmp_path: Path
+) -> None:
+    """The 10 minutes between fresh snapshots start only once one was taken:
+    one that failed is tried again after the 30 s that follow any failure
+    (row 4 re-review)."""
+    server, machine, token = root
+    standby = standby_at(tmp_path / "standby")
+    standby.install_snapshot(_without_pins(machine))
+    follower = Follower(
+        standby, active_url=server.url, interval_seconds=0.01, token_provider=lambda: token
+    )
+    asked: list[str] = []
+    real_get = follower._client.get
+    failing = {"yes": True}
+
+    async def get(url: str, **kwargs: Any) -> httpx.Response:
+        asked.append(str(url))
+        if url.endswith("/snapshot") and failing["yes"]:
+            return httpx.Response(
+                500, json={"detail": "not now"}, request=httpx.Request("GET", url)
+            )
+        return await real_get(url, **kwargs)
+
+    follower._client.get = get  # type: ignore[method-assign]
+    try:
+        with contextlib.suppress(httpx.HTTPError):
+            await follower.tick()
+        assert sum(u.endswith("/snapshot") for u in asked) == 1
+        follower._snapshot_after = 0.0  # the 30 s have passed
+        failing["yes"] = False
+        await follower.tick()
+        assert sum(u.endswith("/snapshot") for u in asked) == 2, "not held off for 10 minutes"
+        assert standby.state.nodes["gpu"].tlsPins == (PIN,)
+    finally:
+        await follower.stop()

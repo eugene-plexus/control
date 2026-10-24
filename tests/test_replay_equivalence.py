@@ -41,6 +41,7 @@ from eugene_plexus_control import security, tokens
 from eugene_plexus_control.app import create_app
 from eugene_plexus_control.applied import (
     ALL_OPS,
+    OP_CHANGE_PASSPHRASE,
     OP_DELETE_COMPONENT,
     OP_DELETE_OIDC_CLIENT,
     OP_DELETE_PERMISSION_GROUP,
@@ -60,10 +61,12 @@ from eugene_plexus_control.applied import (
     OP_PUT_PERSON,
     OP_PUT_RUNTIME,
     OP_REMOVE_SITE,
+    OP_RETIRE_OIDC_KEYS,
     OP_REVOKE_CLIENT_KEY,
     OP_REVOKE_NODE,
     OP_REVOKE_SESSION,
     OP_REVOKE_SIGN_IN,
+    OP_ROTATE_CLIENT_KEY,
     OP_ROTATE_SIGNING_KEY,
     OP_SET_CLIENT_KEY_LIMITS,
     OP_SET_INSTALL_CA,
@@ -73,6 +76,7 @@ from eugene_plexus_control.applied import (
     OP_SET_SITE_DEV_GRANTS,
     OP_SET_SITE_HOST,
     OP_SET_STANDBY,
+    OP_TOUCH_CLIENT_KEY,
     OP_UPDATE_NODE,
     AppliedState,
     ApplyError,
@@ -80,6 +84,7 @@ from eugene_plexus_control.applied import (
     apply_all,
     canonical_bytes,
     from_canonical,
+    sealed_inventory,
     to_canonical,
 )
 from eugene_plexus_control.state_machine import StateMachine
@@ -115,6 +120,8 @@ EXERCISED_OPS = {
     OP_SET_CLIENT_KEY_LIMITS,
     OP_PUT_CLIENT_ADMISSION,
     OP_REVOKE_CLIENT_KEY,
+    OP_ROTATE_CLIENT_KEY,
+    OP_TOUCH_CLIENT_KEY,
     OP_ROTATE_SIGNING_KEY,
     OP_REVOKE_SESSION,
     OP_PROMOTE,
@@ -136,6 +143,8 @@ EXERCISED_OPS = {
     OP_LABEL_NODE,
     OP_SET_INSTALL_CA,
     OP_SET_NODE_CERTIFICATE_NAMES,
+    OP_RETIRE_OIDC_KEYS,
+    OP_CHANGE_PASSPHRASE,
 }
 
 
@@ -342,6 +351,22 @@ def _write_history(machine: StateMachine) -> bytes:
         },
     )
 
+    machine.append(OP_TOUCH_CLIENT_KEY, {"id": "app-key", "usedAt": "2026-09-09T11:21:00+00:00"})
+    machine.append(
+        OP_ROTATE_CLIENT_KEY,
+        {
+            "oldId": "app-key",
+            "retiresAt": "2026-09-10T11:21:00+00:00",
+            "key": {
+                "id": "app-key-2",
+                "name": "Example",
+                "tail": "second",
+                "createdAt": "2026-09-09T11:21:00+00:00",
+                "expiresAt": "2027-09-09T11:21:00+00:00",
+                "replaces": "app-key",
+            },
+        },
+    )
     machine.append(
         OP_REVOKE_CLIENT_KEY, {"id": "app-key", "revokedAt": "2026-09-09T11:22:00+00:00"}
     )
@@ -556,6 +581,9 @@ def _write_history(machine: StateMachine) -> bytes:
     held = machine.state.identity.installCaCertificate  # an initialized root made one
     machine.append(OP_SET_INSTALL_CA, {"certificate": held or "CA PEM", "sealedKey": "SEALED"})
     machine.append(OP_SET_NODE_CERTIFICATE_NAMES, {"name": "attic", "names": ["attic.lan"]})
+    # Row 5: a second sign-in key, every other retired, and the passphrase
+    # changed, every sealed value with it (the install CA's key included).
+    _write_row5_history(machine, when)
     machine.append(OP_REVOKE_NODE, {"name": "gpu-büro"})
     last, last_public = _root_key()
     machine.append(
@@ -570,6 +598,52 @@ def _write_history(machine: StateMachine) -> bytes:
     )
     machine.append(OP_PROMOTE, {"node": "attic"}, epoch_override=machine.state.epoch + 1)
     return last
+
+
+def _write_row5_history(machine: StateMachine, when: str) -> None:
+    """`retireOidcKeys` and `changePassphrase` (row 5). The change re-seals
+    what `sealed_inventory` lists at that point, as placeholders.
+
+    **This history keeps its whole log**: every root compacts the log before
+    a passphrase change (`COMPACT_AFTER`), which would leave the entries
+    above unreadable here. The compaction itself is checked in
+    `test_passphrase_change.py`."""
+    from eugene_plexus_control import state_machine
+
+    machine.append(
+        OP_PUT_OIDC_KEY,
+        {
+            "key": {
+                "kid": "k-2",
+                "sealedKey": placeholder("oidc-key-2"),
+                "publicJwk": {"kty": "RSA", "n": "AQAB", "e": "AQAB", "kid": "k-2"},
+                "createdAt": when,
+            }
+        },
+    )
+    machine.append(OP_RETIRE_OIDC_KEYS, {"keep": ["k-2"]})
+    held = sealed_inventory(machine.state)
+    sealed = {
+        name: (
+            {key: placeholder(f"resealed-{name}-{key}") for key in value}
+            if isinstance(value, dict)
+            else placeholder(f"resealed-{name}")
+        )
+        for name, value in held.items()
+    }
+    kept = state_machine.COMPACT_AFTER
+    state_machine.COMPACT_AFTER = frozenset()
+    try:
+        machine.append(
+            OP_CHANGE_PASSPHRASE,
+            {
+                "salt": base64.b64encode(b"fedcba9876543210").decode("ascii"),
+                "passphraseVerifier": "$argon2id$v=19$m=65536,t=3,p=4$fake$changed",
+                "sealed": sealed,
+            },
+        )
+    finally:
+        state_machine.COMPACT_AFTER = kept
 
 
 def _ops_in(entries: list[dict[str, Any]]) -> set[str]:

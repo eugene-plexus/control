@@ -789,3 +789,63 @@ async def subjects(request: Request) -> JSONResponse:
     for sub in dict.fromkeys(asked):
         (known if sub == OPERATOR_NAME or sub in people else unknown).append(sub)
     return JSONResponse({"known": known, "unknown": unknown}, headers=_NO_STORE)
+
+
+#: `/oidc/groups` (row 70c review): at most this many wrong secrets from one address, and this
+#: many reads by one app, in a window; then 429 with `Retry-After`.
+GROUPS_WINDOW_SECONDS = 60
+GROUPS_FAILURES = 5
+GROUPS_READS = 60
+
+
+def _slow_down(why: str) -> JSONResponse:
+    answer = _oauth_error(
+        429, "slow_down", f"{why} Wait {GROUPS_WINDOW_SECONDS} seconds and try again."
+    )
+    answer.headers["Retry-After"] = str(GROUPS_WINDOW_SECONDS)
+    return answer
+
+
+@router.get("/oidc/groups", operation_id="oidcGroups")
+async def groups(request: Request) -> JSONResponse:
+    """The permission groups that give the calling app, as `{id, name}` (row 70c).
+
+    Workbench's owner attaches a memory server to a group before any member signs in, so
+    the app needs the list without a member's claims. It needs the app's own secret, and
+    says nothing of who is in a group: a person's groups come only in their own sign-in."""
+    auth = request.app.state.auth_state
+    caller = f"oidc-groups-peer:{_caller(request)}"
+    if auth.is_login_rate_limited(
+        caller, window_seconds=GROUPS_WINDOW_SECONDS, max_in_window=GROUPS_FAILURES
+    ):
+        return _slow_down("Too many failed attempts from this address.")
+    client = _client_auth(request)
+    if client is None:
+        auth.record_login_failure(
+            caller, window_seconds=GROUPS_WINDOW_SECONDS, max_in_window=GROUPS_FAILURES
+        )
+        return _oauth_error(401, "invalid_client", "Client authentication failed.")
+    auth.clear_login_failures(caller)
+    reads = f"oidc-groups-reads:{client['clientId']}"
+    if auth.is_login_rate_limited(
+        reads, window_seconds=GROUPS_WINDOW_SECONDS, max_in_window=GROUPS_READS
+    ):
+        return _slow_down("This app has asked for its groups too often.")
+    auth.record_login_failure(
+        reads, window_seconds=GROUPS_WINDOW_SECONDS, max_in_window=GROUPS_READS
+    )
+    machine = request.app.state.machine
+    if not machine.is_active:
+        return _oauth_error(
+            503,
+            "temporarily_unavailable",
+            "This control root is a standby; ask the active one.",
+        )
+    client_id = client["clientId"]
+    given = [
+        {"id": g["id"], "name": g["name"]}
+        for g in machine.state.permission_groups.values()
+        if g["apps"] is None or client_id in g["apps"]
+    ]
+    given.sort(key=lambda g: (g["name"].casefold(), g["id"]))
+    return JSONResponse({"groups": given}, headers=_NO_STORE)
