@@ -214,6 +214,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 else None
             ),
             on_passphrase_changed=lambda old: passphrase_change.standby_followed(app, old),
+            before_passphrase_change=lambda old: passphrase_change.note_stale_keyring(
+                Path(settings.state_dir), old
+            ),
         )
         follower.start()
         app.state.follower = follower
@@ -287,6 +290,7 @@ async def _hourly(app: FastAPI) -> None:
         await asyncio.sleep(oidc_keys.CHECK_EVERY_SECONDS)
         try:
             await asyncio.to_thread(passphrase_change.recheck_file, app)
+            await asyncio.to_thread(app.state.machine.compact_pending)
             await asyncio.to_thread(oidc_keys.tick, app)
         except Exception as exc:
             log.warning("the hourly check failed: %s", exc)
@@ -635,6 +639,15 @@ def _local_node_name(machine: StateMachine) -> str | None:
     return None
 
 
+async def _sealed_under_old_key(request: Any, exc: Exception) -> Any:
+    from fastapi.responses import JSONResponse
+
+    from .dependencies import problem
+
+    refused = problem(409, "Passphrase changed", str(exc))
+    return JSONResponse(status_code=409, content={"detail": refused.detail})
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build a FastAPI app with every router mounted."""
     settings = settings or load_settings()
@@ -679,5 +692,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(site_routes.router)
     app.add_exception_handler(site_routes.HeldAtTheMachine, site_routes.held_response)
+    # Row 5: a value sealed under a key a passphrase change replaced, refused
+    # by the log on any route that seals: never stored, said in one line.
+    from .state_machine import SealedUnderOldKey
+
+    app.add_exception_handler(SealedUnderOldKey, _sealed_under_old_key)
 
     return app

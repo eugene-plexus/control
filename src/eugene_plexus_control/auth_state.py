@@ -59,6 +59,11 @@ class AuthState:
     master_key: bytes | None = None
     """Derived from the passphrase at login. Memory only, always."""
 
+    master_salt: str | None = None
+    """The salt `master_key` was derived with (row 5): its generation. A
+    sealed write names it (`sealing_key`), and the log refuses one sealed
+    under a salt a passphrase change has replaced."""
+
     control_private_key: str | None = None
     """Base64 Ed25519 private half of this root's identity, once
     unsealed. Needed to attest an epoch change to a node."""
@@ -107,16 +112,29 @@ class AuthState:
         epoch = self.epoch_source() if self.epoch_source is not None else None
         return tokens.Signer(key=key, issuer=tokens.ISSUER_CONTROL, epoch=epoch)
 
-    def set_master_key(self, key: bytes) -> None:
+    def set_master_key(self, key: bytes, *, salt: str | None) -> None:
+        """The key and the salt it was derived with, together (row 5)."""
         if len(key) != 32:
             raise ValueError("master key must be 32 bytes")
-        self.master_key = key
+        with self._lock:
+            self.master_key = key
+            self.master_salt = salt
+
+    def sealing_key(self) -> tuple[bytes | None, str | None]:
+        """(key, salt), read together: what a sealed write seals with, and the
+        generation it names to the log (`StateMachine.append(sealed_under=)`).
+        A key read without its salt could be one a passphrase change has
+        just replaced."""
+        with self._lock:
+            return self.master_key, self.master_salt
 
     def forget_master_key(self) -> None:
         """Drop the derived key. Used when a standby is demoted, so a
         host that is no longer the writer stops holding the one thing
         that would let it act like one."""
-        self.master_key = None
+        with self._lock:
+            self.master_key = None
+            self.master_salt = None
         self.control_private_key = None
         self.install_ca_key = None
         self.recovery_private_key = None

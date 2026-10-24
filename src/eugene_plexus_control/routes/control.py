@@ -340,7 +340,8 @@ async def rotate_signing_key(request: Request) -> TrustChange:
             "Not the active root",
             f"This control root is a {machine.role}; rotation belongs to the active root.",
         )
-    if auth.master_key is None or auth.control_private_key is None:
+    master, generation = auth.sealing_key()
+    if master is None or auth.control_private_key is None:
         # Checked before minting: a key that could not be sealed, or a
         # bundle that could not be signed, would be a rotation nobody hears of.
         raise problem(
@@ -359,10 +360,12 @@ async def rotate_signing_key(request: Request) -> TrustChange:
             # Sealed by the writer, once. A replica stores this string
             # verbatim: sealing is not deterministic, so recomputing it
             # would break replay equivalence.
-            "sealedSigningKey": security.seal_b64(new_key, auth.master_key),
+            "sealedSigningKey": security.seal_b64(new_key, master),
             "rootTokenPublicKey": tokens.public_b64(tokens.load_private(new_key)),
             "reason": "operator",
         },
+        # Row 5: refused if the passphrase changed since `master` was read.
+        sealed_under=generation,
     )
     auth.set_signing_key(new_key)
     bundle = request.app.state.trust.publish(request.app)

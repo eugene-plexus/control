@@ -215,3 +215,48 @@ def test_retire_keeps_only_held_keys_and_replays(active_client: TestClient) -> N
     assert [k["kid"] for k in after.oidc_keys] == [kid]
     assert to_canonical(from_canonical(to_canonical(after))) == to_canonical(after)
     assert OP_PUT_OIDC_KEY != OP_RETIRE_OIDC_KEYS
+
+
+def test_two_routine_changes_at_once_change_the_key_once(
+    active_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reproduction: with the newest key 31 days old, two `{}` changes at
+    the same moment both passed the age check and dropped the key whose
+    refresh tokens were still live. The check and the change are one step."""
+    import contextlib
+    import threading
+
+    from eugene_plexus_control import oidc
+
+    c = active_client
+    _tokens(c, _client(c))
+    first = c.get("/v1/oidc/keys").json()["keys"][0]["kid"]
+    _later(monkeypatch, 31)
+    made = oidc.new_signing_key
+    both = threading.Barrier(2, timeout=2)
+
+    def slow_key() -> Any:
+        # Hold the first change here until the second has had every chance
+        # to pass the age check too.
+        with contextlib.suppress(threading.BrokenBarrierError):
+            both.wait()
+        return made()
+
+    monkeypatch.setattr(oidc, "new_signing_key", slow_key)
+    outcomes: list[str] = []
+
+    def change() -> None:
+        try:
+            oidc_keys.change(c.app, end_sign_ins=False)
+            outcomes.append("changed")
+        except oidc_keys.TooSoon:
+            outcomes.append("too soon")
+
+    threads = [threading.Thread(target=change) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert sorted(outcomes) == ["changed", "too soon"], outcomes
+    keys = [k["kid"] for k in c.get("/v1/oidc/keys").json()["keys"]]
+    assert len(keys) == 2 and keys[1] == first, "the live key is kept"

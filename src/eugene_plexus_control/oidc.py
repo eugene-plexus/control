@@ -383,34 +383,67 @@ class Provider:
         """The newest key, unsealed; made first if there is none."""
         if not machine.is_active:
             raise Locked("this control root is a standby; sign in through the active one")
-        master = auth.master_key
+        master, generation = auth.sealing_key()
         if master is None:
             raise Locked(
                 "Eugene is locked. Sign in to the console once with the passphrase to unlock it."
             )
         keys = machine.state.oidc_keys
         if not keys:
-            pem, jwk = new_signing_key()
-            machine.append(
-                OP_PUT_OIDC_KEY,
-                {
-                    "key": {
-                        "kid": jwk["kid"],
-                        "sealedKey": security.seal_b64(pem, master),
-                        "publicJwk": jwk,
-                        "createdAt": utcnow_iso(),
-                    }
-                },
-            )
-            keys = machine.state.oidc_keys
+            keys = self._first_key(machine, auth, master, generation)
+            master, _ = auth.sealing_key()
+            if master is None:
+                raise Locked("Eugene is locked. Sign in to the console once to unlock it.")
         newest = keys[0]
         with self._lock:
             key = self._keys.get(newest["kid"])
             if key is None:
-                pem = security.open_b64(newest["sealedKey"], master)
+                try:
+                    pem = security.open_b64(newest["sealedKey"], master)
+                except ValueError:
+                    # Row 5: a passphrase change landed between reading the
+                    # key and the state; both again, once.
+                    master, _ = auth.sealing_key()
+                    newest = machine.state.oidc_keys[0]
+                    if master is None:
+                        raise Locked("Eugene is locked. Sign in once to unlock it.") from None
+                    pem = security.open_b64(newest["sealedKey"], master)
                 key = serialization.load_pem_private_key(pem, password=None)
                 self._keys[newest["kid"]] = key
         return newest["kid"], key
+
+    @staticmethod
+    def _first_key(
+        machine: Any, auth: Any, master: bytes, generation: str | None
+    ) -> tuple[dict[str, Any], ...]:
+        """The first sign-in key, made at first need. Row 5: when a passphrase
+        change lands between sealing it and writing it, the log refuses it,
+        and it is made once more under the key in effect."""
+        from .state_machine import SealedUnderOldKey
+
+        for _ in range(2):
+            pem, jwk = new_signing_key()
+            try:
+                machine.append(
+                    OP_PUT_OIDC_KEY,
+                    {
+                        "key": {
+                            "kid": jwk["kid"],
+                            "sealedKey": security.seal_b64(pem, master),
+                            "publicJwk": jwk,
+                            "createdAt": utcnow_iso(),
+                        }
+                    },
+                    sealed_under=generation,
+                )
+                break
+            except SealedUnderOldKey:
+                fresh, generation = auth.sealing_key()
+                if fresh is None:
+                    raise Locked("Eugene is locked. Sign in once to unlock it.") from None
+                master = fresh
+        keys: tuple[dict[str, Any], ...] = machine.state.oidc_keys
+        return keys
 
     @staticmethod
     def jwks(state: Any) -> dict[str, Any]:

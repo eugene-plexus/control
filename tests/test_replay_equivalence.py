@@ -187,7 +187,9 @@ def _write_browser_history(machine: StateMachine, when: str) -> None:
         "revision": "revision-one",
         "sealedSecret": placeholder("provider-secret"),
     }
-    machine.append("putExternalProvider", {"record": provider})
+    machine.append(
+        "putExternalProvider", {"record": provider}, sealed_under=machine.state.identity.salt
+    )
     invitation = {
         "id": "a" * 64,
         "personId": "p-ada",
@@ -223,7 +225,9 @@ def _write_browser_history(machine: StateMachine, when: str) -> None:
     # Exercise cascade removal, then retain nonempty identity/session state for snapshot checks.
     machine.append("deleteExternalIdentity", {"id": identity["id"]})
     machine.append("deleteExternalProvider", {"id": provider["id"]})
-    machine.append("putExternalProvider", {"record": provider})
+    machine.append(
+        "putExternalProvider", {"record": provider}, sealed_under=machine.state.identity.salt
+    )
     machine.append("putSignInInvitation", {"record": invitation})
     machine.append("linkExternalIdentity", {"record": identity, "invitationId": invitation["id"]})
     machine.append("putBrowserSignIn", {"record": session})
@@ -426,6 +430,7 @@ def _write_history(machine: StateMachine) -> bytes:
             "rootTokenPublicKey": second,
             "reason": "operator",
         },
+        sealed_under=machine.state.identity.salt,
     )
     machine.append(OP_REVOKE_SESSION, {"jti": "signed-out", "exp": 2000000000, "prunedBefore": 0})
     # Signing in with Eugene (C2): people, an app, the sealed key, a revoked sign-in.
@@ -550,6 +555,7 @@ def _write_history(machine: StateMachine) -> bytes:
                 "createdAt": when,
             }
         },
+        sealed_under=machine.state.identity.salt,
     )
     machine.append(
         OP_REVOKE_SIGN_IN, {"sid": "signed-in", "exp": 2000000000, "prunedBefore": 0}
@@ -563,6 +569,7 @@ def _write_history(machine: StateMachine) -> bytes:
             "reason": "revocation",
             "revokedNode": "shed",
         },
+        sealed_under=machine.state.identity.salt,
     )
     # The older shape: `revokeNode`, then a rotation naming the node it
     # removed. Revoking takes the node's component and runtime with it.
@@ -579,7 +586,11 @@ def _write_history(machine: StateMachine) -> bytes:
     machine.append(OP_LABEL_NODE, {"name": "attic", "label": "The Attic"})
     # LT2: the install CA, once, and names the owner lists for a node.
     held = machine.state.identity.installCaCertificate  # an initialized root made one
-    machine.append(OP_SET_INSTALL_CA, {"certificate": held or "CA PEM", "sealedKey": "SEALED"})
+    machine.append(
+        OP_SET_INSTALL_CA,
+        {"certificate": held or "CA PEM", "sealedKey": "SEALED"},
+        sealed_under=machine.state.identity.salt,
+    )
     machine.append(OP_SET_NODE_CERTIFICATE_NAMES, {"name": "attic", "names": ["attic.lan"]})
     # Row 5: a second sign-in key, every other retired, and the passphrase
     # changed, every sealed value with it (the install CA's key included).
@@ -595,6 +606,7 @@ def _write_history(machine: StateMachine) -> bytes:
             "reason": "revocation",
             "revokedNode": "gpu-büro",
         },
+        sealed_under=machine.state.identity.salt,
     )
     machine.append(OP_PROMOTE, {"node": "attic"}, epoch_override=machine.state.epoch + 1)
     return last
@@ -620,6 +632,7 @@ def _write_row5_history(machine: StateMachine, when: str) -> None:
                 "createdAt": when,
             }
         },
+        sealed_under=machine.state.identity.salt,
     )
     machine.append(OP_RETIRE_OIDC_KEYS, {"keep": ["k-2"]})
     held = sealed_inventory(machine.state)
@@ -641,6 +654,7 @@ def _write_row5_history(machine: StateMachine, when: str) -> None:
                 "passphraseVerifier": "$argon2id$v=19$m=65536,t=3,p=4$fake$changed",
                 "sealed": sealed,
             },
+            sealed_under=machine.state.identity.salt,
         )
     finally:
         state_machine.COMPACT_AFTER = kept

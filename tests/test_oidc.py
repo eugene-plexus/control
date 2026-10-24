@@ -617,6 +617,7 @@ def test_the_log_refuses_a_sign_in_key_with_its_private_part(active_client: Test
                     "createdAt": oidc.utcnow_iso(),
                 }
             },
+            sealed_under=machine.state.identity.salt,
         )
     assert machine.state.oidc_keys == ()
 

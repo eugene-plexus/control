@@ -225,7 +225,7 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
             "one that already exists.",
         ) from exc
 
-    auth.set_master_key(master_key)
+    auth.set_master_key(master_key, salt=machine.state.identity.salt)
     auth.set_signing_key(signing_key)
     auth.control_private_key = control_identity.private
     auth.recovery_private_key = recovery.private
@@ -528,6 +528,7 @@ async def change_passphrase(request: Request) -> PassphraseChangeResult:
         changedAt=changed.at,
         machines=[PassphraseMachine.model_validate(m) for m in machines],
         passphraseFile=PassphraseFileState(changed.passphrase_file),
+        cleanup=changed.cleanup,
     )
 
 
@@ -615,7 +616,7 @@ def unseal_with_master_key(auth: AuthState, machine: StateMachine, master_key: b
     import base64 as _b64
 
     identity = machine.state.identity
-    auth.set_master_key(master_key)
+    auth.set_master_key(master_key, salt=identity.salt)
 
     if identity.sealedSigningKey is not None:
         try:

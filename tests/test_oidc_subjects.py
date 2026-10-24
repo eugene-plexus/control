@@ -81,7 +81,7 @@ def test_a_locked_or_standby_root_says_nothing(active_client: TestClient, monkey
     key = state.auth_state.master_key
     state.auth_state.forget_master_key()
     locked = _ask(active_client, app, [ann])
-    state.auth_state.set_master_key(key)
+    state.auth_state.set_master_key(key, salt=state.machine.state.identity.salt)
     monkeypatch.setattr(type(state.machine), "is_active", property(lambda self: False))
     standby = _ask(active_client, app, [ann])
     for answer in (locked, standby):

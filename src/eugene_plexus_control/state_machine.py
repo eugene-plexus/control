@@ -38,6 +38,9 @@ from typing import Any
 
 from .applied import (
     OP_CHANGE_PASSPHRASE,
+    OP_PUT_OIDC_KEY,
+    OP_ROTATE_SIGNING_KEY,
+    OP_SET_INSTALL_CA,
     ROLE_CONTROL,
     AppliedState,
     ApplyError,
@@ -148,6 +151,33 @@ DEFAULT_COMPACT_THRESHOLD = 512
 #: it replaced, and compaction is what takes them off the disk.
 COMPACT_AFTER = frozenset({OP_CHANGE_PASSPHRASE})
 
+#: Ops whose payload carries a value sealed under the master key (row 5).
+#: The writer appends one only while the install's salt is the one the value
+#: was sealed under (`append(sealed_under=)`), so a value sealed just before
+#: a passphrase change is refused, never stored under a key nobody derives.
+SEALED_OPS = frozenset(
+    {
+        OP_CHANGE_PASSPHRASE,
+        OP_PUT_OIDC_KEY,
+        OP_ROTATE_SIGNING_KEY,
+        OP_SET_INSTALL_CA,
+        "putExternalProvider",
+    }
+)
+
+#: What a refused sealed write tells the person who made it.
+SAVED_AGAIN = "The passphrase changed while this was saved; save it again."
+
+_UNSET: Any = object()
+
+
+class SealedUnderOldKey(Exception):
+    """A sealed write named a salt that is no longer the install's: the
+    passphrase changed between sealing and appending. Nothing was stored."""
+
+    def __init__(self) -> None:
+        super().__init__(SAVED_AGAIN)
+
 
 class NotActive(Exception):
     """A write was attempted on a standby.
@@ -194,6 +224,9 @@ class StateMachine:
         self._compact_threshold = compact_threshold
         self._entries_since_snapshot = 0
         self._dropped_tail_lines = 0
+        #: Row 5: the index of a passphrase change whose old copies are not
+        #: compacted away yet (`compact_pending`). None when there is none.
+        self._pending_change: int | None = None
         #: `applied_digest`'s last answer, for the state object it hashed.
         self._digest: tuple[AppliedState, str] | None = None
 
@@ -223,6 +256,13 @@ class StateMachine:
             pending = [e for e in result.entries if int(e["index"]) > base.index]
             self._state = apply_all(base, pending)
             self._entries_since_snapshot = len(pending)
+            # Row 5: a passphrase change a crash left uncompacted: the log
+            # still holds entries before it, or the snapshot predates it.
+            changes = [int(e["index"]) for e in result.entries if e.get("op") in COMPACT_AFTER]
+            if changes and (
+                base.index < changes[-1] or int(result.entries[0]["index"]) < changes[-1]
+            ):
+                self._pending_change = changes[-1]
             log.info(
                 "loaded control state: index %d, epoch %d, %d node(s), role %s",
                 self._state.index,
@@ -230,6 +270,13 @@ class StateMachine:
                 len(self._state.nodes),
                 self._role,
             )
+        if self._pending_change is not None:
+            cause = self.compact_pending()
+            if cause is None:
+                log.warning(
+                    "finished a passphrase change a restart interrupted: the copies sealed "
+                    "under the old key are removed"
+                )
 
     # ----- reads ------------------------------------------------------
 
@@ -377,8 +424,16 @@ class StateMachine:
         *,
         epoch_override: int | None = None,
         actor: str | None = None,
+        sealed_under: Any = _UNSET,
     ) -> dict[str, Any]:
         """Assign the next index, apply, persist, commit. Active only.
+
+        **A sealed write names its key generation** (row 5): an op in
+        `SEALED_OPS` must say which salt its sealed values were sealed
+        under, and is refused (`SealedUnderOldKey`, nothing stored) unless
+        that is the install's salt now. Checked here, under the writer's
+        lock, so no passphrase change can land between the check and the
+        write.
 
         The ordering is the interesting part:
 
@@ -398,6 +453,11 @@ class StateMachine:
                 raise NotActive(
                     f"this control root is a {self._role}; writes belong to the active root"
                 )
+            if op in SEALED_OPS:
+                if sealed_under is _UNSET:
+                    raise TypeError(f"{op} carries a sealed value: name the salt it sealed under")
+                if sealed_under != self._state.identity.salt:
+                    raise SealedUnderOldKey()
 
             index = self._state.index + 1
             epoch = epoch_override if epoch_override is not None else self._state.epoch
@@ -438,6 +498,10 @@ class StateMachine:
             self._state = candidate
             self._entries_since_snapshot += 1
             self._maybe_compact_locked(entry.get("op"))
+        if self._pending_change is not None:
+            # A standby that took a passphrase change compacts at once; a
+            # failure is retried at every pull and at the next start.
+            self.compact_pending()
 
     def install_snapshot(self, document: dict[str, Any]) -> None:
         """Adopt a snapshot wholesale. How a standby starts, and how one
@@ -483,6 +547,7 @@ class StateMachine:
             self._store.write_snapshot(document, compact_through=incoming.index)
             self._state = incoming
             self._entries_since_snapshot = 0
+            self._pending_change = None
             log.info("installed snapshot at index %d, epoch %d", incoming.index, incoming.epoch)
 
     def snapshot_now(self) -> None:
@@ -491,25 +556,54 @@ class StateMachine:
             document = to_canonical(self._state)
             self._store.write_snapshot(document, compact_through=self._state.index)
             self._entries_since_snapshot = 0
+            self._pending_change = None
 
     def _maybe_compact_locked(self, op: Any = None) -> None:
         if op in COMPACT_AFTER:
-            # Row 5: after a passphrase change, at once and on every root that
-            # applies it, so no value sealed under the old key stays in the
-            # log. The change itself stays (it holds only values sealed under
-            # the new key), so a standby one entry behind reads it from the
-            # log instead of taking a snapshot.
-            document = to_canonical(self._state)
-            self._store.write_snapshot(document, compact_through=self._state.index - 1)
-            self._entries_since_snapshot = 0
-            log.info("snapshot written at index %d after %s; log compacted", self._state.index, op)
+            # Row 5: not here. The entry is committed; the caller switches to
+            # the new key first, then calls `compact_pending`, whose failure
+            # cannot leave the old key in effect.
+            self._pending_change = self._state.index
             return
         if self._entries_since_snapshot < self._compact_threshold:
             return
         document = to_canonical(self._state)
         self._store.write_snapshot(document, compact_through=self._state.index)
         self._entries_since_snapshot = 0
+        self._pending_change = None
         log.info("snapshot written at index %d; log compacted", self._state.index)
+
+    def compact_pending(self) -> str | None:
+        """Row 5: drop the copies sealed under a key a passphrase change
+        replaced: a snapshot of the state now, and every log entry before the
+        change. The change itself stays (it holds only values sealed under
+        the new key), so a standby one entry behind reads it from the log.
+
+        None when done, or when nothing is pending; else the cause, said in
+        the log once per try. Retried at every start, every hour on the
+        root and at every pull on a standby."""
+        with self._lock:
+            pending = self._pending_change
+            if pending is None:
+                return None
+            try:
+                self._store.write_snapshot(to_canonical(self._state), compact_through=pending - 1)
+            except OSError as exc:
+                cause = str(exc) or type(exc).__name__
+                log.warning(
+                    "Passphrase changed; old copies could not be removed yet: %s. Trying "
+                    "again later.",
+                    cause,
+                )
+                return cause
+            self._entries_since_snapshot = 0
+            self._pending_change = None
+            log.info(
+                "snapshot written at index %d after a passphrase change; the copies sealed "
+                "under the old key are removed",
+                self._state.index,
+            )
+            return None
 
     # ----- identity, established once ---------------------------------
 

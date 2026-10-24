@@ -27,6 +27,7 @@ from .._generated.models import (
 )
 from ..administration import active, has_grants
 from ..dependencies import problem, require_operator
+from ..state_machine import SealedUnderOldKey
 from ..trusted_host import require_trusted_host
 from . import oidc as local
 
@@ -83,7 +84,13 @@ async def write_provider(
     request: Request, ident: str, body: ExternalProviderWrite
 ) -> ExternalProvider:
     machine = machine_for(request)
-    before = machine.state.browser_sign_in["providers"].get(ident)
+    # Row 5: the key and the generation it belongs to, read together. The
+    # log refuses this write if a passphrase change lands before it does.
+    key, generation = request.app.state.auth_state.sealing_key()
+    state = machine.state
+    if generation != state.identity.salt:
+        raise SealedUnderOldKey()
+    before = state.browser_sign_in["providers"].get(ident)
     record = body.model_dump(mode="json", exclude={"clientSecret"})
     record["name"] = record["name"].strip()
     # OIDC compares issuer identifiers exactly, including a provider's trailing slash.
@@ -109,9 +116,7 @@ async def write_provider(
     record.update(
         id=ident,
         revision=secrets.token_hex(16),
-        sealedSecret=security.seal_b64(secret.encode(), request.app.state.auth_state.master_key)
-        if secret
-        else before["sealedSecret"],
+        sealedSecret=security.seal_b64(secret.encode(), key) if secret else before["sealedSecret"],
     )
     try:
         sso.validate_provider(record)
@@ -129,7 +134,9 @@ async def write_provider(
         raise problem(422, "Provider could not be enabled", str(exc)) from exc
     if machine.state.browser_sign_in["providers"].get(ident) != before:
         raise problem(409, "Provider changed", "Reload the provider settings and try again.")
-    machine.append("putExternalProvider", {"record": record}, actor="operator")
+    machine.append(
+        "putExternalProvider", {"record": record}, actor="operator", sealed_under=generation
+    )
     return public_provider(request, record)
 
 

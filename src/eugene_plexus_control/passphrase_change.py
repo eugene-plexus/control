@@ -50,6 +50,7 @@ from .applied import (
     sealed_inventory,
     to_canonical,
 )
+from .state_machine import SealedUnderOldKey
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +102,9 @@ class Resealed:
 class Changed:
     at: datetime
     passphrase_file: str
+    cleanup: str | None = None
+    """Why the copies sealed under the old key are still on disk, when they
+    are (`StateMachine.compact_pending`, retried later); else None."""
 
 
 # --------------------------------------------------------------------------- #
@@ -197,10 +201,12 @@ def change(app: Any, new: str, *, actor: str | None = None) -> Changed:
     machine = app.state.machine
     auth = app.state.auth_state
     with _CHANGE_LOCK:
-        old_key = auth.master_key
+        old_key, old_salt = auth.sealing_key()
         if old_key is None:
             raise CannotOpen("master key (this root is locked)")
         state = machine.state
+        if old_salt != state.identity.salt:
+            raise Moved()
         resealed = reseal(state, old_key, new)
         candidate = apply(
             state,
@@ -216,26 +222,31 @@ def change(app: Any, new: str, *, actor: str | None = None) -> Changed:
             raise StillOpens(missed)
         if machine.state is not state:
             raise Moved()
-        old_salt = state.identity.salt
         keyring = config_module.effective(state.config)["securityMode"] == "os_keyring"
         if keyring:
-            _private_write(_marker(app), json.dumps({"oldInstallId": install_id(old_salt)}))
+            note_stale_keyring(Path(app.state.settings.state_dir), old_salt)
         try:
-            machine.append(OP_CHANGE_PASSPHRASE, resealed.payload, actor=actor)
-        except ApplyError as exc:
+            machine.append(
+                OP_CHANGE_PASSPHRASE, resealed.payload, actor=actor, sealed_under=old_salt
+            )
+        except (ApplyError, SealedUnderOldKey) as exc:
             # Something sealed was added or removed since `reseal` read the
             # state: the entry no longer names exactly what is held.
             _marker(app).unlink(missing_ok=True)
             raise Moved() from exc
-        auth.set_master_key(resealed.master_key)
+        # The entry is durable, so the new key is the one in effect now,
+        # before anything that can fail: a sealed write after this point
+        # seals under it, and one sealed before is refused by the log.
+        auth.set_master_key(resealed.master_key, salt=resealed.payload["salt"])
+        cleanup = machine.compact_pending()
         if keyring:
             move_keyring(app, old_salt)
         file = write_file(app, new)
         log.warning(
-            "Eugene's passphrase changed: every sealed value was sealed again under the new "
-            "key, and the log was compacted"
+            "Eugene's passphrase changed: every sealed value was sealed again under the new key%s",
+            "" if cleanup else ", and the old copies were removed",
         )
-        return Changed(at=datetime.now(UTC), passphrase_file=file)
+        return Changed(at=datetime.now(UTC), passphrase_file=file, cleanup=cleanup)
 
 
 def _private_write(path: Path, text: str) -> None:
@@ -264,10 +275,22 @@ def move_keyring(app: Any, old_salt: str | None) -> None:
     _marker(app).unlink(missing_ok=True)
 
 
+def note_stale_keyring(state_dir: Path, old_salt: str | None) -> None:
+    """Before a passphrase change is taken (written by the root, or applied
+    by a standby): which keyring entry it makes stale. A kill before the
+    cleanup leaves this, and `finish_interrupted` finishes it at the next
+    start."""
+    if old_salt:
+        _private_write(
+            Path(state_dir) / KEYRING_MARKER, json.dumps({"oldInstallId": install_id(old_salt)})
+        )
+
+
 def finish_interrupted(app: Any) -> None:
-    """At start: a change that wrote its entry and stopped before it moved the
-    keyring entry. The old entry opens nothing now; it is deleted, and the root
-    says why it is locked."""
+    """At start: a change that was taken and stopped before its keyring entry
+    was cleaned up (on the root, before it moved; on a standby, before it was
+    deleted). The old entry opens nothing now; it is deleted, and a root on
+    the keyring says why it is locked."""
     marker = _marker(app)
     try:
         old_id = json.loads(marker.read_text(encoding="utf-8")).get("oldInstallId")
@@ -279,8 +302,8 @@ def finish_interrupted(app: Any) -> None:
         return
     current = install_id(app.state.machine.state.identity.salt)
     if isinstance(old_id, str) and old_id and old_id != current:
-        keyring_store.delete_master_key(old_id)
-        if keyring_store.get_master_key(current) is None:
+        held = keyring_store.delete_master_key(old_id)
+        if held and keyring_store.get_master_key(current) is None:
             log.warning(
                 "The stored key no longer opens this install (the passphrase changed); sign in."
             )
@@ -472,7 +495,11 @@ async def tell_machines(app: Any, current: str, new: str) -> list[dict[str, Any]
             continue
         kind = _problem_type(body)
         if status in (200, 204):
-            results.append({"node": name, "state": "changed"})
+            took: dict[str, Any] = {"node": name, "state": "changed"}
+            if isinstance(body, dict) and body.get("passphraseFile") == "old":
+                cause = str(body.get("detail") or "it did not say why")[:200]
+                took["detail"] = f"this machine could not save its passphrase file: {cause}"
+            results.append(took)
         elif status == 409 and kind.endswith("no-own-passphrase"):
             continue
         elif status == 409 and kind.endswith("passphrase-differs"):
@@ -521,6 +548,7 @@ def standby_followed(app: Any, old_salt: str) -> None:
     if provider is not None:
         provider.forget()
     keyring_store.delete_master_key(install_id(old_salt))
+    _marker(app).unlink(missing_ok=True)
     recheck_file(app)
     log.warning(
         "the install's passphrase changed; this standby %sholds no key now, and a promotion "

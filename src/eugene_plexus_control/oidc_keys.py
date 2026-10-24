@@ -23,6 +23,7 @@ apart.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -104,56 +105,67 @@ def key_list(state: Any) -> dict[str, Any]:
     return answer
 
 
+#: One change at a time (row 5 review): two routine changes at once both
+#: passed the age check and dropped a key whose refresh tokens were live.
+_CHANGE_LOCK = threading.Lock()
+
+
 def change(app: Any, *, end_sign_ins: bool) -> None:
     """Make a new key and, after a leak, retire the others. Synchronous (an
-    RSA key takes a moment to make), so the route runs it in a thread.
+    RSA key takes a moment to make), so the route runs it in a thread. The
+    age check and the change are one step: a second change waits, then sees
+    the key the first made.
 
     Raises `oidc.Locked` on a standby or a locked root, `TooSoon` for a
-    routine change that would drop a live key, and `StandbyBehind`."""
+    routine change that would drop a live key, `StandbyBehind`, and
+    `SealedUnderOldKey` when the passphrase changed while the key was being
+    made."""
     from .routes.control import standby_short_of
 
-    machine = app.state.machine
-    auth = app.state.auth_state
-    if not machine.is_active:
-        raise oidc.Locked("this control root is a standby; change the key on the active one")
-    master = auth.master_key
-    if master is None:
-        raise oidc.Locked(
-            "Eugene is locked. Sign in to the console once with the passphrase to unlock it."
+    with _CHANGE_LOCK:
+        machine = app.state.machine
+        auth = app.state.auth_state
+        if not machine.is_active:
+            raise oidc.Locked("this control root is a standby; change the key on the active one")
+        master, generation = auth.sealing_key()
+        if master is None:
+            raise oidc.Locked(
+                "Eugene is locked. Sign in to the console once with the passphrase to unlock it."
+            )
+        keys = machine.state.oidc_keys
+        if keys and not end_sign_ins:
+            changed = _made(keys[0])
+            if now() - changed < ROUTINE_MIN_AGE:
+                raise TooSoon(changed, changed + ROUTINE_MIN_AGE)
+        if end_sign_ins:
+            behind = standby_short_of(app, RETIRE_LOG_VERSION)
+            if behind is not None:
+                raise StandbyBehind(behind)
+        pem, jwk = oidc.new_signing_key()
+        machine.append(
+            OP_PUT_OIDC_KEY,
+            {
+                "key": {
+                    "kid": jwk["kid"],
+                    "sealedKey": security.seal_b64(pem, master),
+                    "publicJwk": jwk,
+                    "createdAt": now().isoformat(),
+                }
+            },
+            sealed_under=generation,
         )
-    keys = machine.state.oidc_keys
-    if keys and not end_sign_ins:
-        changed = _made(keys[0])
-        if now() - changed < ROUTINE_MIN_AGE:
-            raise TooSoon(changed, changed + ROUTINE_MIN_AGE)
-    if end_sign_ins:
-        behind = standby_short_of(app, RETIRE_LOG_VERSION)
-        if behind is not None:
-            raise StandbyBehind(behind)
-    pem, jwk = oidc.new_signing_key()
-    machine.append(
-        OP_PUT_OIDC_KEY,
-        {
-            "key": {
-                "kid": jwk["kid"],
-                "sealedKey": security.seal_b64(pem, master),
-                "publicJwk": jwk,
-                "createdAt": now().isoformat(),
-            }
-        },
-    )
-    if end_sign_ins:
-        machine.append(OP_RETIRE_OIDC_KEYS, {"keep": [jwk["kid"]]})
-    provider = getattr(app.state, "oidc", None)
-    if provider is not None:
-        provider.keep_only({k["kid"] for k in machine.state.oidc_keys})
-    log.warning(
-        "the sign-in key changed (%s)%s",
-        jwk["kid"],
-        "; every other key was retired, so every app signs in again"
-        if end_sign_ins
-        else "; the one before keeps verifying the sign-ins it made",
-    )
+        if end_sign_ins:
+            machine.append(OP_RETIRE_OIDC_KEYS, {"keep": [jwk["kid"]]})
+        provider = getattr(app.state, "oidc", None)
+        if provider is not None:
+            provider.keep_only({k["kid"] for k in machine.state.oidc_keys})
+        log.warning(
+            "the sign-in key changed (%s)%s",
+            jwk["kid"],
+            "; every other key was retired, so tokens they signed no longer verify"
+            if end_sign_ins
+            else "; the one before keeps verifying the sign-ins it made",
+        )
 
 
 def tick(app: Any) -> bool:

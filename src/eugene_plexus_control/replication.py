@@ -48,7 +48,7 @@ import httpx
 
 from . import __version__, tokens
 from ._http import internal_client
-from .applied import LOG_VERSION, ApplyError
+from .applied import LOG_VERSION, OP_CHANGE_PASSPHRASE, ApplyError
 from .state_machine import StateMachine
 
 log = logging.getLogger(__name__)
@@ -196,12 +196,17 @@ class Follower:
         interval_seconds: float,
         token_provider: object | None = None,
         on_passphrase_changed: Callable[[str], None] | None = None,
+        before_passphrase_change: Callable[[str], None] | None = None,
     ) -> None:
         self._machine = machine
         self._interval = interval_seconds
         #: Row 5: told the old salt when this copy takes a passphrase change,
         #: from an entry or a snapshot.
         self._on_passphrase_changed = on_passphrase_changed
+        #: Row 5: told the salt in effect just before this copy takes a
+        #: passphrase change, so a kill between taking it and the cleanup
+        #: after it is finished at the next start.
+        self._before_passphrase_change = before_passphrase_change
         # See `_http`: shared SSL context, and no proxy between a
         # standby and the active root.
         self._client = internal_client()
@@ -274,6 +279,8 @@ class Follower:
         before = self._machine.state.identity.salt
         try:
             await self._pull()
+            # Row 5: copies a passphrase change left on disk, tried again.
+            self._machine.compact_pending()
         finally:
             after = self._machine.state.identity.salt
             if (
@@ -283,6 +290,10 @@ class Follower:
                 and self._on_passphrase_changed is not None
             ):
                 self._on_passphrase_changed(before)
+
+    def _before_change(self, salt: str | None) -> None:
+        if salt is not None and self._before_passphrase_change is not None:
+            self._before_passphrase_change(salt)
 
     async def _pull(self) -> None:
         url = self.status.active_url
@@ -327,6 +338,8 @@ class Follower:
             self.status.active_applied_index = reported
 
         entries = page.get("entries") or []
+        if any(isinstance(e, dict) and e.get("op") == OP_CHANGE_PASSPHRASE for e in entries):
+            self._before_change(self._machine.state.identity.salt)
         applied = 0
         for entry in entries:
             try:
@@ -433,6 +446,9 @@ class Follower:
             document = response.json()
             if not isinstance(document, dict):
                 raise ValueError("malformed snapshot")
+            offered = document.get("salt")
+            if isinstance(offered, str) and offered != self._machine.state.identity.salt:
+                self._before_change(self._machine.state.identity.salt)
             self._machine.install_snapshot(document)
         except BaseException:
             self._snapshot_after = time.perf_counter() + SNAPSHOT_RETRY_SECONDS

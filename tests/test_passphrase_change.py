@@ -178,6 +178,7 @@ def test_a_value_that_does_not_open_stops_the_change_and_names_it(
                 "createdAt": utcnow_iso(),
             }
         },
+        sealed_under=machine.state.identity.salt,
     )
     salt = machine.state.identity.salt
     answer = c.post("/v1/auth/passphrase", json={"current": PASSPHRASE, "new": NEW})
@@ -400,6 +401,7 @@ async def test_a_standby_follows_the_change_by_entry_or_by_snapshot(tmp_path: Pa
             assert changed.status_code == 200, changed.text
 
         heard: dict[str, list[str]] = {"near": [], "far": []}
+        noted: dict[str, list[str]] = {"near": [], "far": []}
         for name, start in (("near", one_behind), ("far", far_behind)):
             copy = standby_at(tmp_path / name)
             copy.install_snapshot(start)
@@ -409,6 +411,7 @@ async def test_a_standby_follows_the_change_by_entry_or_by_snapshot(tmp_path: Pa
                 interval_seconds=0.01,
                 token_provider=lambda: spare.service_token(sub="standby"),
                 on_passphrase_changed=heard[name].append,
+                before_passphrase_change=noted[name].append,
             )
             try:
                 await follower.tick()
@@ -416,6 +419,7 @@ async def test_a_standby_follows_the_change_by_entry_or_by_snapshot(tmp_path: Pa
                 await follower.stop()
             assert copy.canonical() == machine.canonical(), name
             assert heard[name] == [old_salt], name
+            assert noted[name] == [old_salt], f"{name}: noted before it was taken"
             log_file = tmp_path / name / "log.jsonl"
             kept = log_file.read_text("utf-8").split() if log_file.exists() else []
             assert [json.loads(e)["op"] for e in kept] in ([OP_CHANGE_PASSPHRASE], []), name
@@ -513,3 +517,178 @@ async def test_the_new_passphrase_goes_only_where_it_is_kept_and_never_in_plain(
     assert all(path == "/v1/node/passphrase" for _, path, _ in nodes.sent)
     assert all(body == {"current": PASSPHRASE, "new": NEW} for _, _, body in nodes.sent)
     assert all(NEW not in json.dumps(r) and PASSPHRASE not in json.dumps(r) for r in results)
+
+
+# --------------------------------------------------------------------- #
+# the review (Codex, 2026-10-24)
+# --------------------------------------------------------------------- #
+
+SAVED_AGAIN = "The passphrase changed while this was saved; save it again."
+
+PROVIDER = {
+    "name": "Example SSO",
+    "kind": "oidc",
+    "issuer": "https://idp.example",
+    "clientId": "eugene-test",
+    "clientSecret": "upstream-secret",
+    "tokenAuthMethod": "client_secret_post",
+}
+
+
+def test_a_secret_sealed_before_a_change_is_refused_not_stored(
+    active_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reproduction: a new provider's secret is sealed, its metadata
+    request is paused, the passphrase changes, and the save resumes. It must
+    not be stored under a key nobody can derive any more."""
+    import asyncio
+
+    from eugene_plexus_control import external_sign_in as sso
+
+    c = active_client
+    app = c.app
+    issuer = c.patch("/v1/config", json={"oidcIssuer": "https://eugene.example/oidc"})
+    assert issuer.status_code == 200
+
+    async def paused(record: dict[str, Any]) -> dict[str, Any]:
+        await asyncio.to_thread(passphrase_change.change, app, NEW)
+        return {}
+
+    monkeypatch.setattr(sso, "metadata", paused)
+    made = c.post("/v1/auth/providers", json={**PROVIDER, "enabled": True})
+    assert made.status_code == 409, made.text
+    assert made.json()["detail"]["detail"] == SAVED_AGAIN
+    machine = app.state.machine  # type: ignore[attr-defined]
+    assert machine.state.browser_sign_in["providers"] == {}
+
+    # Saved again, it opens with the key in effect.
+    again = c.post("/v1/auth/providers", json={**PROVIDER, "enabled": False})
+    assert again.status_code == 200, again.text
+    [record] = machine.state.browser_sign_in["providers"].values()
+    key = app.state.auth_state.master_key  # type: ignore[attr-defined]
+    assert security.open_b64(record["sealedSecret"], key) == b"upstream-secret"
+
+
+def test_every_sealed_op_names_the_salt_it_sealed_under(active_client: TestClient) -> None:
+    """The writer refuses an entry that carries a sealed value unless it says
+    which key generation it sealed under, and that is the one in effect."""
+    from eugene_plexus_control.state_machine import SEALED_OPS, SealedUnderOldKey
+
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    _, jwk = new_signing_key()
+    key = {"kid": jwk["kid"], "sealedKey": "x", "publicJwk": jwk, "createdAt": utcnow_iso()}
+    assert OP_PUT_OIDC_KEY in SEALED_OPS and OP_CHANGE_PASSPHRASE in SEALED_OPS
+    with pytest.raises(TypeError):
+        machine.append(OP_PUT_OIDC_KEY, {"key": key})
+    index = machine.state.index
+    with pytest.raises(SealedUnderOldKey, match="save it again"):
+        machine.append(OP_PUT_OIDC_KEY, {"key": key}, sealed_under="c2FsdHNhbHRzYWx0c2FsdA==")
+    assert machine.state.index == index
+
+
+def test_a_compaction_that_fails_leaves_the_new_key_in_effect(
+    active_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c = active_client
+    app = c.app
+    machine = app.state.machine  # type: ignore[attr-defined]
+    state_dir = Path(app.state.settings.state_dir)  # type: ignore[attr-defined]
+    old_key = app.state.auth_state.master_key  # type: ignore[attr-defined]
+    original = machine._store.write_snapshot
+
+    def disk_full(*_: Any, **__: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(machine._store, "write_snapshot", disk_full)
+    answer = c.post("/v1/auth/passphrase", json={"current": PASSPHRASE, "new": NEW})
+    assert answer.status_code == 200, answer.text
+    assert "No space left on device" in answer.json()["cleanup"]
+    new_key = security.derive_master_key(NEW, base64.b64decode(machine.state.identity.salt))
+    assert app.state.auth_state.master_key == new_key  # type: ignore[attr-defined]
+    saved = c.post("/v1/auth/providers", json={**PROVIDER, "enabled": False})
+    assert saved.status_code == 200, saved.text
+    [record] = machine.state.browser_sign_in["providers"].values()
+    assert security.open_b64(record["sealedSecret"], new_key) == b"upstream-secret"
+    assert _opening(_on_disk(state_dir), old_key), "the old copies are still there"
+
+    monkeypatch.setattr(machine._store, "write_snapshot", original)
+    assert machine.compact_pending() is None
+    assert _opening(_on_disk(state_dir), old_key) == []
+
+
+def test_a_restart_finishes_a_compaction_a_crash_left(tmp_path: Path) -> None:
+    """Killed after the change entry is durable and before compaction: the
+    next start drops the old copies before anything else."""
+    settings = settings_for(tmp_path / "root")
+    state_dir = tmp_path / "root" / "state"
+    app = create_app(settings)
+    with TestClient(app) as c:
+        assert c.post("/v1/auth/initialize", json={"passphrase": PASSPHRASE}).status_code == 204
+        c.headers["Authorization"] = f"Bearer {login(c)}"
+        _with_every_sealed_value(c)
+        old_key = app.state.auth_state.master_key
+        store = app.state.machine._store
+
+        def killed(*_: Any, **__: Any) -> None:
+            raise OSError("killed")
+
+        store.write_snapshot = killed
+        changed = c.post("/v1/auth/passphrase", json={"current": PASSPHRASE, "new": NEW})
+        assert changed.status_code == 200, changed.text
+        assert _opening(_on_disk(state_dir), old_key)
+    with TestClient(create_app(settings)) as again:
+        assert _opening(_on_disk(state_dir), old_key) == []
+        assert again.post("/v1/auth/login", json={"passphrase": NEW}).status_code == 200
+
+
+def test_a_standby_killed_before_its_cleanup_finishes_it_at_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The standby says which keyring entry the change makes stale before it
+    takes the change, so a kill between the two is finished at its next
+    start."""
+    from types import SimpleNamespace
+
+    deleted: list[str] = []
+    monkeypatch.setattr(keyring_store, "delete_master_key", lambda i: deleted.append(i) or True)
+    monkeypatch.setattr(keyring_store, "get_master_key", lambda i: None)
+    copy = standby_at(tmp_path / "copy")
+    old_salt = "b2xkLXNhbHQtb2xkLXNhbHQ="
+    passphrase_change.note_stale_keyring(tmp_path / "copy", old_salt)
+    # ... killed here: the copy took the change, and the cleanup never ran.
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            settings=SimpleNamespace(state_dir=tmp_path / "copy"),
+            machine=copy,
+        )
+    )
+    passphrase_change.finish_interrupted(app)
+    assert deleted == [keyring_store.install_id_for(old_salt)]
+    assert not (tmp_path / "copy" / passphrase_change.KEYRING_MARKER).exists()
+
+
+async def test_a_machine_that_could_not_save_its_file_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eugene_plexus_control import _http
+    from eugene_plexus_control.applied import OP_ENROLL_NODE
+    from eugene_plexus_control.nodes_client import NodeProbe
+
+    app = create_app(settings_for(tmp_path / "root"))
+    with TestClient(app):
+        app.state.machine.append(
+            OP_ENROLL_NODE, {"name": "nas", "url": "http://nas:8079/", "enrolledAt": utcnow_iso()}
+        )
+        app.state.nodes_client = _Nodes(
+            {"nas": NodeProbe(name="nas", reachable=True, own_passphrase=True)},
+            {"nas": (200, {"passphraseFile": "old", "detail": "Read-only file system"})},
+        )
+        monkeypatch.setattr(_http, "machine_route", lambda url: "https://nas:8083")
+        results = await passphrase_change.tell_machines(app, PASSPHRASE, NEW)
+    assert results == [
+        {
+            "node": "nas",
+            "state": "changed",
+            "detail": "this machine could not save its passphrase file: Read-only file system",
+        }
+    ]
