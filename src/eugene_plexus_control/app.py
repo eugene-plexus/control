@@ -332,6 +332,9 @@ def _auto_unlock(app: FastAPI, machine: StateMachine) -> None:
     secret whose failure mode is "auto-unlock appeared to work" is worse
     than no secret.
     """
+    # Row 5: the key is stored under its salt's install id; it is published
+    # with that salt, and only while it is still the install's.
+    salt = machine.state.identity.salt
     install_id = auth_routes.install_id_of(machine)
     stored = keyring_store.get_master_key(install_id)
     if stored is None:
@@ -342,7 +345,7 @@ def _auto_unlock(app: FastAPI, machine: StateMachine) -> None:
         )
         return
     try:
-        auth_routes.unseal_with_master_key(app.state.auth_state, machine, stored)
+        auth_routes.unseal_with_master_key(app.state.auth_state, machine, stored, salt=salt)
     except Exception as exc:
         # Includes the HTTPException that `unseal_with_master_key`
         # raises for an unreadable signing key. At startup that is not
@@ -392,7 +395,8 @@ def _auto_unlock_from_file(app: FastAPI, machine: StateMachine, path: Path | Non
         # read_passphrase logged which of the four things went wrong.
         return
 
-    verifier = machine.state.identity.passphraseVerifier
+    identity = machine.state.identity
+    verifier = identity.passphraseVerifier
     if verifier is not None and not security.verify_passphrase(passphrase, verifier):
         log.error(
             "the passphrase in %s is not this install's passphrase; the root stays locked. "
@@ -403,7 +407,7 @@ def _auto_unlock_from_file(app: FastAPI, machine: StateMachine, path: Path | Non
         return
 
     try:
-        auth_routes.unseal_into(app.state.auth_state, machine, passphrase)
+        auth_routes.unseal_into(app.state.auth_state, machine, passphrase, identity=identity)
     except Exception as exc:
         app.state.auth_state.forget_master_key()
         # ...and the sign-in key unsealed from it (C2).

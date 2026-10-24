@@ -109,6 +109,14 @@ def _oauth_error(status: int, error: str, description: str) -> JSONResponse:
     )
 
 
+def _retry_after[R: Response](response: R, exc: Exception) -> R:
+    """Row 5: while a passphrase change puts its key in effect, the app is
+    asked to try again shortly (503 with `Retry-After`)."""
+    if isinstance(exc, oidc.Changing):
+        response.headers["Retry-After"] = str(oidc.RETRY_AFTER_SECONDS)
+    return response
+
+
 def _token_client(request: Request, form: Any) -> dict[str, Any] | None:
     """Who is at `/oidc/token`: the built-in public client by `client_id` in the
     form with no secret of any kind, else `client_secret_basic`."""
@@ -349,7 +357,8 @@ def complete_sign_in(
     try:
         provider.signing_key(machine, request.app.state.auth_state)
     except oidc.Locked as exc:
-        return _page(503, title="Eugene is locked", app_name=None, error=str(exc))
+        title = "Try again in a moment" if isinstance(exc, oidc.Changing) else "Eugene is locked"
+        return _retry_after(_page(503, title=title, app_name=None, error=str(exc)), exc)
     provider.close_request(ident or "")
     if pending.client_id == sso.ACCOUNT_CLIENT:
         return RedirectResponse(pending.redirect_uri, status_code=303, headers=_NO_STORE)
@@ -538,7 +547,7 @@ async def sign_in(request: Request) -> Response:
         # Made now if it does not exist, so the code can be traded.
         provider.signing_key(machine, auth)
     except oidc.Locked as exc:
-        return again(503, str(exc))
+        return _retry_after(again(503, str(exc)), exc)
     if new_password and person is not None:
         # D10. Every earlier sign-in of this person ends at its next refresh;
         # this one starts after the change, so it is kept.
@@ -675,7 +684,7 @@ async def token(request: Request) -> JSONResponse:
             )
             return JSONResponse(answer, headers=_NO_STORE)
     except oidc.Locked as exc:
-        return _oauth_error(503, "temporarily_unavailable", str(exc))
+        return _retry_after(_oauth_error(503, "temporarily_unavailable", str(exc)), exc)
     return _oauth_error(400, "unsupported_grant_type", "authorization_code or refresh_token.")
 
 

@@ -225,19 +225,22 @@ def change(app: Any, new: str, *, actor: str | None = None) -> Changed:
         keyring = config_module.effective(state.config)["securityMode"] == "os_keyring"
         if keyring:
             note_stale_keyring(Path(app.state.settings.state_dir), old_salt)
-        try:
-            machine.append(
-                OP_CHANGE_PASSPHRASE, resealed.payload, actor=actor, sealed_under=old_salt
-            )
-        except (ApplyError, SealedUnderOldKey) as exc:
-            # Something sealed was added or removed since `reseal` read the
-            # state: the entry no longer names exactly what is held.
-            _marker(app).unlink(missing_ok=True)
-            raise Moved() from exc
-        # The entry is durable, so the new key is the one in effect now,
-        # before anything that can fail: a sealed write after this point
-        # seals under it, and one sealed before is refused by the log.
-        auth.set_master_key(resealed.master_key, salt=resealed.payload["salt"])
+        # The entry and the switch, with unlocks held off: an unlock that
+        # read the old salt cannot publish its key between the two.
+        with auth.publishing():
+            try:
+                machine.append(
+                    OP_CHANGE_PASSPHRASE, resealed.payload, actor=actor, sealed_under=old_salt
+                )
+            except (ApplyError, SealedUnderOldKey) as exc:
+                # Something sealed was added or removed since `reseal` read
+                # the state: the entry no longer names exactly what is held.
+                _marker(app).unlink(missing_ok=True)
+                raise Moved() from exc
+            # The entry is durable, so the new key is the one in effect now,
+            # before anything that can fail: a sealed write after this point
+            # seals under it, and one sealed before is refused by the log.
+            auth.set_master_key(resealed.master_key, salt=resealed.payload["salt"])
         cleanup = machine.compact_pending()
         if keyring:
             move_keyring(app, old_salt)

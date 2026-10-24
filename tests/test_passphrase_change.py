@@ -692,3 +692,144 @@ async def test_a_machine_that_could_not_save_its_file_says_so(
             "detail": "this machine could not save its passphrase file: Read-only file system",
         }
     ]
+
+
+# --------------------------------------------------------------------- #
+# the re-review (Codex, 2026-10-24)
+# --------------------------------------------------------------------- #
+
+SIGN_IN_AGAIN = "The passphrase changed while you signed in; sign in again."
+
+
+def test_a_sign_in_the_change_overtook_publishes_no_key(
+    active_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The input: a sign-in with the old passphrase derives its key, the
+    change to the new one completes, the sign-in resumes, and a provider is
+    saved with a new secret. The stale key must never be published, under
+    any salt, and the save must seal under the key in effect."""
+    c = active_client
+    app = c.app
+    machine = app.state.machine  # type: ignore[attr-defined]
+    auth = app.state.auth_state  # type: ignore[attr-defined]
+    real = security.derive_master_key
+    overtaken: list[bool] = []
+
+    def derive(passphrase: str, salt: bytes) -> bytes:
+        key = real(passphrase, salt)
+        if passphrase == PASSPHRASE and not overtaken:
+            overtaken.append(True)
+            passphrase_change.change(app, NEW)
+        return key
+
+    monkeypatch.setattr(security, "derive_master_key", derive)
+    signed_in = c.post("/v1/auth/login", json={"passphrase": PASSPHRASE})
+    assert overtaken, "the change ran inside the sign-in"
+    assert signed_in.status_code == 409, signed_in.text
+    assert signed_in.json()["detail"]["detail"] == SIGN_IN_AGAIN
+    salt = machine.state.identity.salt
+    new_key = real(NEW, base64.b64decode(salt))
+    assert auth.sealing_key() == (new_key, salt), "the key in effect is the new one"
+
+    saved = c.post("/v1/auth/providers", json={**PROVIDER, "enabled": False})
+    assert saved.status_code == 200, saved.text
+    [record] = machine.state.browser_sign_in["providers"].values()
+    assert security.open_b64(record["sealedSecret"], new_key) == b"upstream-secret"
+
+
+def test_a_stale_key_is_never_published_under_another_salt(active_client: TestClient) -> None:
+    """Whatever unlocks, a key is published only with the salt it was derived
+    from, and only while that salt is the install's."""
+    from eugene_plexus_control.routes.auth import unseal_with_master_key
+
+    c = active_client
+    machine = c.app.state.machine  # type: ignore[attr-defined]
+    auth = c.app.state.auth_state  # type: ignore[attr-defined]
+    before = auth.sealing_key()
+    stale = security.derive_master_key(PASSPHRASE, base64.b64decode(machine.state.identity.salt))
+    with pytest.raises(Exception) as refused:
+        unseal_with_master_key(auth, machine, stale, salt="c2FsdHNhbHRzYWx0c2FsdA==")
+    assert SIGN_IN_AGAIN in str(getattr(refused.value, "detail", refused.value))
+    assert auth.sealing_key() == before
+
+
+def test_a_first_sign_in_during_the_handoff_is_asked_to_retry(
+    active_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The input: the change is paused after its entry is durable and before
+    the key in memory is switched, and the first sign-in (which makes the
+    first sign-in key) comes in. It waits briefly for the key in effect; past
+    that, a 503 with Retry-After, never an IndexError."""
+    import threading
+
+    from eugene_plexus_control import oidc
+
+    from .test_oidc import _sign_in
+
+    c = active_client
+    machine = c.app.state.machine  # type: ignore[attr-defined]
+    auth = c.app.state.auth_state  # type: ignore[attr-defined]
+    made = _client(c)
+    client_id = made["client"]["clientId"]
+    old_key, old_salt = auth.sealing_key()
+    resealed = passphrase_change.reseal(machine.state, old_key, NEW)
+    machine.append(OP_CHANGE_PASSPHRASE, resealed.payload, sealed_under=old_salt)
+    # ... paused: the entry is durable, the key in memory is still the old one.
+
+    monkeypatch.setattr(oidc, "HANDOFF_WAIT_SECONDS", 0.3)
+    waited = _sign_in(c, client_id, NEW)
+    assert waited.status_code == 503, waited.text
+    assert waited.headers.get("retry-after")
+    assert "Try again in a moment" in waited.text
+    assert machine.state.oidc_keys == ()
+
+    # The switch comes inside the wait: the sign-in goes through.
+    monkeypatch.setattr(oidc, "HANDOFF_WAIT_SECONDS", 5.0)
+    switch = threading.Timer(
+        0.3, lambda: auth.set_master_key(resealed.master_key, salt=resealed.payload["salt"])
+    )
+    switch.start()
+    try:
+        through = _sign_in(c, client_id, NEW)
+    finally:
+        switch.join()
+    assert through.status_code == 302, through.text
+    [key] = machine.state.oidc_keys
+    assert security.open_b64(key["sealedKey"], resealed.master_key)
+
+
+def test_a_change_between_the_check_and_the_publish_publishes_nothing(
+    active_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unlock checks its salt, opens the token key, and only then puts
+    its key in effect. A change that lands in between is caught at the
+    publish, under the lock the change holds while it switches."""
+    from eugene_plexus_control.routes.auth import unseal_with_master_key
+
+    c = active_client
+    app = c.app
+    machine = app.state.machine  # type: ignore[attr-defined]
+    auth = app.state.auth_state  # type: ignore[attr-defined]
+    salt = machine.state.identity.salt
+    old_key = security.derive_master_key(PASSPHRASE, base64.b64decode(salt))
+    real_open = security.open_b64
+    overtaken: list[bool] = []
+
+    def open_then_change(sealed: str, key: bytes) -> bytes:
+        opened = real_open(sealed, key)
+        if not overtaken:
+            overtaken.append(True)
+            passphrase_change.change(app, NEW)
+        return opened
+
+    monkeypatch.setattr(security, "open_b64", open_then_change)
+    with pytest.raises(Exception) as refused:
+        unseal_with_master_key(auth, machine, old_key, salt=salt)
+    monkeypatch.setattr(security, "open_b64", real_open)
+    assert overtaken
+    assert SIGN_IN_AGAIN in str(getattr(refused.value, "detail", refused.value))
+    new_salt = machine.state.identity.salt
+    assert auth.sealing_key() == (
+        security.derive_master_key(NEW, base64.b64decode(new_salt)),
+        new_salt,
+    )

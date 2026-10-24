@@ -54,7 +54,7 @@ from .._generated.models import (
     TokenExchangeRequest,
     TokenExchangeResponse,
 )
-from ..applied import OP_PATCH_CONFIG, OP_REVOKE_SESSION
+from ..applied import OP_PATCH_CONFIG, OP_REVOKE_SESSION, InstallIdentity
 from ..auth_state import AuthState
 from ..dependencies import (
     optional_node_actor,
@@ -319,7 +319,7 @@ async def login(request: Request, body: AuthInitializeRequest) -> AuthLoginRespo
 
     auth.clear_login_failures(remote)
     was_locked = auth.signing_key is None or auth.control_private_key is None
-    unseal_into(auth, machine, passphrase)
+    unseal_into(auth, machine, passphrase, identity=identity)
     if was_locked:
         request.app.state.trust.publish(request.app)
 
@@ -578,8 +578,26 @@ async def exchange_token(request: Request, body: TokenExchangeRequest) -> TokenE
     )
 
 
-def unseal_into(auth: AuthState, machine: StateMachine, passphrase: str) -> None:
+#: Row 5: an unlock that a passphrase change overtook publishes nothing.
+SIGN_IN_AGAIN = "The passphrase changed while you signed in; sign in again."
+
+
+def _overtaken() -> Exception:
+    return problem(status.HTTP_409_CONFLICT, "Passphrase changed", SIGN_IN_AGAIN)
+
+
+def unseal_into(
+    auth: AuthState,
+    machine: StateMachine,
+    passphrase: str,
+    *,
+    identity: InstallIdentity | None = None,
+) -> None:
     """Derive the master key and open the three sealed values.
+
+    `identity` is the install identity the passphrase was checked against
+    (its verifier); the key is derived with that identity's salt, and is
+    published only while that salt is still the install's (row 5).
 
     Shared by login and promotion, because they need exactly the same
     thing: a standby being promoted is a host that has the salt and the
@@ -593,7 +611,7 @@ def unseal_into(auth: AuthState, machine: StateMachine, passphrase: str) -> None
     """
     import base64 as _b64
 
-    identity = machine.state.identity
+    identity = identity or machine.state.identity
     if identity.salt is None:
         raise problem(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -602,26 +620,40 @@ def unseal_into(auth: AuthState, machine: StateMachine, passphrase: str) -> None
         )
 
     master_key = security.derive_master_key(passphrase, _b64.b64decode(identity.salt))
-    unseal_with_master_key(auth, machine, master_key)
+    unseal_with_master_key(auth, machine, master_key, salt=identity.salt)
 
 
-def unseal_with_master_key(auth: AuthState, machine: StateMachine, master_key: bytes) -> None:
+def unseal_with_master_key(
+    auth: AuthState, machine: StateMachine, master_key: bytes, *, salt: str | None
+) -> None:
     """The half of `unseal_into` after the key is derived.
 
     Split out for OS keyring auto-unlock, which holds the derived master
     key and never sees the passphrase. One place opens the sealed values
     either way, so the "a sealed value that will not open is reported
     loudly" rule cannot drift between the two entry points.
+
+    **Row 5: `salt` is the one the key was derived with.** The key is
+    checked against the sealed values of that salt's identity, and then
+    published labelled with that salt, only while it is still the
+    install's (`AuthState.publish_master_key`, under the lock a passphrase
+    change holds while it writes and switches). An unlock a change
+    overtook publishes nothing and answers 409, *"The passphrase changed
+    while you signed in; sign in again."*
     """
     import base64 as _b64
 
     identity = machine.state.identity
-    auth.set_master_key(master_key, salt=identity.salt)
+    if identity.salt != salt:
+        raise _overtaken()
 
+    signing: bytes | None = None
     if identity.sealedSigningKey is not None:
         try:
-            auth.set_signing_key(security.open_b64(identity.sealedSigningKey, master_key))
+            signing = security.open_b64(identity.sealedSigningKey, master_key)
         except ValueError as exc:
+            if machine.state.identity.salt != salt:
+                raise _overtaken() from exc
             raise problem(
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
                 "Sealed token key unreadable",
@@ -629,6 +661,12 @@ def unseal_with_master_key(auth: AuthState, machine: StateMachine, master_key: b
                 "session and client key in the install is signed with it, so this host "
                 "cannot serve until it is recovered.",
             ) from exc
+    if not auth.publish_master_key(
+        master_key, salt=salt, current=lambda: machine.state.identity.salt
+    ):
+        raise _overtaken()
+    if signing is not None:
+        auth.set_signing_key(signing)
 
     if identity.sealedControlKey is not None:
         try:

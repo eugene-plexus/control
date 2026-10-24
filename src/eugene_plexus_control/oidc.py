@@ -108,6 +108,39 @@ class Locked(Exception):
     """The root cannot sign: it is locked, or not the active root."""
 
 
+class Changing(Locked):
+    """Row 5: a passphrase change has written its entry and has not put its
+    key in effect yet. Answered with 503 and `Retry-After`."""
+
+
+#: Row 5: how long a sign-in waits for a passphrase change's key to be in
+#: effect before it asks the app to try again.
+HANDOFF_WAIT_SECONDS = 2.0
+#: What `Retry-After` says then.
+RETRY_AFTER_SECONDS = 2
+CHANGING = "Eugene's passphrase is changing. Try again in a moment."
+
+
+def key_in_effect(machine: Any, auth: Any) -> tuple[bytes, str]:
+    """The master key whose salt is the install's now, and that salt (row 5),
+    read together. Between a
+    passphrase change's durable entry and its switch, the key in memory is
+    still the old one: wait for the switch, at most `HANDOFF_WAIT_SECONDS`,
+    then raise `Changing`. `Locked` when there is no key at all."""
+    deadline = time.perf_counter() + HANDOFF_WAIT_SECONDS
+    while True:
+        master, generation = auth.sealing_key()
+        if master is None:
+            raise Locked(
+                "Eugene is locked. Sign in to the console once with the passphrase to unlock it."
+            )
+        if generation is not None and generation == machine.state.identity.salt:
+            return bytes(master), generation
+        if time.perf_counter() >= deadline:
+            raise Changing(CHANGING)
+        time.sleep(0.05)
+
+
 def b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
@@ -383,17 +416,11 @@ class Provider:
         """The newest key, unsealed; made first if there is none."""
         if not machine.is_active:
             raise Locked("this control root is a standby; sign in through the active one")
-        master, generation = auth.sealing_key()
-        if master is None:
-            raise Locked(
-                "Eugene is locked. Sign in to the console once with the passphrase to unlock it."
-            )
+        master, generation = key_in_effect(machine, auth)
         keys = machine.state.oidc_keys
         if not keys:
             keys = self._first_key(machine, auth, master, generation)
-            master, _ = auth.sealing_key()
-            if master is None:
-                raise Locked("Eugene is locked. Sign in to the console once to unlock it.")
+            master, _ = key_in_effect(machine, auth)
         newest = keys[0]
         with self._lock:
             key = self._keys.get(newest["kid"])
@@ -402,11 +429,12 @@ class Provider:
                     pem = security.open_b64(newest["sealedKey"], master)
                 except ValueError:
                     # Row 5: a passphrase change landed between reading the
-                    # key and the state; both again, once.
-                    master, _ = auth.sealing_key()
+                    # key and the state; both again, once the new key is in
+                    # effect.
+                    master, _ = key_in_effect(machine, auth)
+                    if not machine.state.oidc_keys:
+                        raise Changing(CHANGING) from None
                     newest = machine.state.oidc_keys[0]
-                    if master is None:
-                        raise Locked("Eugene is locked. Sign in once to unlock it.") from None
                     pem = security.open_b64(newest["sealedKey"], master)
                 key = serialization.load_pem_private_key(pem, password=None)
                 self._keys[newest["kid"]] = key
@@ -414,15 +442,17 @@ class Provider:
 
     @staticmethod
     def _first_key(
-        machine: Any, auth: Any, master: bytes, generation: str | None
+        machine: Any, auth: Any, master: bytes, generation: str
     ) -> tuple[dict[str, Any], ...]:
         """The first sign-in key, made at first need. Row 5: when a passphrase
         change lands between sealing it and writing it, the log refuses it,
-        and it is made once more under the key in effect."""
+        and it is sealed again under the key in effect (`key_in_effect`
+        waits for the change's switch, or raises `Changing`). Never returns
+        no keys."""
         from .state_machine import SealedUnderOldKey
 
-        for _ in range(2):
-            pem, jwk = new_signing_key()
+        pem, jwk = new_signing_key()
+        for _ in range(3):
             try:
                 machine.append(
                     OP_PUT_OIDC_KEY,
@@ -438,11 +468,10 @@ class Provider:
                 )
                 break
             except SealedUnderOldKey:
-                fresh, generation = auth.sealing_key()
-                if fresh is None:
-                    raise Locked("Eugene is locked. Sign in once to unlock it.") from None
-                master = fresh
+                master, generation = key_in_effect(machine, auth)
         keys: tuple[dict[str, Any], ...] = machine.state.oidc_keys
+        if not keys:
+            raise Changing(CHANGING)
         return keys
 
     @staticmethod

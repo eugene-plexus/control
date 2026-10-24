@@ -31,10 +31,11 @@ security model:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
 from . import tokens
@@ -83,6 +84,10 @@ class AuthState:
 
     _failures: dict[str, list[float]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _publish: threading.RLock = field(default_factory=threading.RLock)
+    """Row 5: held while a key is published by an unlock, and while a
+    passphrase change writes its entry and switches the key, so neither can
+    land between the other's check and its switch."""
 
     # ----- posture ----------------------------------------------------
 
@@ -119,6 +124,25 @@ class AuthState:
         with self._lock:
             self.master_key = key
             self.master_salt = salt
+
+    @contextlib.contextmanager
+    def publishing(self) -> Iterator[None]:
+        """Hold `publish_master_key` off: a passphrase change writes its entry
+        and switches to its key inside this."""
+        with self._publish:
+            yield
+
+    def publish_master_key(
+        self, key: bytes, *, salt: str | None, current: Callable[[], str | None]
+    ) -> bool:
+        """Row 5: put `key` in effect, labelled with the salt it was derived
+        from, only while that salt is the install's (`current()`). False, and
+        nothing published, when a passphrase change replaced it meanwhile."""
+        with self._publish:
+            if salt is None or current() != salt:
+                return False
+            self.set_master_key(key, salt=salt)
+            return True
 
     def sealing_key(self) -> tuple[bytes | None, str | None]:
         """(key, salt), read together: what a sealed write seals with, and the
