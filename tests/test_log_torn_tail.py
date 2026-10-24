@@ -439,8 +439,9 @@ def test_the_apps_own_start_up_repairs_the_tail_before_the_first_write(tmp_path:
     with TestClient(third) as client:
         health = client.get("/healthz").json()
         assert "discardedTornTailLines" not in health["details"]
-        # Initialization records the install CA (LT2, `setInstallCa`), entry 1.
-        assert health["details"]["appliedIndex"] == 3
+        # Initialization records the install CA (LT2, `setInstallCa`), entry 1,
+        # and the first bundle that root tokens carry their epoch (row 4), 2.
+        assert health["details"]["appliedIndex"] == 4
         assert health["status"] == "ok"
     assert third.state.machine.state.config["joinTokenTtlSeconds"] == 120
-    assert _indexes(settings.state_dir) == [1, 2, 3]
+    assert _indexes(settings.state_dir) == [1, 2, 3, 4]

@@ -2653,6 +2653,19 @@ class RevokedSession(BaseModel):
     exp: int = Field(..., description="The session's own `exp`, unix seconds.")
 
 
+class TokenEpochs(BaseModel):
+    """
+    Since when every token the control root signs carries `ep`
+    (row 4): the time in unix seconds, and the epoch it was then.
+    Absent from a root older than row 4, and every root token
+    without `ep` is then accepted as before.
+
+    """
+
+    since: int
+    epoch: int
+
+
 class TrustBundle(BaseModel):
     """
     The set of keys every verifier in the install trusts, and what
@@ -2692,7 +2705,20 @@ class TrustBundle(BaseModel):
        the issuer's own, 14 days for a session, 10 minutes for an
        exchanged token, and 400 days for a client key;
     5. refuses a session that is listed in `revokedSessions`, or
-       whose `aud` names a node no longer in the bundle.
+       whose `aud` names a node no longer in the bundle;
+    6. refuses a token the control root signed, other than a client
+       key, whose `ep` claim (the epoch of the root that minted it,
+       row 4) is below this bundle's `epoch`: "This command came from a
+       root this machine no longer follows (epoch 2; it follows epoch
+       3)." A promotion keeps the root's token key, so this is what
+       stops the root it replaced. A root token without `ep` (from a
+       root older than row 4) is refused once `tokenEpochs` says roots
+       mark theirs, if it was minted after `tokenEpochs.since` or the
+       epoch has risen past `tokenEpochs.epoch`.
+
+    **Bundles are ordered by epoch first** (row 4): a higher `epoch`
+    replaces whatever its `version`, a lower one never does, and at
+    one epoch the version decides.
 
     No hard expiry, deliberately. A bundle that stopped verifying
     when the root was dead would end the data path's guarantee to
@@ -2703,11 +2729,15 @@ class TrustBundle(BaseModel):
 
     version: int = Field(
         ...,
-        description="The control root's replicated log index when this bundle was\nbuilt, so it only grows, including across a promotion. A\nverifier refuses a lower version than it holds (rollback)\nand replaces its bundle with an equal or higher one.\n",
+        description="The control root's replicated log index when this bundle was\nbuilt. At one epoch a verifier refuses a lower version than it\nholds (rollback) and replaces its bundle with an equal or\nhigher one. A root promoted from a copy that was behind may\nnumber below the root it replaced, so a higher `epoch` wins\nwhatever the version.\n",
         ge=0,
     )
     epoch: int = Field(
         ..., description="The control root's epoch; an agent refuses a lower one.", ge=0
+    )
+    tokenEpochs: TokenEpochs | None = Field(
+        None,
+        description='Since when every token the control root signs carries `ep`\n(row 4): the time in unix seconds, and the epoch it was then.\nAbsent from a root older than row 4, and every root token\nwithout `ep` is then accepted as before.\n',
     )
     iat: int = Field(
         ...,
@@ -3006,6 +3036,40 @@ class ClientPlainHttp(StrEnum):
     off = 'off'
 
 
+class MachineListControl(BaseModel):
+    """
+    Where the install's active control root is, and at which epoch
+    (row 4, `docs/design/rows/row-04.md`). Absent from a root older
+    than row 4.
+
+    **A node moves only with a promotion** (R4-MOVE). It writes
+    `url` as its `controlUrl` only when all of these hold: the list
+    verifies against the root identity it pinned at enrolment; its
+    `version` is above the one it holds; `epoch` is above the epoch
+    its current `controlUrl` came with (`NodeIdentity.controlUrlEpoch`);
+    and `epoch` is at least the epoch it holds. The same epoch never
+    moves a node: a node may reach its root at an address the root
+    does not know, such as a tailnet address.
+
+    A list whose `epoch` is below the epoch a node holds comes from a
+    superseded root, and the node refuses all of it
+    (`POST /v1/node/machine-list` answers 409).
+
+    """
+
+    epoch: int = Field(
+        ..., description='The epoch of the root that signed this list.', ge=1
+    )
+    node: str | None = Field(
+        None,
+        description='The node this root runs on, when it knows its own name. After a\npromotion, the promoted machine.\n',
+    )
+    url: str | None = Field(
+        None,
+        description="Where nodes reach this root: the plain form\n`http://<host>:<machine port>` of its machine's port, which a\nnode's machine table carries to TLS under `/control`, or the\nroot's nodes name when it has no machine port. Taken from the\nmachine port its agent describes in the door file, else from\nthis root's own node record, else from the nodes name. Null\nwhen this root knows none of them; a node then does not move.\n",
+    )
+
+
 class MachineListNode(BaseModel):
     name: str
     url: str | None = Field(
@@ -3224,6 +3288,14 @@ class StandbyStatus(BaseModel):
     reachable: bool | None = Field(
         None,
         description='The standby pulled within the last three follow intervals.\nFalse when it has not pulled since this root started, which\n`lastContactAt` being absent tells apart from a standby that\nstopped.\n',
+    )
+    version: str | None = Field(
+        None,
+        description='The version of control the standby runs, from the\n`Eugene-Plexus-Version` header of its last pull (row 4). Absent\nfrom a standby older than row 4. A standby older than the root\nshould be updated: it may drop what a newer root writes.\n',
+    )
+    matches: bool | None = Field(
+        None,
+        description="Whether the standby's copy is the root's, byte for byte (row\n4). Read at a pull made at this root's own applied index, from\nthe `Eugene-Plexus-Copy-Digest` header: true when that digest\nis this root's `LogPage.appliedDigest`, false when it differs.\nA standby whose copy differs takes a fresh snapshot by itself\n(at most once in 10 minutes), so false that stays means the\nfresh copy differs too. Absent until a standby on this root's\nversion has pulled at this root's index: two versions may write\nthe same state in different bytes.\n",
     )
 
 
@@ -4819,6 +4891,7 @@ class MachineList(BaseModel):
         None,
         description="This root takes `NodeAddressAnnouncement.tlsNextPin` (row 3):\na node may change its machine key. Absent from an older\nroot's list, and a node then offers no change.\n",
     )
+    control: MachineListControl | None = None
     nodes: list[MachineListNode]
 
 
@@ -5684,6 +5757,11 @@ class LogPage(BaseModel):
     firstAvailableIndex: int | None = Field(
         None,
         description='Reported on every page so a standby learns it has fallen\nbehind compaction *before* it tries to read a gap.\n',
+    )
+    appliedDigest: str | None = Field(
+        None,
+        description="SHA-256, in hex, of the active root's canonical applied state\nat `appliedIndex`: the bytes `GET /v1/control/snapshot` would\nsend at that index (row 4). Kept per index, so a caught-up\nstandby's pulls cost no hashing. A standby on the same version\n(the `Eugene-Plexus-Version` response header) whose copy at the\nsame index has another digest differs from the root, for\nexample a copy that applied entries with code too old to know\nall their fields. It takes a fresh snapshot.\n",
+        pattern='^[0-9a-f]{64}$',
     )
 
 

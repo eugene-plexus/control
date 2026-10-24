@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -111,11 +112,26 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         store = LogStore(settings.state_dir)
         machine = StateMachine(store, role=role)
         machine.load()
+    if role == ROLE_STANDBY and _promoted_here(machine, settings):
+        # Row 4: this copy was promoted, and its agent, which started it as
+        # a standby, has not heard yet (a crash before the new root's bundle
+        # reached it). Its own log is the evidence: the promote entry names
+        # this node, at an epoch above the one the agent holds.
+        log.warning(
+            "this copy was promoted to the root at epoch %d (its log says so; its agent "
+            "holds epoch %s): it starts as the root, not as a standby",
+            machine.state.epoch,
+            settings.follow_epoch,
+        )
+        machine.force_role(ROLE_ACTIVE)
+        role = ROLE_ACTIVE
     app.state.machine = machine
     app.state.admission_worker = AdmissionWorker()
 
     if not hasattr(app.state, "auth_state"):
         app.state.auth_state = AuthState()
+    # Row 4: every token this root signs carries the epoch it is at.
+    app.state.auth_state.epoch_source = lambda: app.state.machine.state.epoch
 
     # The last bundle this root signed, so a sealed root still serves one.
     app.state.trust = TrustPublisher(Path(settings.state_dir))
@@ -152,6 +168,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.root_tls_task = None
     app.state.machine_list = MachineListPublisher(Path(settings.state_dir))
     app.state.standby_reports = {}
+    # Row 4: when each node behind on the epoch was last sent it again.
+    app.state.epoch_pushes = {}
+    app.state.machine_list_push = None
     app.state.nodes_client = NodesClient(
         timeout_provider=lambda: config_module.effective(machine.state.config)[
             "nodeRequestTimeoutSeconds"
@@ -187,11 +206,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.follower = follower
         log.info("running as a STANDBY control root, following %s", settings.active_url)
     else:
-        app.state.node_poller = asyncio.create_task(_poll_nodes(app), name="control-node-poller")
-        if settings.nodes_origin:
-            app.state.root_tls_task = asyncio.create_task(
-                app.state.root_tls.run(), name="control-root-tls"
-            )
+        start_root_tasks(app)
         log.info(
             "running as the ACTIVE control root at epoch %d, applied index %d",
             machine.state.epoch,
@@ -218,8 +233,31 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.root_tls_task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await app.state.root_tls_task
+        if app.state.machine_list_push is not None:
+            app.state.machine_list_push.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await app.state.machine_list_push
         await app.state.nodes_client.aclose()
         await app.state.admission_worker.close()
+
+
+def _promoted_here(machine: StateMachine, settings: Settings) -> bool:
+    """A copy started as a standby whose own log says this node is the
+    root, at an epoch above the one its agent holds (row 4).
+
+    The promote entry is written by this copy alone, after the passphrase,
+    and only it makes a node's record `control`; a later promotion of
+    another machine records this one as a standby again. The epoch test
+    keeps a stale copy (one that was the root, and was replaced while it
+    was off) a standby of the root that replaced it."""
+    from .state_machine import active_node_name
+
+    name = settings.node_name
+    if not name or settings.follow_epoch is None:
+        return False
+    return active_node_name(machine.state) == name and machine.state.epoch > int(
+        settings.follow_epoch
+    )
 
 
 def _set_aside(store: LogStore) -> list[str]:
@@ -349,6 +387,84 @@ _LOCKED_POLL_SLEEP_SECONDS = 1.0
 """How long the node poller waits between checks while this root is
 sealed. Not the poll interval: see the locked branch below."""
 
+BEHIND_PUSH_SECONDS = 60.0
+"""Row 4: a node seen reachable and behind on this root's epoch, or on the
+address its root came with, is sent the bundle and the machine list again
+at most this often."""
+
+
+def start_root_tasks(app: FastAPI) -> None:
+    """What an active root runs beside its routes: the node poller and, with
+    a nodes name, the watch on its TLS keys. At start, and when a standby
+    is promoted (row 4): the promoted copy is not restarted, so it starts
+    them here. Each at most once."""
+    if getattr(app.state, "node_poller", None) is None:
+        app.state.node_poller = asyncio.create_task(_poll_nodes(app), name="control-node-poller")
+    settings: Settings = app.state.settings
+    if settings.nodes_origin and getattr(app.state, "root_tls_task", None) is None:
+        app.state.root_tls_task = asyncio.create_task(
+            app.state.root_tls.run(), name="control-root-tls"
+        )
+
+
+async def push_to_nodes_behind(
+    app: FastAPI, probes: dict[str, Any], *, now: float | None = None
+) -> list[str]:
+    """Send the bundle and the machine list again to each reachable node
+    behind this root (row 4). Returns the nodes sent to.
+
+    Behind means it reported a lower `epoch` (it missed a promotion's
+    bundle), or a lower `controlUrlEpoch` while this root's list names an
+    address to move to (it holds the epoch but still follows the root it
+    had). Each node at most once in `BEHIND_PUSH_SECONDS`, so a node that
+    refuses is not asked on every poll. A node that is down is reached by
+    its own pulls, or by asking the machine that held the standby grant."""
+    from . import trust as trust_module
+
+    machine: StateMachine = app.state.machine
+    epoch = machine.state.epoch
+    control = machine_list_module.control_block(
+        machine.state,
+        node=getattr(app.state, "node_name", None),
+        door_file=getattr(app.state.settings, "machine_door_file", None),
+        nodes_origin=getattr(app.state.settings, "nodes_origin", None),
+    )
+    behind = sorted(
+        name
+        for name, probe in probes.items()
+        if getattr(probe, "reachable", False)
+        and (
+            (isinstance(probe.epoch, int) and probe.epoch < epoch)
+            or (
+                control["url"] is not None
+                and isinstance(probe.control_url_epoch, int)
+                and probe.control_url_epoch < epoch
+            )
+        )
+    )
+    clock = time.perf_counter() if now is None else now
+    pushed: dict[str, float] = app.state.epoch_pushes
+    due = [
+        name for name in behind if name not in pushed or clock - pushed[name] >= BEHIND_PUSH_SECONDS
+    ]
+    if not due:
+        return []
+    for name in due:
+        pushed[name] = clock
+    bundle = app.state.trust.current
+    await trust_module.push_pairs(
+        app,
+        bundle if bundle is not None and bundle.epoch == epoch else None,
+        machine_list_module.signed(app),
+        names=due,
+    )
+    log.info(
+        "sent the bundle and machine list of epoch %d again to %s: behind this root",
+        epoch,
+        ", ".join(due),
+    )
+    return due
+
 
 async def _poll_nodes(app: FastAPI) -> None:
     """Ask each node whether it is reachable and which epoch it has seen.
@@ -427,6 +543,7 @@ async def _poll_nodes(app: FastAPI) -> None:
                     targets, lambda node: service_token_for(app.state.auth_state, node)
                 )
                 _note_list_capable(app, app.state.node_probes)
+                await push_to_nodes_behind(app, app.state.node_probes)
             _require_when_ready(app, machine)
             await asyncio.sleep(float(values["nodePollIntervalSeconds"]))
         except asyncio.CancelledError:

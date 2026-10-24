@@ -71,6 +71,10 @@ class NodeProbe:
     """The machine list version the node said it holds (`machine.listVersion`,
     row 3): how a machine key change reads which machines have both keys.
     None from an agent older than row 3."""
+    control_url_epoch: int | None = None
+    """The epoch the node's root address came with (`controlUrlEpoch`, row 4):
+    below this root's epoch, the node still follows the root it had. None
+    from an agent older than row 4."""
 
 
 TokenFor = Callable[[str], str | None]
@@ -180,6 +184,7 @@ class NodesClient:
             list_version=listed
             if isinstance(listed, int) and not isinstance(listed, bool)
             else None,
+            control_url_epoch=_int_or_none(body.get("controlUrlEpoch")),
         )
 
     async def probe_all(
@@ -325,6 +330,10 @@ def _problem_words(response: httpx.Response) -> str:
         str(problem[key]) for key in ("title", "detail") if isinstance(problem.get(key), str)
     )
     return f": {words[:240]}" if words else ""
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _str_or_none(value: Any) -> str | None:

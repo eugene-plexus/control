@@ -319,6 +319,16 @@ def test_a_replicating_standby_is_promotable_from_the_passphrase_alone(tmp_path:
         assert body["role"] == "control"
         assert body["epoch"] == epoch_before + 1, "promotion must raise the epoch"
 
+        # The session signed before the promotion was signed at the old
+        # epoch: refused now, as the old root's would be (row 4). Sign in
+        # again.
+        stale = standby.patch("/v1/config", json={"joinTokenTtlSeconds": 60}, headers=headers)
+        assert stale.status_code == 401 and "no longer follows" in stale.text
+        token = standby.post("/v1/auth/login", json={"passphrase": PASSPHRASE}).json()[
+            "sessionToken"
+        ]
+        headers = {"Authorization": f"Bearer {token}"}
+
         # It can write now, which is the difference between promoted and
         # merely relabelled.
         patched = standby.patch("/v1/config", json={"joinTokenTtlSeconds": 60}, headers=headers)

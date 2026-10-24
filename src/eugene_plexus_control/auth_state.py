@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from . import tokens
@@ -71,6 +72,10 @@ class AuthState:
     unsealed. Held only during an explicit recovery or re-seal; normal
     operation never needs it and never opens a component secret."""
 
+    epoch_source: Callable[[], int] | None = None
+    """This root's epoch, read at every mint (row 4): every token it signs
+    but a client key carries it as `ep`. None in a test that has no state."""
+
     _failures: dict[str, list[float]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -99,7 +104,8 @@ class AuthState:
         if self.signing_key is None:
             return None
         key = tokens.load_private(self.signing_key)
-        return tokens.Signer(key=key, issuer=tokens.ISSUER_CONTROL)
+        epoch = self.epoch_source() if self.epoch_source is not None else None
+        return tokens.Signer(key=key, issuer=tokens.ISSUER_CONTROL, epoch=epoch)
 
     def set_master_key(self, key: bytes) -> None:
         if len(key) != 32:
