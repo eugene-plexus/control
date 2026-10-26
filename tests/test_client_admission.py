@@ -500,11 +500,13 @@ def test_a_key_band_and_queue_bound_are_kept_and_checked(active_client):
     assert made["limits"]["maxQueuedRequests"] == 0
     answered = call(c, made["id"], "check").json()["limits"]
     assert answered["band"] == "background" and answered["maxQueuedRequests"] == 0
-    # A key nobody gave a band shows the values in effect; absent is interactive.
+    # A key nobody gave a band or a bound is answered without them (absent is
+    # interactive and 8), so a gateway a release behind, which refuses fields it
+    # does not know, still reads its admission answers.
     plain = mint(c)["key"]
-    assert plain["limits"].get("band", "interactive") == "interactive"
-    assert plain["limits"]["maxQueuedRequests"] == 8
-    assert call(c, plain["id"], "check").json()["limits"].get("band") is None
+    assert not {"band", "maxQueuedRequests"} & plain["limits"].keys()
+    answered = call(c, plain["id"], "acquire", "plain").json()["limits"]
+    assert not {"band", "maxQueuedRequests"} & answered.keys()
     for bad in ({"band": "urgent"}, {"maxQueuedRequests": 65}, {"maxQueuedRequests": -1}):
         response = c.post("/v1/auth/client-keys", json={"name": "bad", "limits": bad})
         assert response.status_code == 422, bad
