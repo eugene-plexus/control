@@ -13,10 +13,10 @@
       "sha256": "bb1c19018f1159882f000586a237bba08adbcaa1857de2f17bc841277c252dbb"
     },
     "src/eugene_plexus_control/client_admission.py": {
-      "sha256": "2d7b3b3f06b6d825d4b7c9c9dfc20ab217bcbf7febd4a477b6e8d58ce2b8b1a7"
+      "sha256": "a70c7e8140c595c86d3ac1edb765987e57b0f9eea3f206f1dc77002cef9670af"
     },
     "src/eugene_plexus_control/tokens.py": {
-      "sha256": "b4ea043831d6609a5b1feb419791506b4b509ea31c9d9dc7054527c1a4665dcb"
+      "sha256": "1068f80fe3705560c640c040bea4de5a7cfd2b1863c758ab6cc55003969e2e00"
     }
   }
 }

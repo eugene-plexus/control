@@ -109,6 +109,14 @@ def _oauth_error(status: int, error: str, description: str) -> JSONResponse:
     )
 
 
+def _retry_after[R: Response](response: R, exc: Exception) -> R:
+    """Row 5: while a passphrase change puts its key in effect, the app is
+    asked to try again shortly (503 with `Retry-After`)."""
+    if isinstance(exc, oidc.Changing):
+        response.headers["Retry-After"] = str(oidc.RETRY_AFTER_SECONDS)
+    return response
+
+
 def _token_client(request: Request, form: Any) -> dict[str, Any] | None:
     """Who is at `/oidc/token`: the built-in public client by `client_id` in the
     form with no secret of any kind, else `client_secret_basic`."""
@@ -349,7 +357,8 @@ def complete_sign_in(
     try:
         provider.signing_key(machine, request.app.state.auth_state)
     except oidc.Locked as exc:
-        return _page(503, title="Eugene is locked", app_name=None, error=str(exc))
+        title = "Try again in a moment" if isinstance(exc, oidc.Changing) else "Eugene is locked"
+        return _retry_after(_page(503, title=title, app_name=None, error=str(exc)), exc)
     provider.close_request(ident or "")
     if pending.client_id == sso.ACCOUNT_CLIENT:
         return RedirectResponse(pending.redirect_uri, status_code=303, headers=_NO_STORE)
@@ -527,8 +536,8 @@ async def sign_in(request: Request) -> Response:
         if person is None:
             return again(
                 400,
-                "Eugene's passphrase cannot be changed here. Only people the owner "
-                "added change their password on this page.",
+                "Eugene's passphrase cannot be changed here; change it on the console, "
+                "on People. Only people the owner added change their password on this page.",
             )
         if new_password != str(form.get("new_password_again") or ""):
             return again(200, "The two new passwords are not the same.")
@@ -538,7 +547,7 @@ async def sign_in(request: Request) -> Response:
         # Made now if it does not exist, so the code can be traded.
         provider.signing_key(machine, auth)
     except oidc.Locked as exc:
-        return again(503, str(exc))
+        return _retry_after(again(503, str(exc)), exc)
     if new_password and person is not None:
         # D10. Every earlier sign-in of this person ends at its next refresh;
         # this one starts after the change, so it is kept.
@@ -675,7 +684,7 @@ async def token(request: Request) -> JSONResponse:
             )
             return JSONResponse(answer, headers=_NO_STORE)
     except oidc.Locked as exc:
-        return _oauth_error(503, "temporarily_unavailable", str(exc))
+        return _retry_after(_oauth_error(503, "temporarily_unavailable", str(exc)), exc)
     return _oauth_error(400, "unsupported_grant_type", "authorization_code or refresh_token.")
 
 
@@ -789,3 +798,63 @@ async def subjects(request: Request) -> JSONResponse:
     for sub in dict.fromkeys(asked):
         (known if sub == OPERATOR_NAME or sub in people else unknown).append(sub)
     return JSONResponse({"known": known, "unknown": unknown}, headers=_NO_STORE)
+
+
+#: `/oidc/groups` (row 70c review): at most this many wrong secrets from one address, and this
+#: many reads by one app, in a window; then 429 with `Retry-After`.
+GROUPS_WINDOW_SECONDS = 60
+GROUPS_FAILURES = 5
+GROUPS_READS = 60
+
+
+def _slow_down(why: str) -> JSONResponse:
+    answer = _oauth_error(
+        429, "slow_down", f"{why} Wait {GROUPS_WINDOW_SECONDS} seconds and try again."
+    )
+    answer.headers["Retry-After"] = str(GROUPS_WINDOW_SECONDS)
+    return answer
+
+
+@router.get("/oidc/groups", operation_id="oidcGroups")
+async def groups(request: Request) -> JSONResponse:
+    """The permission groups that give the calling app, as `{id, name}` (row 70c).
+
+    Workbench's owner attaches a memory server to a group before any member signs in, so
+    the app needs the list without a member's claims. It needs the app's own secret, and
+    says nothing of who is in a group: a person's groups come only in their own sign-in."""
+    auth = request.app.state.auth_state
+    caller = f"oidc-groups-peer:{_caller(request)}"
+    if auth.is_login_rate_limited(
+        caller, window_seconds=GROUPS_WINDOW_SECONDS, max_in_window=GROUPS_FAILURES
+    ):
+        return _slow_down("Too many failed attempts from this address.")
+    client = _client_auth(request)
+    if client is None:
+        auth.record_login_failure(
+            caller, window_seconds=GROUPS_WINDOW_SECONDS, max_in_window=GROUPS_FAILURES
+        )
+        return _oauth_error(401, "invalid_client", "Client authentication failed.")
+    auth.clear_login_failures(caller)
+    reads = f"oidc-groups-reads:{client['clientId']}"
+    if auth.is_login_rate_limited(
+        reads, window_seconds=GROUPS_WINDOW_SECONDS, max_in_window=GROUPS_READS
+    ):
+        return _slow_down("This app has asked for its groups too often.")
+    auth.record_login_failure(
+        reads, window_seconds=GROUPS_WINDOW_SECONDS, max_in_window=GROUPS_READS
+    )
+    machine = request.app.state.machine
+    if not machine.is_active:
+        return _oauth_error(
+            503,
+            "temporarily_unavailable",
+            "This control root is a standby; ask the active one.",
+        )
+    client_id = client["clientId"]
+    given = [
+        {"id": g["id"], "name": g["name"]}
+        for g in machine.state.permission_groups.values()
+        if g["apps"] is None or client_id in g["apps"]
+    ]
+    given.sort(key=lambda g: (g["name"].casefold(), g["id"]))
+    return JSONResponse({"groups": given}, headers=_NO_STORE)

@@ -91,6 +91,9 @@ OP_PROMOTE = "promote"
 OP_PUT_CLIENT_KEY = "putClientKey"
 OP_REVOKE_CLIENT_KEY = "revokeClientKey"
 OP_SET_CLIENT_KEY_LIMITS = "setClientKeyLimits"
+# Row 24: a new token for the same key (shared allowance), and the last-use stamp.
+OP_ROTATE_CLIENT_KEY = "rotateClientKey"
+OP_TOUCH_CLIENT_KEY = "touchClientKey"
 OP_PUT_CLIENT_ADMISSION = "putClientAdmission"
 OP_REVOKE_SESSION = "revokeSession"
 # Signing in with Eugene (C2, docs/design/sign-in-with-eugene.md).
@@ -117,6 +120,19 @@ OP_SET_STANDBY = "setStandby"
 OP_LABEL_NODE = "labelNode"
 OP_SET_INSTALL_CA = "setInstallCa"
 OP_SET_NODE_CERTIFICATE_NAMES = "setNodeCertificateNames"
+# Row 5 (`specs/docs/design/rows/row-05.md`), log version 1.
+OP_RETIRE_OIDC_KEYS = "retireOidcKeys"
+OP_CHANGE_PASSPHRASE = "changePassphrase"
+
+#: The log version this build applies (`Eugene-Plexus-Log-Version`, row 5):
+#: which ops it knows. Every build reports the same `__version__`, so a root
+#: asks this number, not that one, whether its standby can apply an op. Raise
+#: it with the op that needs it, and name the op here.
+#:
+#: * 0: every op before row 5 (what a standby that sends no number applies).
+#: * 1: `retireOidcKeys`, `changePassphrase`, and every op merged before them
+#:   (`rotateClientKey` and `touchClientKey` among them).
+LOG_VERSION = 1
 
 #: The grant that makes a node the install's warm standby (warm-standby.md).
 GRANT_STANDBY = "standby"
@@ -143,6 +159,8 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_PUT_CLIENT_KEY,
         OP_REVOKE_CLIENT_KEY,
         OP_SET_CLIENT_KEY_LIMITS,
+        OP_ROTATE_CLIENT_KEY,
+        OP_TOUCH_CLIENT_KEY,
         OP_PUT_CLIENT_ADMISSION,
         OP_REVOKE_SESSION,
         OP_PUT_PERSON,
@@ -163,6 +181,8 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_LABEL_NODE,
         OP_SET_INSTALL_CA,
         OP_SET_NODE_CERTIFICATE_NAMES,
+        OP_RETIRE_OIDC_KEYS,
+        OP_CHANGE_PASSPHRASE,
     }
 )
 
@@ -345,7 +365,9 @@ class InstallIdentity:
     """The trust root's own replicated material.
 
     Established once by `POST /v1/auth/initialize` and thereafter
-    mutated only by `rotateSigningKey`. **Initialization is not a log
+    mutated only by `rotateSigningKey`, `setInstallCa` and (row 5)
+    `changePassphrase`, which replaces the salt, the verifier and every
+    sealed value at once. **Initialization is not a log
     op**, and that is correct rather than an omission: it happens
     exactly once, before any standby can exist, so the snapshot always
     carries it forward and it never needs to replicate as an entry.
@@ -935,7 +957,7 @@ def _key_record(raw: Any) -> dict[str, Any]:
     for key in ("id", "name", "tail", "createdAt", "expiresAt"):
         if not isinstance(raw.get(key), str) or (not raw[key] and key != "tail"):
             raise ApplyError(f"invalid client-key {key}")
-    for key in ("createdAt", "expiresAt", "revokedAt"):
+    for key in ("createdAt", "expiresAt", "revokedAt", "lastUsedAt", "retiresAt"):
         if raw.get(key) is not None:
             try:
                 parsed = datetime.fromisoformat(raw[key])
@@ -953,6 +975,11 @@ def _key_record(raw: Any) -> dict[str, Any]:
         "revokedAt",
         "lastUsedAt",
         "limits",
+        # Row 24: set by a rotation only (`_apply_rotate_client_key`).
+        "retiresAt",
+        "replaces",
+        "replacedBy",
+        "lineage",
     }
     if raw.keys() - allowed:
         raise ApplyError("unexpected client-key property")
@@ -981,7 +1008,74 @@ def _apply_put_client_key(state: AppliedState, payload: dict[str, Any], index: i
     record = _key_record(payload.get("key"))
     if record["id"] in state.client_keys:
         raise ApplyError("client-key identifier already exists")
+    if record.keys() & _ROTATION_FIELDS:
+        # A forged lineage would let a key borrow another key's allowance.
+        raise ApplyError("rotation fields are set by a rotation only")
     return replace(state, client_keys={**state.client_keys, record["id"]: record})
+
+
+_ROTATION_FIELDS = frozenset({"retiresAt", "replaces", "replacedBy", "lineage"})
+
+
+def _apply_rotate_client_key(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    old_id = payload.get("oldId")
+    old = state.client_keys.get(old_id) if isinstance(old_id, str) else None
+    if old is None or not isinstance(old_id, str):
+        raise ApplyError("unknown client-key identifier")
+    if old.get("revokedAt"):
+        raise ApplyError("this key is turned off and cannot be rotated")
+    if old.get("replacedBy"):
+        raise ApplyError("this key is already replaced")
+    new = _key_record(payload.get("key"))
+    if new["id"] in state.client_keys:
+        raise ApplyError("client-key identifier already exists")
+    if new.get("replaces") != old_id or new.keys() & {
+        "replacedBy",
+        "retiresAt",
+        "revokedAt",
+        "lastUsedAt",
+    }:
+        raise ApplyError("invalid replacement record")
+    retires = payload.get("retiresAt")
+    _key_record({**old, "retiresAt": retires})  # validates the timestamp
+    # The replacement keeps the old key's name and limits and joins its allowance,
+    # whatever the payload says.
+    new = {**new, "name": old["name"], "lineage": old.get("lineage") or old_id}
+    if old.get("limits") is None:
+        new.pop("limits", None)
+    else:
+        new["limits"] = old["limits"]
+    return replace(
+        state,
+        client_keys={
+            **state.client_keys,
+            old_id: {**old, "retiresAt": retires, "replacedBy": new["id"]},
+            new["id"]: new,
+        },
+    )
+
+
+def _apply_touch_client_key(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    key_id, used = payload.get("id"), payload.get("usedAt")
+    if key_id not in state.client_keys:
+        raise ApplyError("unknown client-key identifier")
+    return replace(state, client_keys={**state.client_keys, key_id: _touched(state, key_id, used)})
+
+
+def _touched(state: AppliedState, key_id: str, used: Any) -> dict[str, Any]:
+    """The key's record with `lastUsedAt` moved forward to `used`, never back."""
+    from datetime import datetime
+
+    record = state.client_keys[key_id]
+    candidate = _key_record({**record, "lastUsedAt": used})
+    current = record.get("lastUsedAt")
+    if current is not None and datetime.fromisoformat(current) >= datetime.fromisoformat(used):
+        return record
+    return candidate
 
 
 def _apply_set_client_key_limits(
@@ -991,7 +1085,17 @@ def _apply_set_client_key_limits(
     if key_id not in state.client_keys or not isinstance(payload.get("limits"), dict):
         raise ApplyError("unknown key or missing limits")
     record = _key_record({**state.client_keys[key_id], "limits": payload["limits"]})
-    return replace(state, client_keys={**state.client_keys, key_id: record})
+    keys = {**state.client_keys, key_id: record}
+    # A rotated key's tokens share one allowance, so they share one policy.
+    lineage = record.get("lineage") or key_id
+    for other_id, other in state.client_keys.items():
+        if (
+            other_id != key_id
+            and not other.get("revokedAt")
+            and (other.get("lineage") or other_id) == lineage
+        ):
+            keys[other_id] = _key_record({**other, "limits": payload["limits"]})
+    return replace(state, client_keys=keys)
 
 
 def _apply_put_client_admission(
@@ -1006,9 +1110,13 @@ def _apply_put_client_admission(
         buckets = clean_buckets(state.client_admission["buckets"], now)
         buckets[payload["keyId"]] = payload["bucket"]
         ledger = validate_ledger({"clock": now, "buckets": buckets})
-    except (ValueError, TypeError, KeyError) as exc:
+        used = payload.get("usedId")
+        keys = state.client_keys
+        if used is not None and used in keys:
+            keys = {**keys, used: _touched(state, used, payload["usedAt"])}
+    except (ValueError, TypeError, KeyError, ApplyError) as exc:
         raise ApplyError("invalid admission update") from exc
-    return replace(state, client_admission=ledger)
+    return replace(state, client_admission=ledger, client_keys=keys)
 
 
 def _apply_revoke_client_key(
@@ -1362,6 +1470,96 @@ def _apply_put_oidc_key(state: AppliedState, payload: dict[str, Any], index: int
     return replace(state, oidc_keys=(record, *state.oidc_keys)[:OIDC_KEYS_KEPT])
 
 
+def _apply_retire_oidc_keys(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    """Keep only the sign-in keys `keep` names (row 5): after a suspected
+    leak, every token the others signed stops verifying. At least one held
+    key stays, or nothing could verify a sign-in at all."""
+    keep = payload.get("keep")
+    if not isinstance(keep, list) or not keep or any(not isinstance(k, str) for k in keep):
+        raise ApplyError(f"entry {index}: retireOidcKeys needs `keep`, a list of key ids")
+    held = {k["kid"] for k in state.oidc_keys}
+    if not set(keep) <= held:
+        raise ApplyError(f"entry {index}: retireOidcKeys keeps a sign-in key that is not here")
+    return replace(state, oidc_keys=tuple(k for k in state.oidc_keys if k["kid"] in keep))
+
+
+#: The identity's sealed values, as `changePassphrase`'s `sealed` names them.
+SEALED_IDENTITY = {
+    "signingKey": "sealedSigningKey",
+    "controlKey": "sealedControlKey",
+    "recoveryKey": "sealedRecoveryKey",
+    "installCaKey": "sealedInstallCaKey",
+}
+
+
+def sealed_inventory(state: AppliedState) -> dict[str, Any]:
+    """Every value in applied state sealed under the master key, by where it
+    is, in the shape `changePassphrase`'s `sealed` takes (row 5).
+
+    The one list of them. A sealed field added later must be added here, or
+    a passphrase change refuses to apply: `passphrase_change` also walks
+    every string of the state it would write and refuses one that still
+    opens with the old key, so a field missing here is found, not lost."""
+    identity = state.identity
+    inventory: dict[str, Any] = {
+        name: getattr(identity, attribute)
+        for name, attribute in SEALED_IDENTITY.items()
+        if getattr(identity, attribute)
+    }
+    inventory["oidcKeys"] = {k["kid"]: k["sealedKey"] for k in state.oidc_keys}
+    inventory["externalProviders"] = {
+        ident: record["sealedSecret"]
+        for ident, record in sorted((state.browser_sign_in.get("providers") or {}).items())
+        if record.get("sealedSecret")
+    }
+    return inventory
+
+
+def _apply_change_passphrase(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    """A new salt and verifier, and every sealed value sealed again under the
+    new master key by the writer (row 5). `sealed` must name exactly what
+    `sealed_inventory` holds: a value it missed would stay sealed under the
+    old key, which nobody can derive any more, and one it adds is not here."""
+    salt = _require_str(payload, "salt", index)
+    verifier = _require_str(payload, "passphraseVerifier", index)
+    sealed = payload.get("sealed")
+    if not isinstance(sealed, dict):
+        raise ApplyError(f"entry {index}: changePassphrase needs `sealed`")
+    held = sealed_inventory(state)
+
+    def shape(value: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: sorted(item) if isinstance(item, dict) else None for key, item in value.items()
+        }
+
+    if shape(sealed) != shape(held):
+        raise ApplyError(
+            f"entry {index}: changePassphrase does not name exactly the sealed values held"
+        )
+    for key, item in sealed.items():
+        values = item.values() if isinstance(item, dict) else [item]
+        if any(not isinstance(v, str) or not v for v in values):
+            raise ApplyError(f"entry {index}: changePassphrase's {key} must be sealed strings")
+
+    identity = replace(
+        state.identity,
+        salt=salt,
+        passphraseVerifier=verifier,
+        **{SEALED_IDENTITY[name]: sealed[name] for name in SEALED_IDENTITY if name in sealed},
+    )
+    keys = tuple({**k, "sealedKey": sealed["oidcKeys"][k["kid"]]} for k in state.oidc_keys)
+    sign_in = dict(state.browser_sign_in)
+    providers = dict(sign_in.get("providers") or {})
+    for ident, secret in sealed["externalProviders"].items():
+        providers[ident] = {**providers[ident], "sealedSecret": secret}
+    sign_in["providers"] = providers
+    return replace(state, identity=identity, oidc_keys=keys, browser_sign_in=sign_in)
+
+
 def _apply_revoke_sign_in(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
     """As `revokeSession`, for a sign-in at `/oidc/revoke`."""
     sid = _require_str(payload, "sid", index)
@@ -1504,6 +1702,8 @@ _HANDLERS: dict[str, _Handler] = {
     OP_PUT_CLIENT_KEY: _apply_put_client_key,
     OP_REVOKE_CLIENT_KEY: _apply_revoke_client_key,
     OP_SET_CLIENT_KEY_LIMITS: _apply_set_client_key_limits,
+    OP_ROTATE_CLIENT_KEY: _apply_rotate_client_key,
+    OP_TOUCH_CLIENT_KEY: _apply_touch_client_key,
     OP_PUT_CLIENT_ADMISSION: _apply_put_client_admission,
     OP_REVOKE_SESSION: _apply_revoke_session,
     OP_PUT_PERSON: _apply_put_person,
@@ -1524,6 +1724,8 @@ _HANDLERS: dict[str, _Handler] = {
     OP_LABEL_NODE: _apply_label_node,
     OP_SET_INSTALL_CA: _apply_set_install_ca,
     OP_SET_NODE_CERTIFICATE_NAMES: _apply_set_node_certificate_names,
+    OP_RETIRE_OIDC_KEYS: _apply_retire_oidc_keys,
+    OP_CHANGE_PASSPHRASE: _apply_change_passphrase,
     **{op: partial(sign_in_state.apply, op=op) for op in sign_in_state.OPS},
 }
 

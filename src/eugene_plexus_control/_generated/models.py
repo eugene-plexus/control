@@ -1006,7 +1006,24 @@ class ClientKey(BaseModel):
     expiresAt: AwareDatetime
     revokedAt: AwareDatetime | None = None
     lastUsedAt: AwareDatetime | None = Field(
-        None, description='Reserved; not currently measured.'
+        None,
+        description='When the authority last admitted a check or acquisition with this key, to the minute. Absent, no use recorded.',
+    )
+    retiresAt: AwareDatetime | None = Field(
+        None,
+        description='Set when the key was rotated. The token works until then, and new requests on it are refused as replaced afterwards. Running requests finish.',
+    )
+    replaces: str | None = Field(
+        None,
+        description='The id of the key this one replaced.',
+        max_length=128,
+        min_length=1,
+    )
+    replacedBy: str | None = Field(
+        None,
+        description='The id of the key that replaced this one.',
+        max_length=128,
+        min_length=1,
     )
     limits: ClientKeyLimits | None = Field(
         None,
@@ -1034,6 +1051,24 @@ class ClientKeyCreateRequest(BaseModel):
     name: str = Field(..., max_length=64, min_length=1)
     ttlDays: int | None = Field(365, ge=1, le=3650)
     limits: ClientKeyLimits | None = None
+
+
+class ClientKeyRotateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    overlapSeconds: int | None = Field(
+        86400,
+        description='How long the old token keeps working. 0 stops it now. The old and new tokens share one concurrency and rate allowance during the overlap.',
+        ge=0,
+        le=2592000,
+    )
+    ttlDays: int | None = Field(
+        None,
+        description="Lifetime of the new key. Absent, the old key's lifetime.",
+        ge=1,
+        le=3650,
+    )
 
 
 class ClientKeyUpdateRequest(BaseModel):
@@ -1288,7 +1323,7 @@ class InputFile(BaseModel):
     )
     file_id: str | None = Field(
         None,
-        description="Refused with a 400. It names a file uploaded to one\nprovider's store, which this install does not have; send\n`file_data`.\n",
+        description="A file kept in this install's store (`POST /v1/files`, row\n53). The gateway reads it for the caller, from the caller's\nown files only, and carries it as `file_data` (a PDF), an\nimage or text, within the limits above; it never reaches a\nbackend as an id. Another owner's id is refused as one that\ndoes not exist.\n",
     )
 
 
@@ -1527,6 +1562,11 @@ class ComponentKind(StrEnum):
     calls a tool-driver when the model uses it. `library` scans the operator's model
     directories and holds per-model launch profiles; there is
     exactly one, and it is deliberately not in the request path.
+    `store` (row 53, 2026-10-23) keeps what the gateway's platform
+    doors keep for people -- uploaded files first, then stored
+    responses, batches and vector stores -- each object with an owner
+    and an end; there is exactly one, on the root by default, and the
+    gateway is its only caller (`openapi/store.yaml`).
 
     **The agent is not in this list**, for the same reason engine
     runtimes are not: it supervises, it is not supervised. Its
@@ -1542,7 +1582,52 @@ class ComponentKind(StrEnum):
     gateway = 'gateway'
     inference_driver = 'inference-driver'
     library = 'library'
+    store = 'store'
     tool_driver = 'tool-driver'
+
+
+class Peer(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class ComputeDevicePcieLink(BaseModel):
+    """
+    Current and supported PCIe link measurements for one card. Each
+    measurement is null independently when its probe fails, so a
+    readable width survives an unreadable generation.
+
+    """
+
+    generation: int | None = Field(
+        ..., description='Current PCIe generation. Null when unreadable.', ge=1
+    )
+    width: int | None = Field(
+        ..., description='Current PCIe lane count. Null when unreadable.', ge=1
+    )
+    maxGeneration: int | None = Field(
+        ...,
+        description='Maximum PCIe generation the card supports. Null when unreadable.',
+        ge=1,
+    )
+    maxWidth: int | None = Field(
+        ...,
+        description='Maximum PCIe lane count the card supports. Null when unreadable.',
+        ge=1,
+    )
+
+
+class ComputeDeviceThrottleReason(StrEnum):
+    """
+    An observed reason a card is slowing down. `thermal` is a heat
+    limit, `power-cap` a power limit, `hardware-slowdown` another
+    hardware slowdown signal, and `other` another active NVML reason.
+
+    """
+
+    thermal = 'thermal'
+    power_cap = 'power-cap'
+    hardware_slowdown = 'hardware-slowdown'
+    other = 'other'
 
 
 class ComputeDeviceKind(StrEnum):
@@ -1738,6 +1823,68 @@ class PreparationVisionMode(StrEnum):
     gpu = 'gpu'
 
 
+class SpeedProjectionMode(StrEnum):
+    """
+    Changes the model's answers when on; experimental and off by default.
+    Strata's bundled refusal-direction projection reduces refusals and
+    also changes ordinary predictions. Upstream measures a 0.2-0.4%
+    cost per token on identical text, not a guaranteed speed-up.
+    Preparation uses --experimental-speed-projection on|off. Launch
+    applies the prepared control vector and reports the applied mode;
+    a requested mode alone is not evidence that it took effect.
+
+    """
+
+    off = 'off'
+    on = 'on'
+
+
+class StrataGpuSelectionItem(RootModel[int]):
+    root: int = Field(..., ge=0)
+
+
+class PreparationIntent(BaseModel):
+    """
+    Prepare the model for an engine before running it. Asked for,
+    never implied: Run without it picks an engine that runs the model
+    as it is. This is the source schema for the durable run protocol's
+    PreparationIntent; regenerate openapi/run-operations.json from the
+    Library after adopting this schema, rather than editing its copy.
+    The Strata choices use the same keys as that engine's profile
+    flags. Unsupported or ignored choices must name the observed
+    cause; no requested value may be reported as applied by default.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    engine: EngineKind
+    contextSize: int | None = Field(
+        None,
+        description="The context to prepare for. Absent uses the engine's recommendation for the node.",
+        ge=1,
+    )
+    vision: PreparationVisionMode | None = Field(
+        'off',
+        description='Image encoder placement. Off preserves text-only preparation.',
+    )
+    speedProjection: SpeedProjectionMode | None = Field(
+        'off',
+        description='Changes answers when on; experimental. Off preserves stock model behavior.',
+    )
+    gpus: list[StrataGpuSelectionItem] | None = Field(
+        None,
+        description="Ordered card ordinals from this node's ComputeDevice inventory;\nthe main card is first. The node validates each selected card\nagainst its current inventory and resolves process visibility at\nevery preparation and launch. Two or more cards share the model.\nOmission in a preparation keeps the existing automatic single-card\nselection. Omission in a profile preserves the prepared selection.\nAn empty list is not automatic selection.\nThis inventory has kind and index, not row 43's stable UUIDs;\nordinals are local to the selected node and must not be treated\nas stable identities or silently replaced by another card.\n",
+        min_length=1,
+    )
+    layerSplit: str | None = Field(
+        'auto',
+        description="auto places layers using the selected cards' free memory and\nexpert profile. An expert can give the first layer of each later\ncard, as comma-separated rising integers: 16,32 for three cards.\nThese are boundaries, not a count of layers per card. The node\nchecks one boundary per card after the first, each at least 2,\nstrictly rising and below the model's layer count. An explicit\nboundary requires several selected cards. With one card there\nis no layer split.\n",
+        min_length=1,
+    )
+
+
 class Context(RootModel[int]):
     root: int = Field(..., ge=1)
 
@@ -1767,6 +1914,10 @@ class ModelPreparation(BaseModel):
     visionModes: list[PreparationVisionMode] | None = Field(
         None,
         description="Image encoder choices supported by this model's preparation. Absent:\nno image preparation is offered. Omitting the choice in a run intent\npreserves text-only preparation. Enabling images downloads an extra\nencoder and uses additional memory while serving.\n",
+    )
+    speedProjectionModes: list[SpeedProjectionMode] | None = Field(
+        None,
+        description="Changes answers when on; experimental. Choices this model's\npreparation offers for the bundled projection. Absent means\nno projection choice is advertised, not a claim that an\nuntested model cannot run. Omitting the choice in a run\nintent selects off. An upstream fallback must be reported\nas the mode that actually took effect, with its cause.\n",
     )
     minEngineVersion: str | None = Field(
         None,
@@ -2574,6 +2725,19 @@ class RevokedSession(BaseModel):
     exp: int = Field(..., description="The session's own `exp`, unix seconds.")
 
 
+class TokenEpochs(BaseModel):
+    """
+    Since when every token the control root signs carries `ep`
+    (row 4): the time in unix seconds, and the epoch it was then.
+    Absent from a root older than row 4, and every root token
+    without `ep` is then accepted as before.
+
+    """
+
+    since: int
+    epoch: int
+
+
 class TrustBundle(BaseModel):
     """
     The set of keys every verifier in the install trusts, and what
@@ -2613,7 +2777,20 @@ class TrustBundle(BaseModel):
        the issuer's own, 14 days for a session, 10 minutes for an
        exchanged token, and 400 days for a client key;
     5. refuses a session that is listed in `revokedSessions`, or
-       whose `aud` names a node no longer in the bundle.
+       whose `aud` names a node no longer in the bundle;
+    6. refuses a token the control root signed, other than a client
+       key, whose `ep` claim (the epoch of the root that minted it,
+       row 4) is below this bundle's `epoch`: "This command came from a
+       root this machine no longer follows (epoch 2; it follows epoch
+       3)." A promotion keeps the root's token key, so this is what
+       stops the root it replaced. A root token without `ep` (from a
+       root older than row 4) is refused once `tokenEpochs` says roots
+       mark theirs, if it was minted after `tokenEpochs.since` or the
+       epoch has risen past `tokenEpochs.epoch`.
+
+    **Bundles are ordered by epoch first** (row 4): a higher `epoch`
+    replaces whatever its `version`, a lower one never does, and at
+    one epoch the version decides.
 
     No hard expiry, deliberately. A bundle that stopped verifying
     when the root was dead would end the data path's guarantee to
@@ -2624,11 +2801,15 @@ class TrustBundle(BaseModel):
 
     version: int = Field(
         ...,
-        description="The control root's replicated log index when this bundle was\nbuilt, so it only grows, including across a promotion. A\nverifier refuses a lower version than it holds (rollback)\nand replaces its bundle with an equal or higher one.\n",
+        description="The control root's replicated log index when this bundle was\nbuilt. At one epoch a verifier refuses a lower version than it\nholds (rollback) and replaces its bundle with an equal or\nhigher one. A root promoted from a copy that was behind may\nnumber below the root it replaced, so a higher `epoch` wins\nwhatever the version.\n",
         ge=0,
     )
     epoch: int = Field(
         ..., description="The control root's epoch; an agent refuses a lower one.", ge=0
+    )
+    tokenEpochs: TokenEpochs | None = Field(
+        None,
+        description='Since when every token the control root signs carries `ep`\n(row 4): the time in unix seconds, and the epoch it was then.\nAbsent from a root older than row 4, and every root token\nwithout `ep` is then accepted as before.\n',
     )
     iat: int = Field(
         ...,
@@ -2686,6 +2867,43 @@ class MasterKeyEnvelope(BaseModel):
         description='Base64-encoded 24-byte nonce. Generated per-encryption,\nnever reused with the same key.\n',
     )
     ciphertext: str = Field(..., description='Base64-encoded ciphertext + auth tag.')
+
+
+class Subject(RootModel[str]):
+    root: str = Field(..., max_length=200, min_length=1)
+
+
+class PeopleKnownRequest(BaseModel):
+    """
+    Which of these people the root still has (row 53). A component
+    that keeps people's objects (the store) asks its agent, which asks
+    the root with its own node token. Only the ids sent are answered,
+    so it cannot list people.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subjects: list[Subject] = Field(
+        ...,
+        description="People's ids, as a person token's `personId` names them.",
+        max_length=500,
+        min_length=1,
+    )
+
+
+class PeopleKnownResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    known: list[str] = Field(
+        ..., description="Ids the root has a person for (on or off), or the owner's."
+    )
+    unknown: list[str] = Field(
+        ...,
+        description="Ids the root has no person for. Each one was deleted, or never was the root's.",
+    )
 
 
 class RestartResult(BaseModel):
@@ -2927,6 +3145,40 @@ class ClientPlainHttp(StrEnum):
     off = 'off'
 
 
+class MachineListControl(BaseModel):
+    """
+    Where the install's active control root is, and at which epoch
+    (row 4, `docs/design/rows/row-04.md`). Absent from a root older
+    than row 4.
+
+    **A node moves only with a promotion** (R4-MOVE). It writes
+    `url` as its `controlUrl` only when all of these hold: the list
+    verifies against the root identity it pinned at enrolment; its
+    `version` is above the one it holds; `epoch` is above the epoch
+    its current `controlUrl` came with (`NodeIdentity.controlUrlEpoch`);
+    and `epoch` is at least the epoch it holds. The same epoch never
+    moves a node: a node may reach its root at an address the root
+    does not know, such as a tailnet address.
+
+    A list whose `epoch` is below the epoch a node holds comes from a
+    superseded root, and the node refuses all of it
+    (`POST /v1/node/machine-list` answers 409).
+
+    """
+
+    epoch: int = Field(
+        ..., description='The epoch of the root that signed this list.', ge=1
+    )
+    node: str | None = Field(
+        None,
+        description='The node this root runs on, when it knows its own name. After a\npromotion, the promoted machine.\n',
+    )
+    url: str | None = Field(
+        None,
+        description="Where nodes reach this root: the plain form\n`http://<host>:<machine port>` of its machine's port, which a\nnode's machine table carries to TLS under `/control`, or the\nroot's nodes name when it has no machine port. Taken from the\nmachine port its agent describes in the door file, else from\nthis root's own node record, else from the nodes name. Null\nwhen this root knows none of them; a node then does not move.\n",
+    )
+
+
 class MachineListNode(BaseModel):
     name: str
     url: str | None = Field(
@@ -3146,6 +3398,19 @@ class StandbyStatus(BaseModel):
         None,
         description='The standby pulled within the last three follow intervals.\nFalse when it has not pulled since this root started, which\n`lastContactAt` being absent tells apart from a standby that\nstopped.\n',
     )
+    version: str | None = Field(
+        None,
+        description='The version of control the standby runs, from the\n`Eugene-Plexus-Version` header of its last pull (row 4). Absent\nfrom a standby older than row 4. A standby older than the root\nshould be updated: it may drop what a newer root writes.\n',
+    )
+    matches: bool | None = Field(
+        None,
+        description="Whether the standby's copy is the root's, byte for byte (row\n4). Read at a pull made at this root's own applied index, from\nthe `Eugene-Plexus-Copy-Digest` header: true when that digest\nis this root's `LogPage.appliedDigest`, false when it differs.\nA standby whose copy differs takes a fresh snapshot by itself\n(at most once in 10 minutes), so false that stays means the\nfresh copy differs too. Absent until a standby on this root's\nversion has pulled at this root's index: two versions may write\nthe same state in different bytes.\n",
+    )
+    logVersion: int | None = Field(
+        None,
+        description="The log version the standby applies, from the\n`Eugene-Plexus-Log-Version` header of its last pull (row 5);\n0 when its pull carried none (a standby older than row 5).\nAbsent until it has pulled since this root started. Log\nversion 1 adds `retireOidcKeys` and `changePassphrase`: this\nroot refuses to write either while its standby reports less,\nbecause the standby's copy would stop there.\n",
+        ge=0,
+    )
 
 
 class AccessAuditEvent(BaseModel):
@@ -3165,6 +3430,26 @@ class AccessAudit(BaseModel):
 
 class LogOp(StrEnum):
     """
+    **`retireOidcKeys` (row 5, log version 1)** keeps only the sign-in
+    keys named in `keep` (`{keep: [kid]}`, at least one held key) and
+    drops the others, so every token they signed stops verifying. It
+    follows a `putOidcKey` when the owner ends every app sign-in after
+    a suspected leak.
+
+    **`changePassphrase` (row 5, log version 1)** changes Eugene's
+    passphrase: `{salt, passphraseVerifier, sealed}`, where `sealed`
+    holds every value the old master key sealed, sealed again under
+    the new one by the writer (`signingKey`, `controlKey`,
+    `recoveryKey`, `installCaKey`, `oidcKeys` by `kid`, and
+    `externalProviders` by id). It must name exactly the sealed values
+    the state holds, no more and no fewer, or it does not apply. Every
+    root that applies it writes a snapshot and drops every entry
+    before it, so no value sealed under the old key stays in the log;
+    a root that could not, does at its next start. The writer appends
+    every entry that carries a sealed value (`putOidcKey`,
+    `rotateSigningKey`, `setInstallCa`, `putExternalProvider`,
+    `changePassphrase`) only while the salt is the one it sealed under.
+
     **`setNodeCertificateNames` (LT2, 2026-10-20)** replaces the names
     the owner listed for one node's client certificate (`{name,
     names}`). An operator's, unsigned, like `labelNode`.
@@ -3243,6 +3528,8 @@ class LogOp(StrEnum):
     putClientKey = 'putClientKey'
     revokeClientKey = 'revokeClientKey'
     setClientKeyLimits = 'setClientKeyLimits'
+    rotateClientKey = 'rotateClientKey'
+    touchClientKey = 'touchClientKey'
     putClientAdmission = 'putClientAdmission'
     rotateSigningKey = 'rotateSigningKey'
     revokeSession = 'revokeSession'
@@ -3274,6 +3561,8 @@ class LogOp(StrEnum):
     labelNode = 'labelNode'
     setInstallCa = 'setInstallCa'
     setNodeCertificateNames = 'setNodeCertificateNames'
+    retireOidcKeys = 'retireOidcKeys'
+    changePassphrase = 'changePassphrase'
 
 
 class Group(RootModel[str]):
@@ -3437,6 +3726,109 @@ class OidcClient(BaseModel):
     createdAt: AwareDatetime
 
 
+class OidcKey(BaseModel):
+    """
+    One sign-in key (row 5), without its key material.
+    """
+
+    kid: str = Field(
+        ..., description="The key's RFC 7638 thumbprint, as the JWKS names it."
+    )
+    createdAt: AwareDatetime
+    signs: bool = Field(
+        ..., description='True for the newest key, which signs every new token.'
+    )
+    verifiesUntil: AwareDatetime | None = Field(
+        None,
+        description='For a key that no longer signs: when the last refresh token\nit signed expires (30 days after the next key was made). It\nis dropped at the next change after that. Absent for the key\nthat signs.\n',
+    )
+
+
+class OidcKeyList(BaseModel):
+    keys: list[OidcKey] = Field(
+        ..., description='Newest first. Empty before the first sign-in made a key.'
+    )
+    nextChangeAt: AwareDatetime | None = Field(
+        None,
+        description='When the active root changes the key by itself:\n`signInKeyDays` after the newest key was made. It checks once\nan hour while it is unlocked. Absent when `signInKeyDays` is 0\n(never) or there is no key yet.\n',
+    )
+
+
+class OidcKeyChangeRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    endSignIns: bool | None = Field(
+        False,
+        description='True after a suspected leak: tokens the old key signed stop\nverifying at once. An app that renews them asks the person to\nsign in again (Workbench within five minutes, its JWKS cache);\nan app that keeps its own session (Open WebUI) keeps it until\nit expires or the person signs out.\n',
+    )
+
+
+class PassphraseChangeRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    current: SecretStr = Field(
+        ..., description="Eugene's passphrase now.", min_length=1
+    )
+    new: SecretStr = Field(
+        ..., description='The new passphrase, at least 12 characters.', min_length=12
+    )
+
+
+class PassphraseMachineState(StrEnum):
+    """
+    * `changed`: the machine took the new passphrase.
+    * `pending`: it was not reached, or could not take it now; it
+      takes it at its next sign-in with the new passphrase.
+    * `plain`: it is reached in plain HTTP, so nothing was sent to
+      it; it takes the new passphrase at its next sign-in.
+
+    """
+
+    changed = 'changed'
+    pending = 'pending'
+    plain = 'plain'
+
+
+class PassphraseMachine(BaseModel):
+    node: str
+    state: PassphraseMachineState
+    detail: str | None = Field(
+        None,
+        description='The observed cause, for `pending` and `plain`. For `changed`,\nwhat the machine could not do with the new passphrase:\n*this machine could not save its passphrase file: <cause>*\n(after a restart it stays locked until someone signs in).\n',
+    )
+
+
+class PassphraseFileState(StrEnum):
+    """
+    The passphrase file this root unlocks from (`securityMode:
+    passphrase_file`), checked at each start, every hour and after a
+    change: `matches` holds this install's passphrase; `old` holds
+    another (after a change this root could not write it), so after a
+    restart the root stays locked until someone signs in; `none`
+    means this root does not unlock from a file.
+
+    """
+
+    matches = 'matches'
+    old = 'old'
+    none = 'none'
+
+
+class PassphraseChangeResult(BaseModel):
+    changedAt: AwareDatetime
+    machines: list[PassphraseMachine] = Field(
+        ...,
+        description='Each machine that keeps a passphrase of its own, or that could\nnot be asked whether it does, by node name.\n',
+    )
+    passphraseFile: PassphraseFileState
+    cleanup: str | None = Field(
+        None,
+        description='Present when the passphrase changed but the copies sealed\nunder the old key could not be removed yet: the cause. The\nroot tries again every hour and at its next start.\n',
+    )
+
+
 class OidcClientList(BaseModel):
     clients: list[OidcClient]
     issuer: str | None = Field(
@@ -3527,6 +3919,24 @@ class OidcSubjectsResponse(BaseModel):
     unknown: list[str] = Field(
         ...,
         description="Ids Eugene has no person for. Each one was deleted, or never was Eugene's.",
+    )
+
+
+class OidcGroup(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(..., max_length=80, min_length=1)
+
+
+class OidcGroupsResponse(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    groups: list[OidcGroup] = Field(
+        ...,
+        description='The permission groups that give the calling app, sorted by name.',
     )
 
 
@@ -3673,6 +4083,7 @@ class AuthStatus(BaseModel):
         None,
         description="Whether this host's OS keyring accepted a write, read and\ndelete of a probe entry from this process — measured once per\nprocess run. False in a container or on a headless box, where\n`passphrase_file` is the unattended answer. Absent when the\nprobe was not run or did not finish within its budget.\n",
     )
+    passphraseFile: PassphraseFileState | None = None
 
 
 class AuthInitializeRequest(BaseModel):
@@ -4289,6 +4700,12 @@ class ClientAdmissionResult(BaseModel):
     )
     keyId: str
     keyName: str
+    lineage: str | None = Field(
+        None,
+        description="The id of the first key of this key's rotations (row 24): a\nreplacement shares its predecessor's lineage. The store names a\nkey's objects by it, so a rotated key keeps its files (row 53).\nReaders take it when present and use `keyId` when absent; the\nauthority starts sending it once every reader knows the field,\nbecause an older reader refuses an unknown one.\n",
+        max_length=128,
+        min_length=1,
+    )
     personId: str | None = Field(
         None, description='Stable subject verified by the root, never caller supplied.'
     )
@@ -4386,6 +4803,11 @@ class ComputeDevice(BaseModel):
     because a host with two cards is the case that makes replicas of
     one model possible.
 
+    Health readings are observations, never estimates. Each optional
+    health field is null when the platform cannot read it. The agent
+    refreshes these with its device list every 600 seconds and on
+    each `GET /v1/node` (row 43).
+
     """
 
     kind: ComputeDeviceKind
@@ -4395,8 +4817,45 @@ class ComputeDevice(BaseModel):
     )
     index: int | None = Field(
         None,
-        description="Device ordinal on its own host — what `CUDA_VISIBLE_DEVICES`\nor `HIP_VISIBLE_DEVICES` in a runtime's `env` selects to pin\nthat runtime to one card. For a `vulkan` device it is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES`\ncounts in.\n",
+        description='Current device ordinal on its own host. It can change when\nanother card disappears; `uuid`, when readable, identifies\nthe same card across that renumbering. NVIDIA launches use\nthe UUID in `CUDA_VISIBLE_DEVICES`, falling back to an index\nwhen no UUID was read. For a `vulkan` device the index is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES` counts\nin.\n',
         ge=0,
+    )
+    uuid: str | None = Field(
+        None,
+        description="Stable vendor device identifier, used to keep a runtime on\nthe same card when indices change. NVIDIA's NVML UUID (for\nexample `GPU-...`) or AMD's sysfs `unique_id`, kept as the\nvendor reports it; not necessarily an RFC UUID. Null when\nthe platform cannot read it.\n",
+        min_length=1,
+    )
+    pciBusId: str | None = Field(
+        None,
+        description='PCI bus address from NVML or the Linux sysfs device path.\nNull when unreadable. A location, not a stable card identity.\n',
+        min_length=1,
+    )
+    pcieLink: ComputeDevicePcieLink | None = Field(
+        None,
+        description="Observed PCIe link against the card's supported link. Null\nwhen no link measurements can be read. A lower generation\nis a warning only when this card's utilisation exceeded 50%\nin the last minute of host history: an idle card can lower\nits generation to save power. A narrower width is a warning\nat any time. Compare only measurements that are known.\n",
+    )
+    powerLimitWatts: float | None = Field(
+        None,
+        description="Power cap in effect, in watts, from NVML's enforced power\nlimit or Linux hwmon `power1_cap`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    powerDefaultLimitWatts: float | None = Field(
+        None,
+        description="The card's default power cap in watts, from NVML or Linux\nhwmon `power1_cap_default`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    throttleReasons: list[ComputeDeviceThrottleReason] | None = Field(
+        None,
+        description='Reasons the card is currently slowing down, read from NVML.\nAn empty list means it reported no throttling. Null when\nunreadable, including AMD and other unsupported platforms.\n',
+    )
+    uncorrectedMemoryErrors: int | None = Field(
+        None,
+        description="Volatile uncorrected ECC memory-error count from NVML, since\nthe device's counter was reset. Zero is a measured result.\nNull when ECC is off, unsupported or unreadable.\n",
+        ge=0,
+    )
+    peers: list[Peer] | None = Field(
+        None,
+        description='UUIDs of other cards this card can reach directly by P2P\nreads, as NVML reports it. Directional: the reverse path is\nreported on the other card. An empty list means no peers\nwere reachable; null means the peer check was unreadable or\nunsupported. Unknown checks never claim that P2P is absent.\n',
     )
     memoryTotalBytes: int | None = None
     memoryFreeBytes: int | None = Field(
@@ -4678,6 +5137,7 @@ class MachineList(BaseModel):
         None,
         description="This root takes `NodeAddressAnnouncement.tlsNextPin` (row 3):\na node may change its machine key. Absent from an older\nroot's list, and a node then offers no change.\n",
     )
+    control: MachineListControl | None = None
     nodes: list[MachineListNode]
 
 
@@ -5543,6 +6003,11 @@ class LogPage(BaseModel):
     firstAvailableIndex: int | None = Field(
         None,
         description='Reported on every page so a standby learns it has fallen\nbehind compaction *before* it tries to read a gap.\n',
+    )
+    appliedDigest: str | None = Field(
+        None,
+        description="SHA-256, in hex, of the active root's canonical applied state\nat `appliedIndex`: the bytes `GET /v1/control/snapshot` would\nsend at that index (row 4). Kept per index, so a caught-up\nstandby's pulls cost no hashing. A standby on the same version\n(the `Eugene-Plexus-Version` response header) whose copy at the\nsame index has another digest differs from the root, for\nexample a copy that applied entries with code too old to know\nall their fields. It takes a fresh snapshot.\n",
+        pattern='^[0-9a-f]{64}$',
     )
 
 

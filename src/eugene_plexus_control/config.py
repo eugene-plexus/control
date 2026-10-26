@@ -284,7 +284,26 @@ FIELDS: list[ConfigField] = [
             "access setup, the address the app reaches Eugene at with /oidc."
         ),
     ),
+    ConfigField(
+        key="signInKeyDays",
+        label="Days before the sign-in key changes",
+        description=(
+            "How often the active root makes a new sign-in key for apps, in days.\n\n"
+            "Apps stay signed in: the old key keeps working until the last sign-in "
+            "it made must be renewed (30 days). At least 31; 0 means never. To "
+            "change the key now, or after a leak, use Change sign-in key on People."
+        ),
+        category="security",
+        valueType=ConfigValueType.integer,
+        default=90,
+        minimum=0,
+        maximum=3650,
+    ),
 ]
+
+#: Row 5: a sign-in key must outlive the refresh tokens it signed (30 days),
+#: or a change would drop a key whose sign-ins are still live.
+SIGN_IN_KEY_MIN_DAYS = 31
 
 # NOTE on what is NOT in this schema:
 #   * The bind port — the agent owns it via EUGENE_PLEXUS_CONTROL_BIND_PORT.
@@ -295,6 +314,10 @@ FIELDS: list[ConfigField] = [
 _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
 
 MODE_CHANGED_AT = "installModeChangedAt"
+
+#: Applied config that is no setting: the mode's date, and since when root
+#: tokens carry their epoch (row 4, `trust.TOKEN_EPOCHS`).
+INTERNAL = frozenset({MODE_CHANGED_AT, "tokenEpochs"})
 
 
 def as_schema() -> ConfigSchema:
@@ -323,6 +346,16 @@ def validate_patch(request: ConfigUpdateRequest) -> tuple[dict[str, Any], list[C
             rejected.append(ConfigFieldError(key=key, message=message))
             continue
         error = _validate_value(field, value)
+        if (
+            error is None
+            and key == "signInKeyDays"
+            and isinstance(value, int)
+            and 0 < value < SIGN_IN_KEY_MIN_DAYS
+        ):
+            error = (
+                f"must be 0 (never) or at least {SIGN_IN_KEY_MIN_DAYS} days: an app sign-in "
+                "lasts 30 days, and a key must outlive the sign-ins it made"
+            )
         if error is not None:
             rejected.append(ConfigFieldError(key=key, message=error))
             continue
@@ -373,7 +406,7 @@ def as_document(values: dict[str, Any]) -> ConfigDocument:
     # dates, and is not a setting anyone edits.
     merged = {
         **defaults(),
-        **{k: v for k, v in values.items() if k != MODE_CHANGED_AT and k not in RETIRED},
+        **{k: v for k, v in values.items() if k not in INTERNAL and k not in RETIRED},
     }
     return ConfigDocument.model_validate(merged)
 

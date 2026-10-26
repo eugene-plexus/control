@@ -360,11 +360,17 @@ def ensure(auth: Any, machine: Any) -> None:
         return
     if not machine.is_active:
         return
+    master, generation = auth.sealing_key()
+    if master is None:
+        return
     try:
         certificate, key = make_ca(label_for(identity.controlPublicKey))
+        # Row 5: refused, never stored, if the passphrase changed since
+        # `master` was read; the next unseal makes the CA again.
         machine.append(
             OP_SET_INSTALL_CA,
-            {"certificate": certificate, "sealedKey": security.seal_b64(key, auth.master_key)},
+            {"certificate": certificate, "sealedKey": security.seal_b64(key, master)},
+            sealed_under=generation,
         )
     except Exception as exc:  # degraded mode: logged, never fatal
         log.error("could not make the install CA; client doors stay plain: %s", exc)

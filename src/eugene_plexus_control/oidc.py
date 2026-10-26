@@ -108,6 +108,39 @@ class Locked(Exception):
     """The root cannot sign: it is locked, or not the active root."""
 
 
+class Changing(Locked):
+    """Row 5: a passphrase change has written its entry and has not put its
+    key in effect yet. Answered with 503 and `Retry-After`."""
+
+
+#: Row 5: how long a sign-in waits for a passphrase change's key to be in
+#: effect before it asks the app to try again.
+HANDOFF_WAIT_SECONDS = 2.0
+#: What `Retry-After` says then.
+RETRY_AFTER_SECONDS = 2
+CHANGING = "Eugene's passphrase is changing. Try again in a moment."
+
+
+def key_in_effect(machine: Any, auth: Any) -> tuple[bytes, str]:
+    """The master key whose salt is the install's now, and that salt (row 5),
+    read together. Between a
+    passphrase change's durable entry and its switch, the key in memory is
+    still the old one: wait for the switch, at most `HANDOFF_WAIT_SECONDS`,
+    then raise `Changing`. `Locked` when there is no key at all."""
+    deadline = time.perf_counter() + HANDOFF_WAIT_SECONDS
+    while True:
+        master, generation = auth.sealing_key()
+        if master is None:
+            raise Locked(
+                "Eugene is locked. Sign in to the console once with the passphrase to unlock it."
+            )
+        if generation is not None and generation == machine.state.identity.salt:
+            return bytes(master), generation
+        if time.perf_counter() >= deadline:
+            raise Changing(CHANGING)
+        time.sleep(0.05)
+
+
 def b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
@@ -257,6 +290,50 @@ def redirect_allowed(client: dict[str, Any], uri: str, issuer: str | None = None
     return uri in client["redirectUris"]
 
 
+#: The most bytes the group claims may add to an ID token (row 70c): an app may keep the
+#: token in a cookie, and a browser drops a cookie over 4 KB. `/oidc/userinfo` is not cut.
+ID_TOKEN_GROUP_BYTES = 1024
+
+
+def _json_bytes(value: Any) -> int:
+    """The bytes `value` takes in a signed token's payload: compact JSON with non-ASCII
+    escaped, as PyJWT writes it (`json.dumps` with its default `ensure_ascii`). Counting UTF-8
+    instead undercounts a name outside the Basic Multilingual Plane sixfold (row 70c review)."""
+    return len(json.dumps(value, separators=(",", ":")).encode("ascii"))
+
+
+def capped_group_claims(
+    groups: list[dict[str, str]], policies: dict[str, Any], cap: int
+) -> dict[str, Any]:
+    """The group claims as an ID token carries them: whole when they fit in `cap` bytes.
+
+    Past the cap: the groups that fit, from the start of the name-ordered list; every
+    policy value; in `setBy`, only the groups listed; and `eugene_groups_truncated: true`,
+    so an app that needs them all reads `/oidc/userinfo`. Everything this adds to the
+    token, the flag included, fits in `cap` (as signed: `_json_bytes`)."""
+    whole = {"eugene_groups": groups, "eugene_policies": policies}
+    if _json_bytes(whole) <= cap:
+        return whole
+
+    def cut(count: int) -> dict[str, Any]:
+        kept = groups[:count]
+        named = {g["id"] for g in kept}
+        trimmed = {k: v for k, v in policies.items() if k != "setBy"}
+        set_by = {
+            policy: [g for g in ids if g in named]
+            for policy, ids in (policies.get("setBy") or {}).items()
+        }
+        set_by = {policy: ids for policy, ids in set_by.items() if ids}
+        if set_by:
+            trimmed["setBy"] = set_by
+        return {"eugene_groups": kept, "eugene_policies": trimmed, "eugene_groups_truncated": True}
+
+    count = 0
+    while count < len(groups) and _json_bytes(cut(count + 1)) <= cap:
+        count += 1
+    return cut(count)
+
+
 def group_claims(state: Any, sub: str) -> dict[str, Any]:
     """`eugene_groups` and `eugene_policies` (row 70), from the root's state
     now: the person's groups as `{id, name}`, and the policies in effect
@@ -326,40 +403,76 @@ class Provider:
         with self._lock:
             self._keys.clear()
 
+    def keep_only(self, kids: set[str]) -> None:
+        """Drop every unsealed key the state no longer holds (row 5): a
+        retired key is not kept in memory either."""
+        with self._lock:
+            for kid in [k for k in self._keys if k not in kids]:
+                del self._keys[kid]
+
     # --- keys ---------------------------------------------------------
 
     def signing_key(self, machine: Any, auth: Any) -> tuple[str, Any]:
         """The newest key, unsealed; made first if there is none."""
         if not machine.is_active:
             raise Locked("this control root is a standby; sign in through the active one")
-        master = auth.master_key
-        if master is None:
-            raise Locked(
-                "Eugene is locked. Sign in to the console once with the passphrase to unlock it."
-            )
+        master, generation = key_in_effect(machine, auth)
         keys = machine.state.oidc_keys
         if not keys:
-            pem, jwk = new_signing_key()
-            machine.append(
-                OP_PUT_OIDC_KEY,
-                {
-                    "key": {
-                        "kid": jwk["kid"],
-                        "sealedKey": security.seal_b64(pem, master),
-                        "publicJwk": jwk,
-                        "createdAt": utcnow_iso(),
-                    }
-                },
-            )
-            keys = machine.state.oidc_keys
+            keys = self._first_key(machine, auth, master, generation)
+            master, _ = key_in_effect(machine, auth)
         newest = keys[0]
         with self._lock:
             key = self._keys.get(newest["kid"])
             if key is None:
-                pem = security.open_b64(newest["sealedKey"], master)
+                try:
+                    pem = security.open_b64(newest["sealedKey"], master)
+                except ValueError:
+                    # Row 5: a passphrase change landed between reading the
+                    # key and the state; both again, once the new key is in
+                    # effect.
+                    master, _ = key_in_effect(machine, auth)
+                    if not machine.state.oidc_keys:
+                        raise Changing(CHANGING) from None
+                    newest = machine.state.oidc_keys[0]
+                    pem = security.open_b64(newest["sealedKey"], master)
                 key = serialization.load_pem_private_key(pem, password=None)
                 self._keys[newest["kid"]] = key
         return newest["kid"], key
+
+    @staticmethod
+    def _first_key(
+        machine: Any, auth: Any, master: bytes, generation: str
+    ) -> tuple[dict[str, Any], ...]:
+        """The first sign-in key, made at first need. Row 5: when a passphrase
+        change lands between sealing it and writing it, the log refuses it,
+        and it is sealed again under the key in effect (`key_in_effect`
+        waits for the change's switch, or raises `Changing`). Never returns
+        no keys."""
+        from .state_machine import SealedUnderOldKey
+
+        pem, jwk = new_signing_key()
+        for _ in range(3):
+            try:
+                machine.append(
+                    OP_PUT_OIDC_KEY,
+                    {
+                        "key": {
+                            "kid": jwk["kid"],
+                            "sealedKey": security.seal_b64(pem, master),
+                            "publicJwk": jwk,
+                            "createdAt": utcnow_iso(),
+                        }
+                    },
+                    sealed_under=generation,
+                )
+                break
+            except SealedUnderOldKey:
+                master, generation = key_in_effect(machine, auth)
+        keys: tuple[dict[str, Any], ...] = machine.state.oidc_keys
+        if not keys:
+            raise Changing(CHANGING)
+        return keys
 
     @staticmethod
     def jwks(state: Any) -> dict[str, Any]:
@@ -465,7 +578,12 @@ def token_response(
     if client_id in machine.state.oidc_clients:
         # Worked out at each sign-in and refresh, so a change reaches the
         # app within one ID token's life. Never for a built-in client.
-        id_claims.update(group_claims(machine.state, subject.sub))
+        found = group_claims(machine.state, subject.sub)
+        id_claims.update(
+            capped_group_claims(
+                found["eugene_groups"], found["eugene_policies"], ID_TOKEN_GROUP_BYTES
+            )
+        )
     access = {
         **base,
         "exp": issued + ACCESS_TOKEN_TTL_SECONDS,

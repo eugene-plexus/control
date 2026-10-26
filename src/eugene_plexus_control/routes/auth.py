@@ -39,6 +39,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.security import HTTPBearer
+from pydantic import ValidationError
 
 from .. import config as config_module
 from .. import keyring_store, machine_list, peer, sealing, security, tokens
@@ -46,10 +47,14 @@ from .._generated.models import (
     AuthInitializeRequest,
     AuthLoginResponse,
     AuthStatus,
+    PassphraseChangeRequest,
+    PassphraseChangeResult,
+    PassphraseFileState,
+    PassphraseMachine,
     TokenExchangeRequest,
     TokenExchangeResponse,
 )
-from ..applied import OP_PATCH_CONFIG, OP_REVOKE_SESSION
+from ..applied import OP_PATCH_CONFIG, OP_REVOKE_SESSION, InstallIdentity
 from ..auth_state import AuthState
 from ..dependencies import (
     optional_node_actor,
@@ -101,7 +106,7 @@ def install_id_of(machine: StateMachine) -> str:
     return keyring_store.install_id_for(salt) if salt else ""
 
 
-@router.get("/v1/auth/status", response_model=AuthStatus)
+@router.get("/v1/auth/status", response_model=AuthStatus, response_model_exclude_unset=True)
 async def auth_status(request: Request) -> AuthStatus:
     """Has this install been through first-run setup, is it unlocked, and
     can this host's keyring keep it that way?
@@ -127,10 +132,21 @@ async def auth_status(request: Request) -> AuthStatus:
             KEYRING_PROBE_BUDGET_SECONDS,
         )
         available = None
+    from .. import passphrase_change
+
+    file_state = (
+        await asyncio.to_thread(passphrase_change.current_file_state, request.app)
+        if machine.state.identity.salt is not None
+        else None
+    )
+    # Row 5: checked at each start, every hour and after a change; absent
+    # when it could not be read.
+    extra = {"passphraseFile": PassphraseFileState(file_state)} if file_state else {}
     return AuthStatus(
         initialized=machine.state.identity.salt is not None,
         unlocked=auth.master_key is not None,
         keyringAvailable=available,
+        **extra,
     )
 
 
@@ -209,7 +225,7 @@ async def initialize(request: Request, body: AuthInitializeRequest) -> None:
             "one that already exists.",
         ) from exc
 
-    auth.set_master_key(master_key)
+    auth.set_master_key(master_key, salt=machine.state.identity.salt)
     auth.set_signing_key(signing_key)
     auth.control_private_key = control_identity.private
     auth.recovery_private_key = recovery.private
@@ -303,7 +319,7 @@ async def login(request: Request, body: AuthInitializeRequest) -> AuthLoginRespo
 
     auth.clear_login_failures(remote)
     was_locked = auth.signing_key is None or auth.control_private_key is None
-    unseal_into(auth, machine, passphrase)
+    unseal_into(auth, machine, passphrase, identity=identity)
     if was_locked:
         request.app.state.trust.publish(request.app)
 
@@ -380,6 +396,142 @@ async def logout(request: Request) -> None:
     log.info("session signed out")
 
 
+#: The log version `changePassphrase` came with (row 5).
+_CHANGE_LOG_VERSION = 1
+
+
+async def _change_body(request: Request) -> tuple[str, str]:
+    """`{current, new}`, checked here and not by FastAPI: a validation error
+    would echo the passphrase it refused back in its `input`."""
+    try:
+        raw = await request.json()
+    except ValueError:
+        raw = None
+    if not isinstance(raw, dict):
+        raise problem(422, "Passphrases required", "Send the current passphrase and the new one.")
+    try:
+        body = PassphraseChangeRequest.model_validate(raw)
+    except ValidationError as exc:
+        if any(e.get("loc") == ("new",) for e in exc.errors(include_input=False)):
+            raise problem(
+                422,
+                "Passphrase too short",
+                f"Choose a new passphrase of at least {MIN_PASSPHRASE_LENGTH} characters. A few "
+                "ordinary words in a row works.",
+            ) from None
+        raise problem(
+            422, "Passphrases required", "Send the current passphrase and the new one."
+        ) from None
+    return body.current.get_secret_value(), body.new.get_secret_value()
+
+
+@router.post(
+    "/v1/auth/passphrase",
+    response_model=PassphraseChangeResult,
+    response_model_exclude_none=True,
+)
+async def change_passphrase(request: Request) -> PassphraseChangeResult:
+    """Change Eugene's passphrase (row 5, 5b): see `passphrase_change`.
+
+    The owner's session, the current passphrase, and the login limiter,
+    which a wrong `current` counts against like a failed sign-in. Neither
+    passphrase is logged or put in a problem detail."""
+    claims = require_operator(request, await _bearer_scheme(request))
+    if claims.sub != tokens.SUB_OPERATOR:
+        raise problem(status.HTTP_403_FORBIDDEN, "Owner required", "Only Eugene's owner may.")
+    current, new = await _change_body(request)
+    machine: StateMachine = request.app.state.machine
+    auth: AuthState = request.app.state.auth_state
+    remote = (
+        peer.peer_of(
+            request.client.host if request.client else None,
+            request.headers.get(peer.PEER_HEADER),
+        )
+        or "unknown"
+    )
+    if auth.is_login_rate_limited(
+        remote, window_seconds=_RATE_LIMIT_WINDOW_SECONDS, max_in_window=_RATE_LIMIT_MAX_FAILURES
+    ):
+        raise problem(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Rate limited",
+            f"Too many wrong passphrases from {remote}. Wait {_RATE_LIMIT_WINDOW_SECONDS} "
+            "seconds and try again.",
+        )
+    if not machine.is_active:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "Not the active root",
+            "Change the passphrase on the active control root; this one is a standby.",
+        )
+    if auth.master_key is None:
+        raise problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Locked",
+            "Eugene is locked. Sign in once with the passphrase, then change it.",
+        )
+    verifier = machine.state.identity.passphraseVerifier
+    if verifier is None or not await asyncio.to_thread(
+        security.verify_passphrase, current, verifier
+    ):
+        auth.record_login_failure(
+            remote,
+            window_seconds=_RATE_LIMIT_WINDOW_SECONDS,
+            max_in_window=_RATE_LIMIT_MAX_FAILURES,
+        )
+        log.warning("a passphrase change from %s gave the wrong current passphrase", remote)
+        raise problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Wrong passphrase",
+            "The current passphrase did not match. Nothing changed.",
+        )
+    auth.clear_login_failures(remote)
+    from .control import standby_short_of
+
+    behind = standby_short_of(request.app, _CHANGE_LOG_VERSION)
+    if behind is not None:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "Standby too old",
+            f"Update {behind} first; its copy would stop at this change.",
+        )
+    from .. import passphrase_change
+
+    try:
+        changed = await asyncio.to_thread(
+            passphrase_change.change, request.app, new, actor="operator"
+        )
+    except passphrase_change.CannotOpen as exc:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "A sealed value did not open",
+            f"The {exc.what} did not open with this install's key, so nothing changed. "
+            "Restore it from a copy of the install made before it changed.",
+        ) from exc
+    except passphrase_change.StillOpens as exc:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "A sealed value was missed",
+            "Nothing changed: these values would still open with the old passphrase: "
+            f"{', '.join(exc.paths[:5])}. This version of Eugene does not know them; update it.",
+        ) from exc
+    except passphrase_change.Moved as exc:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "Changed meanwhile",
+            "Something sealed changed while the passphrase was being changed, so nothing "
+            "changed. Try again.",
+        ) from exc
+    request.app.state.trust.publish(request.app)
+    machines = await passphrase_change.tell_machines(request.app, current, new)
+    return PassphraseChangeResult(
+        changedAt=changed.at,
+        machines=[PassphraseMachine.model_validate(m) for m in machines],
+        passphraseFile=PassphraseFileState(changed.passphrase_file),
+        cleanup=changed.cleanup,
+    )
+
+
 @router.post("/v1/auth/token", response_model=TokenExchangeResponse)
 async def exchange_token(request: Request, body: TokenExchangeRequest) -> TokenExchangeResponse:
     """RFC 8693: a session for a 5-minute token addressed to one other machine.
@@ -426,8 +578,26 @@ async def exchange_token(request: Request, body: TokenExchangeRequest) -> TokenE
     )
 
 
-def unseal_into(auth: AuthState, machine: StateMachine, passphrase: str) -> None:
+#: Row 5: an unlock that a passphrase change overtook publishes nothing.
+SIGN_IN_AGAIN = "The passphrase changed while you signed in; sign in again."
+
+
+def _overtaken() -> Exception:
+    return problem(status.HTTP_409_CONFLICT, "Passphrase changed", SIGN_IN_AGAIN)
+
+
+def unseal_into(
+    auth: AuthState,
+    machine: StateMachine,
+    passphrase: str,
+    *,
+    identity: InstallIdentity | None = None,
+) -> None:
     """Derive the master key and open the three sealed values.
+
+    `identity` is the install identity the passphrase was checked against
+    (its verifier); the key is derived with that identity's salt, and is
+    published only while that salt is still the install's (row 5).
 
     Shared by login and promotion, because they need exactly the same
     thing: a standby being promoted is a host that has the salt and the
@@ -441,7 +611,7 @@ def unseal_into(auth: AuthState, machine: StateMachine, passphrase: str) -> None
     """
     import base64 as _b64
 
-    identity = machine.state.identity
+    identity = identity or machine.state.identity
     if identity.salt is None:
         raise problem(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -450,26 +620,40 @@ def unseal_into(auth: AuthState, machine: StateMachine, passphrase: str) -> None
         )
 
     master_key = security.derive_master_key(passphrase, _b64.b64decode(identity.salt))
-    unseal_with_master_key(auth, machine, master_key)
+    unseal_with_master_key(auth, machine, master_key, salt=identity.salt)
 
 
-def unseal_with_master_key(auth: AuthState, machine: StateMachine, master_key: bytes) -> None:
+def unseal_with_master_key(
+    auth: AuthState, machine: StateMachine, master_key: bytes, *, salt: str | None
+) -> None:
     """The half of `unseal_into` after the key is derived.
 
     Split out for OS keyring auto-unlock, which holds the derived master
     key and never sees the passphrase. One place opens the sealed values
     either way, so the "a sealed value that will not open is reported
     loudly" rule cannot drift between the two entry points.
+
+    **Row 5: `salt` is the one the key was derived with.** The key is
+    checked against the sealed values of that salt's identity, and then
+    published labelled with that salt, only while it is still the
+    install's (`AuthState.publish_master_key`, under the lock a passphrase
+    change holds while it writes and switches). An unlock a change
+    overtook publishes nothing and answers 409, *"The passphrase changed
+    while you signed in; sign in again."*
     """
     import base64 as _b64
 
     identity = machine.state.identity
-    auth.set_master_key(master_key)
+    if identity.salt != salt:
+        raise _overtaken()
 
+    signing: bytes | None = None
     if identity.sealedSigningKey is not None:
         try:
-            auth.set_signing_key(security.open_b64(identity.sealedSigningKey, master_key))
+            signing = security.open_b64(identity.sealedSigningKey, master_key)
         except ValueError as exc:
+            if machine.state.identity.salt != salt:
+                raise _overtaken() from exc
             raise problem(
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
                 "Sealed token key unreadable",
@@ -477,6 +661,12 @@ def unseal_with_master_key(auth: AuthState, machine: StateMachine, master_key: b
                 "session and client key in the install is signed with it, so this host "
                 "cannot serve until it is recovered.",
             ) from exc
+    if not auth.publish_master_key(
+        master_key, salt=salt, current=lambda: machine.state.identity.salt
+    ):
+        raise _overtaken()
+    if signing is not None:
+        auth.set_signing_key(signing)
 
     if identity.sealedControlKey is not None:
         try:
