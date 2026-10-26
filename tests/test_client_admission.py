@@ -441,3 +441,90 @@ def test_a_retired_key_renews_but_cannot_acquire(active_client):
     assert call(c, old, "renew", "stream").status_code == 200
     assert call(c, old, "release", "stream").status_code == 200
     assert call(c, new, "acquire", "next").status_code == 200
+
+
+# --- row 11: the gateway's queue reads these ------------------------------------
+
+
+def test_concurrency_refusal_names_its_reason(active_client):
+    """A 429 says which limit it is: the gateway keeps a request refused for
+    `concurrency` in its queue (another gateway holds the key's leases) and
+    refuses one refused for `rate`."""
+    c = active_client
+    key = mint(c, maxConcurrentRequests=1, requestsPerMinute=2)["key"]["id"]
+    assert call(c, key, "acquire", "one").status_code == 200
+    busy = call(c, key, "acquire", "two")
+    assert busy.status_code == 429
+    assert busy.headers["X-Eugene-Refusal-Reason"] == "concurrency"
+    assert int(busy.headers["Retry-After"]) > 0
+    assert call(c, key, "release", "one").status_code == 200
+    assert call(c, key, "acquire", "two").status_code == 200
+    assert call(c, key, "release", "two").status_code == 200
+    used = call(c, key, "acquire", "three")
+    assert used.status_code == 429
+    assert used.headers["X-Eugene-Refusal-Reason"] == "rate"
+
+
+def test_band_change_does_not_cut_a_renewal(active_client):
+    """The band and the queue bound are not part of the policy a running
+    request is bound to: changing them never cuts a request in flight."""
+    c = active_client
+    key = mint(c, maxConcurrentRequests=2, requestsPerMinute=60)["key"]["id"]
+    assert call(c, key, "acquire").status_code == 200
+    for limits in (
+        {"band": "background"},
+        {"band": "sheddable", "maxQueuedRequests": 0},
+        {"maxQueuedRequests": 64},
+    ):
+        edited = c.put(
+            f"/v1/auth/client-keys/{key}/limits",
+            json={"limits": {"maxConcurrentRequests": 2, "requestsPerMinute": 60, **limits}},
+        )
+        assert edited.status_code == 200, edited.text
+        assert call(c, key, "renew").status_code == 200, limits
+    answered = call(c, key, "check", "peek").json()["limits"]
+    assert answered["maxQueuedRequests"] == 64 and "band" not in answered
+    # What the request is bound to still is: a new concurrency limit cuts it.
+    edited = c.put(
+        f"/v1/auth/client-keys/{key}/limits",
+        json={"limits": {"maxConcurrentRequests": 3, "requestsPerMinute": 60}},
+    )
+    assert edited.status_code == 200
+    assert call(c, key, "renew").status_code == 409
+
+
+def test_a_key_band_and_queue_bound_are_kept_and_checked(active_client):
+    c = active_client
+    made = mint(c, band="background", maxQueuedRequests=0)["key"]
+    assert made["limits"]["band"] == "background"
+    assert made["limits"]["maxQueuedRequests"] == 0
+    answered = call(c, made["id"], "check").json()["limits"]
+    assert answered["band"] == "background" and answered["maxQueuedRequests"] == 0
+    # A key nobody gave a band shows the values in effect; absent is interactive.
+    plain = mint(c)["key"]
+    assert plain["limits"].get("band", "interactive") == "interactive"
+    assert plain["limits"]["maxQueuedRequests"] == 8
+    assert call(c, plain["id"], "check").json()["limits"].get("band") is None
+    for bad in ({"band": "urgent"}, {"maxQueuedRequests": 65}, {"maxQueuedRequests": -1}):
+        response = c.post("/v1/auth/client-keys", json={"name": "bad", "limits": bad})
+        assert response.status_code == 422, bad
+
+
+def test_a_check_with_a_model_applies_allowed_models(active_client):
+    """The gateway checks when a request arrives and acquires only when it
+    leaves its queue, so the check is where a model outside the key's scope
+    is refused, before the request waits for anything."""
+    c = active_client
+    key = mint(c, allowedModels=["allowed"])["key"]["id"]
+    assert call(c, key, "check", model="allowed").status_code == 200
+    refused = call(c, key, "check", model="excluded")
+    assert refused.status_code == 403
+    assert "does not permit" in refused.text
+    # A check without a model (the model list, the app catalogue) still answers.
+    bare = c.post(
+        "/v1/auth/client-keys/admission",
+        json={"keyId": key, "action": "check", "requestId": "list"},
+    )
+    assert bare.status_code == 200
+    # Nothing was taken: the key's whole allowance is still there.
+    assert call(c, key, "acquire", "after").status_code == 200

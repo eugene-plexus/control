@@ -311,11 +311,7 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
         )
         return ClientAdmissionResult.model_validate(result)
     except AdmissionRefusal as exc:
-        raise HTTPException(
-            exc.status,
-            detail=exc.detail,
-            headers={"Retry-After": str(exc.retry)} if exc.retry else None,
-        ) from exc
+        raise HTTPException(exc.status, detail=exc.detail, headers=exc.headers) from exc
     except (OSError, ValueError, ApplyError, NotActive) as exc:
         raise problem(
             503, "Admission unavailable", "The authority could not commit admission state."
