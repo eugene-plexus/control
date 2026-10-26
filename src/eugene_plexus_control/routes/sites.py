@@ -97,7 +97,7 @@ def _private_response(response: Response) -> None:
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["sites"], dependencies=[Depends(_private_response)])
 MAX_REQUEST = 40_000
-MAX_RESULT = 70_000
+MAX_RESULT = 8 * 1024 * 1024
 INVITES_PER_PERSON = 3
 INVITE_SECONDS = 900
 
@@ -265,7 +265,7 @@ async def claim(request: Request, ident: str, site: SiteActor) -> dict[str, Any]
 async def result(request: Request, ident: str, body: SiteResult, site: SiteActor) -> None:
     value = body.model_dump(mode="json", exclude_none=True)
     if len(json.dumps(value, ensure_ascii=False).encode()) > MAX_RESULT:
-        raise problem(413, "Result too large", "A site's answer may be at most 70,000 bytes.")
+        raise problem(413, "Result too large", "A site's answer may be at most 8 MiB.")
     helpers.broker(request).finish(site.id, ident, value)
 
 
