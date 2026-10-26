@@ -364,3 +364,49 @@ def test_the_list_version_follows_the_log(active_client: TestClient) -> None:
     assert first["version"] >= machine.state.index * 1000
     enroll(active_client, "gpu-box", url="http://100.64.0.7:8079")
     assert _machine_list(active_client)["version"] >= machine.state.index * 1000
+
+
+# ---- agent#38: no token in plain HTTP to a machine not known yet -------------
+
+
+async def test_control_sends_no_token_in_plain_to_a_machine_it_has_no_record_of(
+    active_client: TestClient,
+) -> None:
+    """agent#38: in `automatic`, control's own table carries a machine with
+    a machine port over TLS and reaches one on an older version in plain HTTP,
+    its drivers included; a token for a machine it holds no record of is
+    refused, with nothing sent, rather than sent in clear."""
+    import httpx
+
+    from eugene_plexus_control import _http
+
+    enroll(active_client, "new-box", url="http://100.64.0.7:8079",
+           machineUrl="https://100.64.0.7:8083", tlsPin=PIN_A)  # fmt: skip
+    enroll(active_client, "old-box", url="http://100.64.0.8:8079")
+    table = _http.machine_table()
+    assert not table.required
+    assert table.routes["http://100.64.0.7:8079"] == "https://100.64.0.7:8083/agent"
+    assert table.routes["http://100.64.0.8:8079"] is None
+
+    def part(value: dict) -> str:
+        import json
+
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    token = f"{part({'alg': 'EdDSA', 'typ': 'ep-service+jwt'})}.{part({'sub': 'c'})}.c2ln"
+    headers = {"Authorization": f"Bearer {token}"}
+    sent: list[str] = []
+
+    def plain(request: httpx.Request) -> httpx.Response:
+        sent.append(str(request.url))
+        return httpx.Response(200, json={})
+
+    async with _http.internal_client(timeout=2) as client:
+        transport = client._transport
+        assert isinstance(transport, _http.MachineTransport)
+        transport._plain = httpx.MockTransport(plain)  # type: ignore[assignment]
+        await client.get("http://100.64.0.8:8079/v1/node", headers=headers)
+        await client.get("http://100.64.0.8:8091/v1/info", headers=headers)
+        with pytest.raises(_http.MachineRefused):
+            await client.get("http://100.64.0.9:8079/v1/node", headers=headers)
+    assert sent == ["http://100.64.0.8:8079/v1/node", "http://100.64.0.8:8091/v1/info"]
