@@ -27,6 +27,7 @@ import json
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -204,7 +205,9 @@ def install_table(state: Any, own_node: str | None) -> None:
     from ._http import parse_machine_table, set_machine_table
 
     machines: dict[str, list[str]] = {}
-    routes: dict[str, str | None] = {}
+    # None: no machine port (an older version). False: an address two
+    # records claim, which is refused, never plain (agent#38 review).
+    routes: dict[str, str | bool | None] = {}
     names: dict[str, str] = {}
     local: list[str] = []
     for record in sorted(state.nodes.values(), key=lambda r: r.name):
@@ -238,7 +241,7 @@ def install_table(state: Any, own_node: str | None) -> None:
                 # refused that): neither is carried there.
                 log.warning("%s and %s both claim %s; neither is trusted there",
                             names.get(agent), record.name, agent)  # fmt: skip
-                routes[agent] = None
+                routes[agent] = False
                 continue
             routes[agent] = carried
             names[agent] = record.name
@@ -255,15 +258,62 @@ def install_table(state: Any, own_node: str | None) -> None:
     )
 
 
-def link(record: Any, probe: Any | None) -> dict[str, Any]:
-    """`Node.machineTls`: how this root last reached the node (an observation)."""
+#: `link`'s words for a node that announced no machine port while one is
+#: on record (agent#38 review): the record is kept, so it is not reached.
+DOORLESS = (
+    "it announced no machine port; if it was moved back to a version from before "
+    "machine ports, remove it and join it again"
+)
+
+
+@dataclass
+class DoorReport:
+    """What a node last said about its machine port in a signed announcement
+    (agent#38 review): why it does not answer (`machineError`), or that it
+    announced none while one is on record. Kept in this root's memory only,
+    never replicated: the node says it again at its next announcement."""
+
+    sequence: int
+    error: str | None = None
+    doorless: bool = False
+
+
+def door_reports(app: Any) -> dict[str, DoorReport]:
+    reports: dict[str, DoorReport] | None = getattr(app.state, "door_reports", None)
+    if reports is None:
+        reports = {}
+        app.state.door_reports = reports
+    return reports
+
+
+def note_door(app: Any, name: str, sequence: int, *, error: str | None, doorless: bool) -> None:
+    """Keep a node's word about its machine port, from an announcement whose
+    signature verified. An older sequence than the one held says nothing new
+    (a replay)."""
+    reports = door_reports(app)
+    held = reports.get(name)
+    if held is not None and sequence <= held.sequence:
+        return
+    reports[name] = DoorReport(sequence=sequence, error=error, doorless=doorless)
+
+
+def link(record: Any, probe: Any | None, report: DoorReport | None = None) -> dict[str, Any]:
+    """`Node.machineTls`: how this root last reached the node (an observation).
+    `report` is what the node said about its machine port (`note_door`)."""
     from ._http import machine_route
 
+    said = report.error if report is not None else None
     if not record.machineUrl or not record.tlsPins:
+        if said:
+            return {"state": "door_down", "detail": said}
         return {
             "state": "no_key",
             "detail": "It runs a version without a machine port; update it.",
         }
+    if said and (probe is None or not probe.reachable):
+        # The node's own word on why its port does not answer, before this
+        # root has polled it too (agent#38 review).
+        return {"state": "door_down", "detail": said}
     if probe is None:
         return {"state": "unknown", "detail": None}
     if probe.hosts_control:
@@ -277,6 +327,8 @@ def link(record: Any, probe: Any | None) -> dict[str, Any]:
             f"({probe.pin_refused}). Nothing was sent to it.",
         }
     if not probe.reachable:
+        if report is not None and report.doorless:
+            return {"state": "door_down", "detail": DOORLESS}
         return {"state": "unreachable", "detail": probe.error}
     if record.url and machine_route(record.url):
         return {"state": "encrypted", "detail": None}

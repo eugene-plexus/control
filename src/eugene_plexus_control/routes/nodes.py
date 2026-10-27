@@ -266,9 +266,10 @@ async def announce_node_address(
     # LT1: the machine port and its key, read raw for the same reason as
     # `url`, and signed with it whenever the body holds them. Row 3: the
     # next key too, under its own name.
+    # agent#38 review: and why the port does not answer, while it does not.
     machine_fields = {
         key: raw[key]
-        for key in ("machineUrl", "tlsPin", "tlsNextPin")
+        for key in ("machineUrl", "tlsPin", "tlsNextPin", "machineError")
         if isinstance(raw, dict) and raw.get(key) is not None
     }
     if any(not isinstance(value, str) for value in machine_fields.values()):
@@ -276,8 +277,15 @@ async def announce_node_address(
         raise problem(
             status.HTTP_400_BAD_REQUEST,
             "Malformed announcement",
-            "`machineUrl`, `tlsPin` and `tlsNextPin` must be strings when present: a node "
-            "announces one key, and one next key while it changes keys.",
+            "`machineUrl`, `tlsPin`, `tlsNextPin` and `machineError` must be strings when "
+            "present: a node announces one key, and one next key while it changes keys.",
+        )
+    if len(machine_fields.get("machineError", "")) > MACHINE_ERROR_MAX:
+        refusals.count_unverified(name)
+        raise problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Malformed announcement",
+            f"`machineError` is longer than {MACHINE_ERROR_MAX} characters.",
         )
     message = sealing.address_message(
         name=name, sequence=int(body.sequence), url=announced_url, machine=machine_fields
@@ -330,11 +338,31 @@ async def announce_node_address(
         raise _refused(refusals, name, MACHINE_PORT, exc, announced_url) from exc
     if next_pin is not None:
         pins = tuple(sorted({*pins, next_pin}))
+    # **An announcement without a machine port keeps the one on record**
+    # (agent#38 review). A node only ever drops its port by being moved back
+    # to a version from before machine ports, and a party in the middle could
+    # make a node announce less (an unsigned 401 or 404 to it); clearing the
+    # key then made the node an "older version" every machine sent tokens to
+    # in plain HTTP. Only a new enrolment replaces it. The node's card says
+    # it announced none (`machine_list.link`).
+    doorless = machine_url is None and bool(record.machineUrl and record.tlsPins)
+    if doorless:
+        machine_url, pins, next_pin = record.machineUrl, record.tlsPins, record.tlsNextPin
+        log.warning(
+            "node %s announced no machine port; the one on record (%s) is kept. If it was "
+            "moved back to a version from before machine ports, remove it and join it again",
+            name,
+            record.machineUrl,
+        )
+    error = machine_fields.get("machineError")
     if normalized == record.url and (machine_url, pins, next_pin) == (
         record.machineUrl,
         record.tlsPins,
         record.tlsNextPin,
     ):
+        machine_list.note_door(
+            request.app, name, int(body.sequence), error=error, doorless=doorless
+        )
         # Nothing to record. Note that the sequence is deliberately NOT
         # advanced here: it lives in applied state, and advancing it
         # would need a log entry, which is exactly what this branch
@@ -402,9 +430,8 @@ async def announce_node_address(
                 "name": name,
                 "url": normalized,
                 "sequence": int(body.sequence),
-                # Both, always: an announcement is the node's whole statement
-                # of its doors, so one without a key clears the key on record
-                # (a node rolled back to an older version).
+                # Both, always. An announcement without a key kept the one
+                # on record above (agent#38 review), so this never clears it.
                 "machineUrl": machine_url,
                 "tlsPins": list(pins),
                 # Row 3: which of them is the next key; None drops it.
@@ -414,6 +441,7 @@ async def announce_node_address(
     except NotActive as exc:
         raise _not_active(machine) from exc
     machine_list.install_table(machine.state, request.app.state.node_name)
+    machine_list.note_door(request.app, name, int(body.sequence), error=error, doorless=doorless)
     refusals.clear(name)
 
     current = [p for p in pins if p != next_pin]
@@ -461,6 +489,8 @@ def _refused(
 
 
 TLS_PIN = re.compile(r"^[A-Za-z0-9_-]{43}$")
+#: `NodeAddressAnnouncement.machineError`'s length limit.
+MACHINE_ERROR_MAX = 300
 
 #: How often the door file is looked at again (row 3).
 DOOR_RECHECK_SECONDS = 1.0
@@ -993,6 +1023,13 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
     # Before the bundle is pushed to it: the new node is reached over TLS to
     # the key it enrolled with from the first call (LT1).
     machine_list.install_table(machine.state, request.app.state.node_name)
+    # Why its machine port does not answer yet, when it joins with the port
+    # still binding (agent#38 review): its card says so from the join. A new
+    # enrolment starts its word afresh; its announcements (sequence 1 and up)
+    # take over from this one.
+    machine_list.door_reports(request.app).pop(body.name, None)
+    if body.machineError:
+        machine_list.note_door(request.app, body.name, 0, error=body.machineError, doorless=False)
 
     bundle = request.app.state.trust.publish(request.app)
     if bundle is None:  # pragma: no cover - the identity key was checked above
@@ -1149,7 +1186,13 @@ def _to_node(record: NodeRecord, probe: Any | None, request: Request | None = No
             "tlsNextPin": record.tlsNextPin,
             "machineKeyChange": key_change,
             "certificateNames": list(record.certificateNames),
-            "machineTls": machine_list.link(record, probe),
+            "machineTls": machine_list.link(
+                record,
+                probe,
+                machine_list.door_reports(request.app).get(record.name)
+                if request is not None
+                else None,
+            ),
             "lastSeenAt": probe.last_seen_at if probe is not None else None,
             # The probe client has always had the reason; until 2026-09-15
             # this view dropped it, and `reachable: false` sent an operator
