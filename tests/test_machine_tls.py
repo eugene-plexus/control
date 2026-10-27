@@ -41,8 +41,13 @@ def _announce(
     machine_url: str | None = None,
     pin: str | None = None,
     signed: dict | None = None,
+    error: str | None = None,
 ) -> object:
-    machine = {k: v for k, v in (("machineUrl", machine_url), ("tlsPin", pin)) if v is not None}
+    machine = {
+        k: v
+        for k, v in (("machineUrl", machine_url), ("tlsPin", pin), ("machineError", error))
+        if v is not None
+    }
     message = sealing.address_message(
         name=name, sequence=sequence, url=url, machine=machine if signed is None else signed
     )
@@ -163,10 +168,16 @@ def test_a_machine_port_that_cannot_be_one_is_refused(
     assert words in response.text or "pattern" in response.text  # type: ignore[attr-defined]
 
 
-def test_an_announcement_without_a_key_clears_the_one_on_record(
+def test_an_announcement_without_a_key_keeps_the_one_on_record(
     active_client: TestClient,
 ) -> None:
-    """A node rolled back to an older version stops being dialled over TLS."""
+    """agent#38 review: a party in the middle could make a node sign an
+    announcement of its address alone (an unsigned 401 or 404 to it), and
+    clearing the key then made the node an "older version" that every
+    machine sent tokens to in plain HTTP. The key on record stays; only a new
+    enrolment replaces it, and the node's card says it announced none."""
+    from types import SimpleNamespace
+
     keys, _ = enroll(
         active_client,
         "gpu-box",
@@ -174,14 +185,80 @@ def test_an_announcement_without_a_key_clears_the_one_on_record(
         machineUrl="https://100.64.0.7:8083",
         tlsPin=PIN_A,
     )
-    assert active_client.get("/v1/nodes/gpu-box").json()["tlsPins"] == [PIN_A]
+    machine = active_client.app.state.machine  # type: ignore[attr-defined]
+    before = machine.state.index
     response = _announce(
         active_client, "gpu-box", keys.signing_private, url="http://100.64.0.7:8079", sequence=1
     )
-    assert response.json()["changed"] is True  # type: ignore[attr-defined]
+    assert response.status_code == 200, response.text  # type: ignore[attr-defined]
+    assert response.json()["changed"] is False  # type: ignore[attr-defined]
+    assert machine.state.index == before, "nothing was written"
     node = active_client.get("/v1/nodes/gpu-box").json()
-    assert node.get("machineUrl") is None and node["tlsPins"] == []
-    assert node["machineTls"]["state"] == "no_key"
+    assert node["machineUrl"].rstrip("/") == "https://100.64.0.7:8083"
+    assert node["tlsPins"] == [PIN_A]
+    listed = {n["name"]: n for n in _machine_list(active_client)["nodes"]}
+    assert listed["gpu-box"]["pins"] == [PIN_A]
+    # Its card, once the root cannot reach it there: it announced no door.
+    from eugene_plexus_control import machine_list
+
+    record = machine.state.nodes["gpu-box"]
+    report = machine_list.door_reports(active_client.app).get("gpu-box")
+    down = SimpleNamespace(reachable=False, hosts_control=False, pin_refused=None, error="refused")
+    assert machine_list.link(record, down, report) == {
+        "state": "door_down",
+        "detail": machine_list.DOORLESS,
+    }
+
+
+def test_a_node_says_why_its_machine_port_does_not_answer(active_client: TestClient) -> None:
+    """agent#38 review: a node whose 8083 another program holds announces its
+    door all the same, with the holder, signed; the root's card says it."""
+    keys, _ = enroll(
+        active_client,
+        "gpu-box",
+        url="http://100.64.0.7:8079",
+        machineUrl="https://100.64.0.7:8083",
+        tlsPin=PIN_A,
+    )
+    held = "port 8083 is held by python (pid 4242)"
+    response = _announce(
+        active_client,
+        "gpu-box",
+        keys.signing_private,
+        url="http://100.64.0.7:8079",
+        sequence=1,
+        machine_url="https://100.64.0.7:8083",
+        pin=PIN_A,
+        error=held,
+    )
+    assert response.status_code == 200, response.text  # type: ignore[attr-defined]
+    node = active_client.get("/v1/nodes/gpu-box").json()
+    assert node["machineTls"] == {"state": "door_down", "detail": held}
+    # Signed: the same words under another signature are refused.
+    forged = _announce(
+        active_client,
+        "gpu-box",
+        keys.signing_private,
+        url="http://100.64.0.7:8079",
+        sequence=2,
+        machine_url="https://100.64.0.7:8083",
+        pin=PIN_A,
+        error="port 8083 is held by something else",
+        signed={"machineUrl": "https://100.64.0.7:8083", "tlsPin": PIN_A},
+    )
+    assert forged.status_code == 401  # type: ignore[attr-defined]
+    # Its port opens: the next announcement carries no error, and the word goes.
+    cleared = _announce(
+        active_client,
+        "gpu-box",
+        keys.signing_private,
+        url="http://100.64.0.7:8079",
+        sequence=3,
+        machine_url="https://100.64.0.7:8083",
+        pin=PIN_A,
+    )
+    assert cleared.status_code == 200  # type: ignore[attr-defined]
+    assert active_client.get("/v1/nodes/gpu-box").json()["machineTls"]["state"] != "door_down"
 
 
 def test_the_machine_list_is_signed_and_its_iat_only_rises(active_client: TestClient) -> None:
@@ -373,8 +450,8 @@ async def test_control_sends_no_token_in_plain_to_a_machine_it_has_no_record_of(
     active_client: TestClient,
 ) -> None:
     """agent#38: in `automatic`, control's own table carries a machine with
-    a machine port over TLS and reaches one on an older version in plain HTTP,
-    its drivers included; a token for a machine it holds no record of is
+    a machine port over TLS and reaches one on an older version in plain HTTP
+    at its own address; a token for a machine it holds no record of is
     refused, with nothing sent, rather than sent in clear."""
     import httpx
 
@@ -406,7 +483,67 @@ async def test_control_sends_no_token_in_plain_to_a_machine_it_has_no_record_of(
         assert isinstance(transport, _http.MachineTransport)
         transport._plain = httpx.MockTransport(plain)  # type: ignore[assignment]
         await client.get("http://100.64.0.8:8079/v1/node", headers=headers)
-        await client.get("http://100.64.0.8:8091/v1/info", headers=headers)
+        # Its address only: another port on its host may be another machine.
+        with pytest.raises(_http.MachineRefused):
+            await client.get("http://100.64.0.8:8091/v1/info", headers=headers)
         with pytest.raises(_http.MachineRefused):
             await client.get("http://100.64.0.9:8079/v1/node", headers=headers)
-    assert sent == ["http://100.64.0.8:8079/v1/node", "http://100.64.0.8:8091/v1/info"]
+    assert sent == ["http://100.64.0.8:8079/v1/node"]
+
+
+def test_an_address_two_records_claim_is_refused_not_plain() -> None:
+    """agent#38 review: "neither is trusted there" meant plain HTTP under
+    `automatic`. An address two records claim is refused outright now."""
+    from types import SimpleNamespace
+
+    from eugene_plexus_control import _http, machine_list
+
+    def node(name: str, url: str) -> SimpleNamespace:
+        return SimpleNamespace(name=name, url=url, machineUrl=None, tlsPins=())
+
+    state = SimpleNamespace(
+        config={},
+        nodes={
+            "a": node("a", "http://100.64.0.9:8079"),
+            "b": node("b", "http://100.64.0.9:8079"),
+            "old": node("old", "http://100.64.0.8:8079"),
+        },
+    )
+    machine_list.install_table(state, None)
+    table = _http.machine_table()
+    assert table.routes == {"http://100.64.0.8:8079": None}
+    assert table.invalid == {"http://100.64.0.9:8079"}
+    with pytest.raises(_http.MachineRefused):
+        table.carry(__import__("httpx").URL("http://100.64.0.9:8079/v1/node"))
+
+
+def test_a_node_that_joins_with_its_port_held_says_so_from_the_join(
+    active_client: TestClient,
+) -> None:
+    """agent#38 review: a node joining while another program holds its
+    machine port sends why with the join, so its card says it before its
+    first announcement; its announcements take over from there."""
+    held = "port 8083 is held by python (pid 4242)"
+    keys, response = enroll(
+        active_client,
+        "gpu-box",
+        url="http://100.64.0.7:8079",
+        machineUrl="https://100.64.0.7:8083",
+        tlsPin=PIN_A,
+        machineError=held,
+    )
+    assert response.status_code == 201, response.text
+    assert active_client.get("/v1/nodes/gpu-box").json()["machineTls"] == {
+        "state": "door_down",
+        "detail": held,
+    }
+    _announce(
+        active_client,
+        "gpu-box",
+        keys.signing_private,
+        url="http://100.64.0.7:8079",
+        sequence=1,
+        machine_url="https://100.64.0.7:8083",
+        pin=PIN_A,
+    )
+    assert active_client.get("/v1/nodes/gpu-box").json()["machineTls"]["state"] != "door_down"

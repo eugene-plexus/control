@@ -3094,6 +3094,9 @@ class State(StrEnum):
       traffic to it is plain (refused once encryption is required).
     * `unreachable`: it has a key on record and its machine port did
       not answer.
+    * `door_down`: as `unreachable`, and the node said why
+      (`NodeAddressAnnouncement.machineError`), or it last announced
+      no machine port at all; `detail` holds its words.
     * `refused`: its machine port presented a key it did not
       register. A security event; nothing was sent.
     * `unknown`: not polled yet.
@@ -3103,6 +3106,7 @@ class State(StrEnum):
     encrypted = 'encrypted'
     no_key = 'no_key'
     unreachable = 'unreachable'
+    door_down = 'door_down'
     refused = 'refused'
     unknown = 'unknown'
 
@@ -3116,10 +3120,11 @@ class MachineLink(BaseModel):
 
     state: State = Field(
         ...,
-        description='* `encrypted`: the last poll went over TLS to the key the node\n  registered.\n* `no_key`: the node runs a version without a machine port, so\n  traffic to it is plain (refused once encryption is required).\n* `unreachable`: it has a key on record and its machine port did\n  not answer.\n* `refused`: its machine port presented a key it did not\n  register. A security event; nothing was sent.\n* `unknown`: not polled yet.\n',
+        description='* `encrypted`: the last poll went over TLS to the key the node\n  registered.\n* `no_key`: the node runs a version without a machine port, so\n  traffic to it is plain (refused once encryption is required).\n* `unreachable`: it has a key on record and its machine port did\n  not answer.\n* `door_down`: as `unreachable`, and the node said why\n  (`NodeAddressAnnouncement.machineError`), or it last announced\n  no machine port at all; `detail` holds its words.\n* `refused`: its machine port presented a key it did not\n  register. A security event; nothing was sent.\n* `unknown`: not polled yet.\n',
     )
     detail: str | None = Field(
-        None, description="The reason in the probe client's words, for the last three."
+        None,
+        description="The reason: the probe client's words for `unreachable` and\n`refused`, the node's own for `door_down`.\n",
     )
 
 
@@ -3325,6 +3330,11 @@ class NodeAddressAnnouncement(BaseModel):
         None,
         description="The node's next machine key, while it changes keys (row 3).\nOnly with `tlsPin`, and not equal to it. The root records both\nin `Node.tlsPins` and lists both, so every machine accepts\neither key across the switch; the node then announces\n`tlsPin` alone, and the old key leaves the list. A replay of\nan announcement that carried the old key is refused by\n`sequence`.\n",
         pattern='^[A-Za-z0-9_-]{43}$',
+    )
+    machineError: str | None = Field(
+        None,
+        description="Why this node's machine port does not answer, in the node's own\nwords, while it does not (agent#38): another program holds the\nport, the machine key does not load, or the port cannot answer\nat the address announced. A node announces its machine port\nwhenever it has one, listening or not, so the root never takes\nit for an older version; this says why the root cannot reach it\nyet, and becomes `Node.machineTls.detail` (`door_down`). Signed\nlike `tlsNextPin`, under its own name. Kept by this root in\nmemory only, and dropped by the next announcement without it.\n\n**An announcement without `machineUrl` and `tlsPin` keeps the\nones on record** (agent#38). Only a new enrolment replaces\nthem, so no answer on the network can make a machine look\nlike an older version. A node rolled back to a version before\nmachine ports is therefore unreachable until it is removed\nand joined again; its link says so.\n",
+        max_length=300,
     )
 
 
@@ -5210,6 +5220,11 @@ class EnrollmentRequest(BaseModel):
         None,
         description="Base64url (no padding) of the SHA-256 of a machine key's\nSubjectPublicKeyInfo, the form Job Sites pin too.\n",
         pattern='^[A-Za-z0-9_-]{43}$',
+    )
+    machineError: str | None = Field(
+        None,
+        description="Why the node's machine port does not answer yet, when it joins\nwith it still binding (agent#38): the same words as\n`NodeAddressAnnouncement.machineError`, so its link says why\n(`door_down`) from the join, before its first announcement.\n",
+        max_length=300,
     )
     agentVersion: str | None = None
     os: Os | None = None
