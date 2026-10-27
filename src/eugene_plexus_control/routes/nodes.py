@@ -22,9 +22,9 @@ import base64
 import logging
 import re
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from .. import capabilities, machine_list, node_address, oidc, sealing, security, tokens, trust
 from .._generated.models import (
@@ -48,6 +48,15 @@ from .._generated.models import (
     SignedTrustBundle,
     TrustChange,
     TrustGrant,
+)
+from ..announcement_refusals import (
+    ANOTHERS_ADDRESS,
+    MACHINE_PORT,
+    NO_SIGNING_KEY,
+    NOT_A_NODE,
+    OPEN_INTERNET,
+    STALE_SEQUENCE,
+    AnnouncementRefusals,
 )
 from ..applied import (
     OP_ENROLL_NODE,
@@ -213,13 +222,22 @@ async def announce_node_address(
         raise problem(
             status.HTTP_404_NOT_FOUND, "No such node", f"No node named {name!r} is enrolled."
         )
+    refusals = _refusals(request)
     if not record.signingPublicKey:
-        raise problem(
-            status.HTTP_401_UNAUTHORIZED,
-            "Node has no signing key",
-            f"Node {name!r} enrolled before nodes carried an Ed25519 signing identity, so "
-            f"there is nothing here to verify its announcement against. Re-enroll it; its "
-            f"model files and runtimes are untouched by that.",
+        # A fact of the record, so recorded whatever the request carried
+        # (row 36); the request's own address is not kept.
+        raise _refused(
+            refusals,
+            name,
+            NO_SIGNING_KEY,
+            problem(
+                status.HTTP_401_UNAUTHORIZED,
+                "Node has no signing key",
+                f"Node {name!r} enrolled before nodes carried an Ed25519 signing identity, so "
+                f"there is nothing here to verify its announcement against. Re-enroll it; its "
+                f"model files and runtimes are untouched by that.",
+            ),
+            None,
         )
 
     # **The signed field is read from the raw body, never from `body.url`.**
@@ -238,6 +256,8 @@ async def announce_node_address(
         raw = None
     announced_url = raw.get("url") if isinstance(raw, dict) else None
     if not isinstance(announced_url, str):
+        # Nothing here verified who sent it: counted, never kept (row 36).
+        refusals.count_unverified(name)
         raise problem(
             status.HTTP_400_BAD_REQUEST,
             "Malformed announcement",
@@ -253,6 +273,7 @@ async def announce_node_address(
         if isinstance(raw, dict) and raw.get(key) is not None
     }
     if any(not isinstance(value, str) for value in machine_fields.values()):
+        refusals.count_unverified(name)
         raise problem(
             status.HTTP_400_BAD_REQUEST,
             "Malformed announcement",
@@ -260,6 +281,7 @@ async def announce_node_address(
             "present: a node announces one key, and one next key while it changes keys.",
         )
     if len(machine_fields.get("machineError", "")) > MACHINE_ERROR_MAX:
+        refusals.count_unverified(name)
         raise problem(
             status.HTTP_400_BAD_REQUEST,
             "Malformed announcement",
@@ -270,6 +292,7 @@ async def announce_node_address(
     )
     if not sealing.verify_address(record.signingPublicKey, message, body.signature):
         log.warning("refused an address announcement for %s: signature did not verify", name)
+        refusals.count_unverified(name)
         raise problem(
             status.HTTP_401_UNAUTHORIZED,
             "Signature rejected",
@@ -284,23 +307,35 @@ async def announce_node_address(
             announced_url,
             reason,
         )
-        raise problem(
-            status.HTTP_400_BAD_REQUEST,
-            "Address cannot be a node",
-            f"{announced_url} cannot be node {name!r}'s address: {reason}. The "
-            "announcement was correctly signed; what is refused is the address.",
+        raise _refused(
+            refusals,
+            name,
+            NOT_A_NODE,
+            problem(
+                status.HTTP_400_BAD_REQUEST,
+                "Address cannot be a node",
+                f"{announced_url} cannot be node {name!r}'s address: {reason}. The "
+                "announcement was correctly signed; what is refused is the address.",
+            ),
+            announced_url,
         )
 
     normalized = normalize_url(announced_url)
-    _not_anothers_address(name, normalized, machine.state.nodes)
-    machine_url, pins = _checked_machine(
-        name,
-        normalized,
-        machine_fields.get("machineUrl"),
-        machine_fields.get("tlsPin"),
-        machine.state.nodes,
-    )
-    next_pin = _checked_next_pin(name, pins, machine_fields.get("tlsNextPin"))
+    try:
+        _not_anothers_address(name, normalized, machine.state.nodes)
+    except HTTPException as exc:
+        raise _refused(refusals, name, ANOTHERS_ADDRESS, exc, announced_url) from exc
+    try:
+        machine_url, pins = _checked_machine(
+            name,
+            normalized,
+            machine_fields.get("machineUrl"),
+            machine_fields.get("tlsPin"),
+            machine.state.nodes,
+        )
+        next_pin = _checked_next_pin(name, pins, machine_fields.get("tlsNextPin"))
+    except HTTPException as exc:
+        raise _refused(refusals, name, MACHINE_PORT, exc, announced_url) from exc
     if next_pin is not None:
         pins = tuple(sorted({*pins, next_pin}))
     # **An announcement without a machine port keeps the one on record**
@@ -332,6 +367,8 @@ async def announce_node_address(
         # advanced here: it lives in applied state, and advancing it
         # would need a log entry, which is exactly what this branch
         # exists to avoid. A replay of this same message stays a no-op.
+        # The machine says where it is, and that is where the root has it.
+        refusals.clear(name)
         return NodeAddressAck(
             name=name,
             url=record.url,  # type: ignore[arg-type]
@@ -354,23 +391,36 @@ async def announce_node_address(
             node_address.classify(record.url),
             node_address.classify(normalized),
         )
-        raise problem(
-            status.HTTP_409_CONFLICT,
-            "Address puts this node on the open internet",
-            f"Node {name!r} is enrolled at {record.url} ({node_address.classify(record.url)}) "
-            f"and announced {normalized} ({node_address.classify(normalized)}). A node may "
-            "not move itself onto the open internet. Re-enroll the node to confirm the new "
-            "address; its model files and runtimes are untouched.",
+        raise _refused(
+            refusals,
+            name,
+            OPEN_INTERNET,
+            problem(
+                status.HTTP_409_CONFLICT,
+                "Address puts this node on the open internet",
+                f"Node {name!r} is enrolled at {record.url} "
+                f"({node_address.classify(record.url)}) and announced {normalized} "
+                f"({node_address.classify(normalized)}). A node may not move itself onto the "
+                "open internet. Re-enroll the node to confirm the new address; its model "
+                "files and runtimes are untouched.",
+            ),
+            announced_url,
         )
 
     if int(body.sequence) <= record.advertiseSequence:
-        raise problem(
-            status.HTTP_409_CONFLICT,
-            "Stale announcement",
-            f"Sequence {int(body.sequence)} does not advance node {name!r} past "
-            f"{record.advertiseSequence}. Either this is a replay, or the node's identity "
-            f"file was restored from a backup — in which case re-enroll it rather than "
-            f"raising the counter here.",
+        raise _refused(
+            refusals,
+            name,
+            STALE_SEQUENCE,
+            problem(
+                status.HTTP_409_CONFLICT,
+                "Stale announcement",
+                f"Sequence {int(body.sequence)} does not advance node {name!r} past "
+                f"{record.advertiseSequence}. Either this is a replay, or the node's identity "
+                f"file was restored from a backup — in which case re-enroll it rather than "
+                f"raising the counter here.",
+            ),
+            announced_url,
         )
 
     try:
@@ -392,6 +442,7 @@ async def announce_node_address(
         raise _not_active(machine) from exc
     machine_list.install_table(machine.state, request.app.state.node_name)
     machine_list.note_door(request.app, name, int(body.sequence), error=error, doorless=doorless)
+    refusals.clear(name)
 
     current = [p for p in pins if p != next_pin]
     log.info(
@@ -410,6 +461,31 @@ async def announce_node_address(
         sequence=updated.advertiseSequence,
         changed=True,
     )
+
+
+def _refusals(request: Request) -> AnnouncementRefusals:
+    return cast(AnnouncementRefusals, request.app.state.announcement_refusals)
+
+
+def _refused(
+    refusals: AnnouncementRefusals,
+    name: str,
+    reason: str,
+    exc: HTTPException,
+    announced_url: str | None,
+) -> HTTPException:
+    """Keep what the machine is about to be told, and hand the problem back to
+    raise (row 36): Machines shows the root's own words."""
+    body = exc.detail
+    if isinstance(body, dict):
+        refusals.refuse(
+            name,
+            reason=reason,
+            title=str(body.get("title", "")),
+            detail=str(body.get("detail", "")),
+            announced_url=announced_url,
+        )
+    return exc
 
 
 TLS_PIN = re.compile(r"^[A-Za-z0-9_-]{43}$")
@@ -713,6 +789,7 @@ def revoke(request: Request, name: str) -> TrustChange:
         machine.append(OP_REVOKE_NODE, {"name": name})
     except NotActive as exc:
         raise _not_active(machine) from exc
+    _refusals(request).clear(name)
     machine_list.install_table(machine.state, request.app.state.node_name)
     bundle = request.app.state.trust.publish(request.app)
     version = bundle.version if bundle is not None else machine.state.index
@@ -940,6 +1017,9 @@ async def enroll_node(request: Request, body: EnrollmentRequest) -> Enrollment:
         machine.append(OP_ENROLL_NODE, payload)
     except NotActive as exc:
         raise _not_active(machine) from exc
+    # A machine that enrols again has said where it is: what was refused of
+    # its announcements no longer applies (row 36).
+    _refusals(request).clear(body.name)
     # Before the bundle is pushed to it: the new node is reached over TLS to
     # the key it enrolled with from the first call (LT1).
     machine_list.install_table(machine.state, request.app.state.node_name)
@@ -1066,6 +1146,21 @@ def _to_node(record: NodeRecord, probe: Any | None, request: Request | None = No
             control_pins=machine_pins(app.state.settings),
             hosts_control=record.name == getattr(app.state, "node_name", None),
         )
+    refused = unverified = None
+    if request is not None:
+        refusals = _refusals(request)
+        refusal = refusals.refusal(record.name)
+        if refusal is not None:
+            refused = {
+                "at": refusal.at,
+                "reason": refusal.reason,
+                "title": refusal.title,
+                "detail": refusal.detail,
+                "announcedUrl": refusal.announced_url,
+            }
+        count = refusals.unverified(record.name)
+        if count is not None:
+            unverified = {"count": count.count, "lastAt": count.last_at}
     return Node.model_validate(
         {
             "name": record.name,
@@ -1104,6 +1199,8 @@ def _to_node(record: NodeRecord, probe: Any | None, request: Request | None = No
             # to enrollment and keys when the cause was half a second of
             # clock skew on a worker refusing this root's tokens.
             "lastError": probe.error if probe is not None else None,
+            "announcementRefused": refused,
+            "unverifiedAnnouncements": unverified,
         }
     )
 
