@@ -2984,6 +2984,60 @@ class DirectoryEntryKind(StrEnum):
     file = 'file'
 
 
+class NodeAnnouncementRefusalReason(StrEnum):
+    """
+    * `open_internet`: the machine tried to move itself onto the open
+      internet. Re-enrolling the machine is the confirmation.
+    * `anothers_address`: the address is another machine's.
+    * `not_a_node`: the address can never be a machine's (a metadata,
+      link-local, multicast or wildcard address, or not http or https).
+    * `machine_port`: the machine port or its key was refused.
+    * `stale_sequence`: the announcement does not advance past the
+      sequence on record; the machine's identity file was restored from
+      a backup, or this is a replay.
+    * `no_signing_key`: the machine enrolled before machines signed
+      announcements, so nothing on record can verify one.
+
+    """
+
+    open_internet = 'open_internet'
+    anothers_address = 'anothers_address'
+    not_a_node = 'not_a_node'
+    machine_port = 'machine_port'
+    stale_sequence = 'stale_sequence'
+    no_signing_key = 'no_signing_key'
+
+
+class NodeAnnouncementRefusal(BaseModel):
+    """
+    The last refusal of an announcement that verified against the
+    machine's signing key (row 36). `title` and `detail` are the
+    problem the machine was sent, in the root's words, and `detail`
+    names the addresses involved.
+
+    """
+
+    at: AwareDatetime
+    reason: NodeAnnouncementRefusalReason
+    title: str
+    detail: str
+    announcedUrl: str | None = Field(
+        None,
+        description='The address the machine announced. `null` for `no_signing_key`:\nnothing on record can verify what the request carried.\n',
+    )
+
+
+class NodeUnverifiedAnnouncements(BaseModel):
+    """
+    Announcements under a machine's name that were malformed or whose
+    signature did not verify (row 36).
+
+    """
+
+    count: int = Field(..., ge=1)
+    lastAt: AwareDatetime
+
+
 class TlsPin(RootModel[str]):
     root: str = Field(
         ...,
@@ -5802,6 +5856,14 @@ class Node(BaseModel):
     lastError: str | None = Field(
         None,
         description='Why the last probe of this node did not come back with an\nidentity, in the probe client\'s words -- an HTTP status and\nthe body\'s title, or a transport error. `null` when the node\nanswered, and when nothing has polled yet.\n\nAdded 2026-09-15 because `reachable: false` on its own sent an\noperator looking at enrollment, keys and firewalls when the\ncause was a worker refusing this root\'s tokens as "not yet\nvalid (iat)" over half a second of clock skew. The probe\nclient had the reason the whole time; this surface dropped\nit. Observation, not applied state: a standby has not seen\nwhat this root saw, so it is never replicated.\n',
+    )
+    announcementRefused: NodeAnnouncementRefusal | None = Field(
+        None,
+        description="Why this root refused the last address announcement that this\nmachine signed (row 36). Present only while that refusal is the\nlatest word from the machine: an announcement this root accepts,\nthe machine's removal and its re-enrollment clear it. An\nobservation of the active root, never replicated: a standby, or\na root that restarted, learns it at the machine's next attempt.\n`null` when there is none.\n",
+    )
+    unverifiedAnnouncements: NodeUnverifiedAnnouncements | None = Field(
+        None,
+        description="Announcements sent under this machine's name that it did not\nsign, as a count and the time of the last one. `null` when there\nis none. Never the text they carried: anyone who can reach this\nroot can send one, and it must not put words on the owner's\nscreen.\n",
     )
 
 

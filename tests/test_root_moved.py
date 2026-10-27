@@ -177,9 +177,15 @@ def test_the_root_pushes_to_a_node_behind_at_most_once_a_minute(
     active_client: TestClient,
 ) -> None:
     app: Any = active_client.app
+    pushes = _Pushes()
+    app.state.nodes_client = pushes
     for name in ("gpu", "edge", "fresh"):
         _keys, joined = enroll(active_client, name, url=f"http://192.0.2.{len(name)}:8079")
         assert joined.status_code == 201, joined.text
+    # Each enrollment pushes the new bundle in the background; on a slow
+    # runner the last push can post after this point. Let it finish first.
+    active_client.portal.call(app.state.trust.wait)
+    pushes.posts.clear()
     epoch = app.state.machine.state.epoch
     probes = {
         # It missed the epoch.
@@ -192,8 +198,6 @@ def test_the_root_pushes_to_a_node_behind_at_most_once_a_minute(
     # Somewhere a node could move to: without one, a node behind only on
     # its address could do nothing with the list.
     app.state.settings.nodes_origin = "https://nodes.example.test"
-    pushes = _Pushes()
-    app.state.nodes_client = pushes
     clock = 1000.0
 
     def push(now: float) -> None:

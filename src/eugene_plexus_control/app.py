@@ -36,6 +36,7 @@ from . import __version__, keyring_store, passphrase_file, security
 from . import config as config_module
 from . import machine_list as machine_list_module
 from .admission_worker import AdmissionWorker
+from .announcement_refusals import AnnouncementRefusals
 from .applied import OP_PATCH_CONFIG, RetiredData, normalize_url
 from .auth_state import AuthState
 from .join_tokens import JoinTokenStore
@@ -168,6 +169,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.join_tokens = JoinTokenStore()
     app.state.node_probes = {}
+    app.state.announcement_refusals = AnnouncementRefusals()
     app.state.site_contacts = {}
     app.state.root_tls = RootTls(
         Path(settings.state_dir), settings.nodes_origin, settings.nodes_probe
