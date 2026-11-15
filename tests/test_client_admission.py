@@ -556,9 +556,12 @@ def test_a_key_band_and_queue_bound_are_kept_and_checked(active_client):
     # interactive and 8), so a gateway a release behind, which refuses fields it
     # does not know, still reads its admission answers.
     plain = mint(c)["key"]
-    assert not {"band", "maxQueuedRequests"} & plain["limits"].keys()
+    # Nor with `readMetrics` (row 12): the specs integration found a gateway a
+    # release behind refusing every request on a key whose answer said `false`.
+    left_out = {"band", "maxQueuedRequests", "readMetrics"}
+    assert not left_out & plain["limits"].keys()
     answered = call(c, plain["id"], "acquire", "plain").json()["limits"]
-    assert not {"band", "maxQueuedRequests"} & answered.keys()
+    assert not left_out & answered.keys()
     for bad in ({"band": "urgent"}, {"maxQueuedRequests": 65}, {"maxQueuedRequests": -1}):
         response = c.post("/v1/auth/client-keys", json={"name": "bad", "limits": bad})
         assert response.status_code == 422, bad
