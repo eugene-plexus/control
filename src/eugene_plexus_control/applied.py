@@ -1299,14 +1299,20 @@ def _person_record(raw: Any) -> dict[str, Any]:
         "managePeople",
         "manageGroups",
         "membershipGroups",
+        # Row 39: operations powers, and the machines they reach (null: all).
+        "operateModels",
+        "operateMachines",
+        "operationsMachines",
     }:
         raise ApplyError("invalid administration grants")
-    for permission in ("managePeople", "manageGroups"):
+    for permission in ("managePeople", "manageGroups", "operateModels", "operateMachines"):
         if type(grants.get(permission, False)) is not bool:
             raise ApplyError("invalid administration permission")
     _string_list(
         grants.get("membershipGroups", []), "administration scope", limit=64, item_limit=64
     )
+    if grants.get("operationsMachines") is not None:
+        _string_list(grants["operationsMachines"], "operations machines", limit=256, item_limit=64)
     version = raw.get("administrationVersion", 0)
     if type(version) is not int or version < 0:
         raise ApplyError("invalid administration version")

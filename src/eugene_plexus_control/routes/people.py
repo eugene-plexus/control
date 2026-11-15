@@ -60,6 +60,7 @@ from ..dependencies import (
     require_operator,
 )
 from ..state_machine import StateMachine
+from .administration import revoke_operations
 
 router = APIRouter(tags=["people"], dependencies=[Depends(require_administrator)])
 # Registering and removing an app's sign-in is also what installing an app on
@@ -354,6 +355,7 @@ async def update_person(
             record["permissions"] = chosen
     if "disabled" in changes and changes["disabled"] is not None:
         if bool(changes["disabled"]) != record["disabled"]:
+            revoke_operations(request, record, actor=admin.claims.sub)
             record["administrationVersion"] = record.get("administrationVersion", 0) + 1
         record["disabled"] = bool(changes["disabled"])
     machine.append(OP_PUT_PERSON, {"person": record}, actor=admin.claims.sub)
@@ -368,6 +370,7 @@ async def delete_person(
     admin.require("managePeople")
     machine = _active(request)
     admin.ordinary_account(_person(machine, person_id))
+    revoke_operations(request, _person(machine, person_id), actor=admin.claims.sub)
     owned = [s for s, record in machine.state.sites.items() if record.owner == person_id]
     machine.append(OP_DELETE_PERSON, {"id": person_id}, actor=admin.claims.sub)
     admin.audit("delete-person", person_id)
@@ -386,7 +389,7 @@ async def delete_person(
 )
 async def set_password(request: Request, person_id: str, body: PersonPasswordRequest) -> Response:
     machine = _active(request)
-    _person(machine, person_id)
+    revoke_operations(request, _person(machine, person_id), actor="operator")
     machine.append(
         OP_SET_PERSON_PASSWORD,
         {
@@ -410,9 +413,12 @@ async def set_administration(
 ) -> Person:
     machine = _active(request)
     record = dict(_person(machine, person_id))
-    grants = body.model_dump()
+    # Null `operationsMachines` (every machine) is kept as no key, as a
+    # record written before row 39 has none.
+    grants = body.model_dump(exclude_none=True)
     _check_groups(machine, grants["membershipGroups"])
     if record.get("administration", {}) != grants:
+        revoke_operations(request, record, actor=admin.claims.sub)
         record["administration"] = grants
         record["administrationVersion"] = record.get("administrationVersion", 0) + 1
         machine.append(OP_PUT_PERSON, {"person": record}, actor=admin.claims.sub)

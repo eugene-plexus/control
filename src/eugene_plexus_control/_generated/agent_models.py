@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Any, Literal
 
 from pydantic import (
@@ -2588,6 +2588,69 @@ class HostSeries(BaseModel):
     min: list[float | None]
     mean: list[float | None]
     max: list[float | None]
+
+
+class Power(Enum):
+    """
+    The power the route needs. Absent on a read.
+    """
+
+    operate_models = 'operate-models'
+    operate_machines = 'operate-machines'
+    NoneType_None = None
+
+
+class OperationReport(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    personId: str = Field(
+        ..., description="The person's id, or `operator` for the owner.", max_length=64
+    )
+    name: str = Field(..., description='The name to show for them.', max_length=64)
+    owner: bool
+    power: Power | None = Field(
+        None, description='The power the route needs. Absent on a read.'
+    )
+    action: str = Field(
+        ...,
+        description='What was done, a short verb phrase such as `stop runtime`.',
+        max_length=64,
+    )
+    target: str = Field(
+        ...,
+        description='What it was done to (a runtime, an engine, a model), or empty.',
+        max_length=256,
+    )
+    status: int = Field(
+        ..., description='The HTTP status the change answered with.', ge=100, le=599
+    )
+
+
+class Power1(Enum):
+    operate_models = 'operate-models'
+    operate_machines = 'operate-machines'
+    NoneType_None = None
+
+
+class OperationRecord(BaseModel):
+    """
+    One row of `OperationsLog`, an `OperationReport` with when and where.
+    """
+
+    at: AwareDatetime
+    component: str
+    personId: str
+    name: str
+    owner: bool
+    power: Power1 | None = None
+    action: str
+    target: str
+    status: int
+
+
+class OperationsLog(BaseModel):
+    entries: list[OperationRecord]
 
 
 class HostHistory(BaseModel):

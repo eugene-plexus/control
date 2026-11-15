@@ -26,8 +26,34 @@ _bearer = HTTPBearer(auto_error=False)
 def has_grants(person: dict[str, Any]) -> bool:
     grants = person.get("administration", {})
     return bool(
-        grants.get("managePeople") or grants.get("manageGroups") or grants.get("membershipGroups")
+        grants.get("managePeople")
+        or grants.get("manageGroups")
+        or grants.get("membershipGroups")
+        or has_operations(person)
     )
+
+
+#: Row 39: each operations power, as the grant names it and as a token carries it.
+OPERATIONS_POWERS: tuple[tuple[str, str], ...] = (
+    ("operateModels", tokens.POWER_OPERATE_MODELS),
+    ("operateMachines", tokens.POWER_OPERATE_MACHINES),
+)
+
+
+def operations_powers(person: dict[str, Any]) -> list[str]:
+    """The operations powers `person` holds, as a token carries them (row 39)."""
+    grants = person.get("administration", {})
+    return [power for grant, power in OPERATIONS_POWERS if grants.get(grant) is True]
+
+
+def has_operations(person: dict[str, Any]) -> bool:
+    return bool(operations_powers(person))
+
+
+def operations_reach(person: dict[str, Any], machine: str) -> bool:
+    """Whether `person`'s operations powers reach `machine`: null is every one."""
+    scope = person.get("administration", {}).get("operationsMachines")
+    return scope is None or machine in scope
 
 
 def active(request: Request) -> StateMachine:
@@ -104,6 +130,9 @@ async def require_administrator(
                         "manageGroups": True,
                         # The owner is not restricted to a delegate's 64-group scope.
                         "membershipGroups": [],
+                        "operateModels": True,
+                        "operateMachines": True,
+                        "operationsMachines": None,
                     }
                 ),
             ),

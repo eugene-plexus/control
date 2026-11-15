@@ -3596,6 +3596,10 @@ class MembershipGroup(RootModel[str]):
     root: str = Field(..., max_length=64, min_length=1)
 
 
+class OperationsMachine(RootModel[str]):
+    root: str = Field(..., max_length=64, min_length=1)
+
+
 class AdministrationGrants(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -3614,6 +3618,52 @@ class AdministrationGrants(BaseModel):
         max_length=64,
         validate_default=True,
     )
+    operateModels: bool | None = Field(
+        False,
+        description='Row 39. Download, delete and re-scan models; edit profiles; create, start, stop, restart and change runtimes, on the machines in operationsMachines. Never secrets, chats or sign-in keys.',
+    )
+    operateMachines: bool | None = Field(
+        False,
+        description="Row 39. Update Eugene and engines (Update all), install and remove engine builds, restart components, and read the machines' logs (call R39-LOGS), on the machines in operationsMachines. Never secrets, chats or sign-in keys.",
+    )
+    operationsMachines: list[OperationsMachine] | None = Field(
+        None,
+        description='Row 39. The machines (node names) the operations powers reach. Null is every machine; an empty list is none.',
+        max_length=256,
+    )
+
+
+class OperationsPower(StrEnum):
+    """
+    Row 39. An operations power as an operations token carries it
+    (`ops`): `operate-models` is `AdministrationGrants.operateModels`,
+    `operate-machines` is `operateMachines`.
+
+    """
+
+    operate_models = 'operate-models'
+    operate_machines = 'operate-machines'
+
+
+class OperationsTokenRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    machine: str = Field(
+        ...,
+        description='The node name of the one machine the token is for.',
+        max_length=64,
+        min_length=1,
+    )
+
+
+class OperationsToken(BaseModel):
+    token: str = Field(
+        ..., description='An `ep-operations+jwt` addressed to `node:<machine>` only.'
+    )
+    expiresAt: AwareDatetime
+    machine: str
+    powers: list[OperationsPower]
 
 
 class AdministrationLoginRequest(BaseModel):

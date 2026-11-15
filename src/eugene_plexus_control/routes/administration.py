@@ -15,8 +15,17 @@ from .._generated.models import (
     AdministrationLoginRequest,
     AdministrationLoginResponse,
     AdministrationSession,
+    OperationsPower,
+    OperationsToken,
+    OperationsTokenRequest,
 )
-from ..administration import DirectoryAdministrator, active, has_grants
+from ..administration import (
+    DirectoryAdministrator,
+    active,
+    has_grants,
+    operations_powers,
+    operations_reach,
+)
 from ..applied import OP_REVOKE_SESSION
 from ..dependencies import problem, require_operator
 from ..trusted_host import require_trusted_host
@@ -125,3 +134,98 @@ async def logout(request: Request, admin: DirectoryAdministrator) -> Response:
     request.app.state.trust.publish(request.app)
     admin.audit("sign-out", admin.claims.sub)
     return Response(status_code=204)
+
+
+@router.post("/v1/auth/operations-token", response_model=OperationsToken)
+async def operations_token(
+    request: Request,
+    body: OperationsTokenRequest,
+    admin: DirectoryAdministrator,
+    response: Response,
+) -> OperationsToken:
+    """Row 39: a person's operations powers on one machine, for 10 minutes.
+
+    Checked at every exchange, from the root's current state: the session
+    (version, enabled, not signed out: `require_administrator`), the
+    powers, and the machine scope. The token is addressed to that one
+    machine and carries the session it came from, so signing out ends it
+    on every machine that can fetch the trust bundle."""
+    if admin.owner:
+        raise problem(
+            403,
+            "Owner session",
+            "The owner's console reaches every machine already. This exchange is for people "
+            "the owner gave an operations power.",
+        )
+    machine = active(request)
+    person = machine.state.people.get(admin.claims.sub)
+    powers = operations_powers(person) if person is not None else []
+    if person is None or not powers:
+        raise problem(
+            403,
+            "No operations power",
+            "The owner has not given you an operations power (Models, or Updates and "
+            "restarts). The owner can, on Eugene's People page.",
+        )
+    name = body.machine
+    if not operations_reach(person, name):
+        raise problem(
+            403,
+            "Outside your machines",
+            f"Your operations powers do not reach the machine {name!r}. The owner chooses your "
+            "machines on Eugene's People page.",
+        )
+    if name not in machine.state.nodes:
+        raise problem(400, "No such machine", f"{name!r} is not a machine in this install.")
+    auth = request.app.state.auth_state
+    if auth.signing_key is None:
+        raise problem(503, "Locked", "The owner must unlock Eugene first.")
+    now = int(time.time())
+    ttl = min(tokens.OPERATIONS_TTL_SECONDS, admin.claims.exp - now)
+    if ttl <= 0:
+        raise problem(401, "Administration session ended", "Sign in again.")
+    token, expires = auth.signer().mint(
+        typ=tokens.TYP_OPERATIONS,
+        sub=person["id"],
+        aud=[tokens.node_recipient(name)],
+        ttl_seconds=ttl,
+        now=now,
+        extra={
+            "ops": powers,
+            "name": person.get("displayName") or person["name"],
+            "sid": admin.claims.jti,
+            "administration_version": person.get("administrationVersion", 0),
+        },
+    )
+    admin.audit("operations-token", name)
+    response.headers["Cache-Control"] = "no-store"
+    return OperationsToken(
+        token=token,
+        expiresAt=datetime.fromtimestamp(expires, UTC),
+        machine=name,
+        powers=[OperationsPower(p) for p in powers],
+    )
+
+
+def revoke_operations(request: Request, person: dict[str, Any], *, actor: str) -> None:
+    """End every operations token `person` holds now (row 39).
+
+    Called before a change that bumps their administration version or
+    removes them: their grants, enabled state, password, or the account.
+    One sign-out entry names the person at their current version; it
+    outlives the longest token minted before it."""
+    if not operations_powers(person):
+        return
+    now = int(time.time())
+    active(request).append(
+        OP_REVOKE_SESSION,
+        {
+            "jti": tokens.operations_revocation(
+                person["id"], person.get("administrationVersion", 0)
+            ),
+            "exp": now + tokens.OPERATIONS_TTL_SECONDS + tokens.LEEWAY_SECONDS,
+            "prunedBefore": now - tokens.LEEWAY_SECONDS,
+        },
+        actor=actor,
+    )
+    request.app.state.trust.publish(request.app)

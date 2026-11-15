@@ -296,3 +296,143 @@ def test_administration_token_profile_is_narrow(
     }
     token, _ = c.app.state.auth_state.signer().mint(**args)
     assert c.get("/v1/people", headers={"Authorization": "Bearer " + token}).status_code == 401
+
+
+# ------------------------------------------------------------- operations (row 39)
+
+
+def _bundle(c: TestClient) -> tokens.TrustBundle:
+    return c.app.state.trust.view_for(c.app.state.machine.state)
+
+
+def _why(r: Any) -> str:
+    return str(r.json()["detail"]["detail"])
+
+
+def _exchange(c: TestClient, auth: dict[str, str], machine: str) -> Any:
+    return c.post("/v1/auth/operations-token", headers=auth, json={"machine": machine})
+
+
+def test_operations_token_carries_powers_and_machine_scope(active_client: TestClient) -> None:
+    c = active_client
+    for name in ("gpu-a", "gpu-b"):
+        assert enroll(c, name)[1].status_code == 201
+    p, auth = delegate(c, operateModels=True, operationsMachines=["gpu-a"])
+    assert p["administration"]["operateModels"] is True
+    r = _exchange(c, auth, "gpu-a")
+    assert r.status_code == 200, r.text
+    assert r.headers["cache-control"] == "no-store"
+    body = r.json()
+    assert body["machine"] == "gpu-a" and body["powers"] == ["operate-models"]
+    claims = tokens.verify(
+        body["token"], bundle=_bundle(c), recipient="node:gpu-a", classes=[tokens.TYP_OPERATIONS]
+    )
+    assert claims.sub == p["id"] and claims.name == "Manager"
+    assert claims.ops == ("operate-models",)
+    assert claims.aud == ("node:gpu-a",)
+    assert claims.exp - claims.iat == tokens.OPERATIONS_TTL_SECONDS
+    session = tokens.verify(
+        auth["Authorization"][7:],
+        bundle=_bundle(c),
+        recipient="control",
+        classes=[tokens.TYP_ADMINISTRATION],
+    )
+    assert claims.sid == session.jti
+    # Every machine when the scope is null; both powers when both are given.
+    c.put(
+        f"/v1/people/{p['id']}/administration",
+        json={"operateModels": True, "operateMachines": True},
+    )
+    auth = sign_in(c)
+    body = _exchange(c, auth, "gpu-b").json()
+    assert body["powers"] == ["operate-models", "operate-machines"]
+    # The token reaches nothing at the root.
+    bearer = {"Authorization": "Bearer " + body["token"]}
+    for route in ("/v1/people", "/v1/nodes", "/v1/config", "/v1/auth/administration/session"):
+        assert c.get(route, headers=bearer).status_code == 401, route
+
+
+def test_exchange_refuses_a_machine_outside_the_scope(active_client: TestClient) -> None:
+    c = active_client
+    for name in ("gpu-a", "gpu-b"):
+        assert enroll(c, name)[1].status_code == 201
+    _, auth = delegate(c, operateModels=True, operationsMachines=["gpu-a"])
+    r = _exchange(c, auth, "gpu-b")
+    assert r.status_code == 403
+    assert "gpu-b" in _why(r) and "machines" in _why(r)
+    missing = _exchange(c, auth, "nowhere")
+    assert missing.status_code in (400, 403)
+
+
+def test_exchange_refuses_without_an_operations_power(active_client: TestClient) -> None:
+    c = active_client
+    assert enroll(c, "gpu-a")[1].status_code == 201
+    _, auth = delegate(c, managePeople=True)
+    r = _exchange(c, auth, "gpu-a")
+    assert r.status_code == 403
+    assert "operations power" in _why(r)
+    # The owner's own session is not exchanged here.
+    assert c.post("/v1/auth/operations-token", json={"machine": "gpu-a"}).status_code == 403
+
+
+def test_exchange_refuses_an_unknown_machine(active_client: TestClient) -> None:
+    c = active_client
+    _, auth = delegate(c, operateMachines=True)
+    r = _exchange(c, auth, "nowhere")
+    assert r.status_code == 400
+    assert "nowhere" in _why(r)
+
+
+def test_operations_powers_alone_sign_in_but_manage_no_one(active_client: TestClient) -> None:
+    c = active_client
+    _, auth = delegate(c, operateModels=True)
+    session = c.get("/v1/auth/administration/session", headers=auth).json()
+    assert session["grants"]["operateModels"] is True
+    assert (
+        c.post("/v1/people", headers=auth, json={"name": "X", "password": PASSWORD}).status_code
+        == 403
+    )
+    assert c.post("/v1/permission-groups", headers=auth, json={"name": "Y"}).status_code == 403
+
+
+@pytest.mark.parametrize("change", ["grants", "disable", "password", "delete", "logout"])
+def test_an_access_change_revokes_operations_tokens(active_client: TestClient, change: str) -> None:
+    c = active_client
+    assert enroll(c, "gpu-a")[1].status_code == 201
+    p, auth = delegate(c, operateModels=True)
+    token = _exchange(c, auth, "gpu-a").json()["token"]
+    path = f"/v1/people/{p['id']}"
+    if change == "grants":
+        c.put(path + "/administration", json={"operateMachines": True})
+    elif change == "disable":
+        c.patch(path, json={"disabled": True})
+    elif change == "password":
+        c.put(path + "/password", json={"password": PASSWORD})
+    elif change == "delete":
+        c.delete(path)
+    else:
+        assert c.delete("/v1/auth/administration/session", headers=auth).status_code == 204
+    with pytest.raises(tokens.TokenError, match="signed out"):
+        tokens.verify(
+            token, bundle=_bundle(c), recipient="node:gpu-a", classes=[tokens.TYP_OPERATIONS]
+        )
+
+
+def test_operations_grants_replay_and_refuse_bad_values(active_client: TestClient) -> None:
+    c = active_client
+    p, _ = delegate(c, operateModels=True, operationsMachines=["gpu-a"])
+    machine = c.app.state.machine
+    snapshot = to_canonical(machine.state)
+    assert canonical_bytes(from_canonical(snapshot)) == canonical_bytes(machine.state)
+    for bad in (
+        {"operateModels": "yes"},
+        {"operateMachines": 1},
+        {"operationsMachines": "gpu-a"},
+        {"operationsMachines": [""]},
+        {"operationsMachines": ["a"] * 257},
+    ):
+        broken = deepcopy(snapshot)
+        broken["people"][0]["administration"] = bad
+        with pytest.raises(ApplyError):
+            from_canonical(broken)
+    assert p["administration"]["operationsMachines"] == ["gpu-a"]
