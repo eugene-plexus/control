@@ -2710,6 +2710,26 @@ class Arch(StrEnum):
     arm64 = 'arm64'
 
 
+class NodeVersionKind(StrEnum):
+    """
+    - `release`: every commit is the one a published release pins.
+    - `edge`: every commit is the one the Edge marker pins.
+    - `development`: a git checkout; it has no version to match.
+    - `unmatched`: the commits match no release and not Edge: "not a
+      published release".
+    - `unknown`: not matched yet (the first lookup has not run, GitHub
+      could not be read, or the install's commits changed since the
+      last match and the new ones are not matched yet).
+
+    """
+
+    release = 'release'
+    edge = 'edge'
+    development = 'development'
+    unmatched = 'unmatched'
+    unknown = 'unknown'
+
+
 class MachineKeyChangeState(StrEnum):
     """
     * `waiting`: the next key is made and announced beside the
@@ -3322,6 +3342,8 @@ class Action(StrEnum):
 
 class Purpose(StrEnum):
     """
+    Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key's `readMetrics` is on. It never acquires, renews or releases.
+
     Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.
 
     Search is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.
@@ -3332,6 +3354,7 @@ class Purpose(StrEnum):
     logs = 'logs'
     catalog = 'catalog'
     search = 'search'
+    metrics = 'metrics'
 
 
 class ClientAdmissionRequest(BaseModel):
@@ -3357,7 +3380,7 @@ class ClientAdmissionRequest(BaseModel):
     requestId: str = Field(..., max_length=128, min_length=1)
     purpose: Purpose | None = Field(
         'inference',
-        description="Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.\n",
+        description='Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key\'s `readMetrics` is on. It never acquires, renews or releases.\n\nLogs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI\'s external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key\'s `allowedModels` does not apply. The gateway checks the key\'s `allowedTools` and `localOnly`, as for every tool.\n',
     )
     model: str | None = Field(None, max_length=256, min_length=1)
     personToken: str | None = Field(
@@ -3693,6 +3716,101 @@ class EngineInstall(BaseModel):
     error: str | None = Field(None, description='Populated when `state: failed`.')
     startedAt: AwareDatetime | None = None
     finishedAt: AwareDatetime | None = None
+
+
+class ExecTrustKind(StrEnum):
+    """
+    Why Eugene's own account did not run a program (row 8, part 8c).
+    The check walks the program's path from `/`: every folder, every
+    link and where it points, the file, a script's interpreter and
+    the Python environment it belongs to.
+
+    - `needs_approval`: everything is owned by root, by Eugene's
+      account, or by one other account, and nothing can be changed
+      by a group or by others. It runs once an owner approves it
+      (`POST /v1/exec-approvals`).
+    - `refused`: a group or others can change something on the way
+      (mode bits, a macOS ACL entry, a volume that ignores
+      ownership), two or more other accounts own parts of it, or it
+      cannot be checked. It never runs; the error names the path and
+      who can change it.
+
+    A program owned by root and Eugene's account alone runs, and is
+    not reported.
+
+    """
+
+    needs_approval = 'needs_approval'
+    refused = 'refused'
+
+
+class ExecTrust(BaseModel):
+    """
+    A program Eugene's own account did not run, and what an owner can
+    do about it (row 8, part 8c). Present only when the agent runs as
+    an account of its own (the Mac's daemon, a Linux system install).
+
+    """
+
+    kind: ExecTrustKind
+    path: str = Field(
+        ...,
+        description="The path the program is looked up by: the setting's path made\nabsolute, its links kept (`/Users/troy/current/llama-server`,\nnot where `current` points). What `POST /v1/exec-approvals`\ntakes and what an approval is kept by, so the folders and links\napproved are the ones every later check walks.\n",
+    )
+    account: str | None = Field(
+        None,
+        description="`needs_approval`: the one account other than root and\nEugene's that can change the program. A console says that\napproving it lets this account act as Eugene.\n",
+    )
+    sha256: str | None = Field(
+        None,
+        description="`needs_approval`: the program file's SHA-256 now, which an\napproval must name.\n",
+    )
+
+
+class ExecApprovalRequest(BaseModel):
+    path: str = Field(..., description='`ExecTrust.path`.')
+    sha256: str = Field(
+        ..., description='`ExecTrust.sha256`: the file as it was shown.'
+    )
+
+
+class ExecChainItem(BaseModel):
+    """
+    One file, folder or link the check walked, as it was approved.
+    """
+
+    path: str
+    uid: int
+    mode: int = Field(..., description='`st_mode`: the type and permission bits.')
+
+
+class ExecApproval(BaseModel):
+    """
+    An owner's approval of one program for Eugene's own account (row
+    8, part 8c). It holds while the path, the other account, the
+    file's SHA-256 and every item of the chain are what they were;
+    the first check that finds any of them different drops it, and
+    the program asks again.
+
+    """
+
+    id: str
+    path: str = Field(
+        ...,
+        description='The program approved, by the path it is looked up by (`ExecTrust.path`).',
+    )
+    account: str = Field(..., description='The other account that can change it.')
+    accountUid: int
+    sha256: str
+    chain: list[ExecChainItem]
+    approvedAt: AwareDatetime
+    approvedBy: str | None = Field(
+        None, description='Who approved it, as their session named them.'
+    )
+
+
+class ExecApprovalList(BaseModel):
+    approvals: list[ExecApproval]
 
 
 class Origin(StrEnum):
@@ -5656,6 +5774,52 @@ class NodePassphraseResult(BaseModel):
     )
 
 
+class NodeVersion(BaseModel):
+    """
+    What a person calls the version this machine runs (row 75).
+
+    The agent works it out from the seven commits `install` reports,
+    matched against the published release manifests and the Edge
+    marker's pins. It is never a guess: **a version is named only when
+    every installed commit equals the one a release (or Edge) pins.**
+    An install that matches nothing says so (`unmatched`), and the
+    commits stay on `install` for whoever wants them.
+
+    The answer is kept on disk, keyed by the installed commits, so it
+    shows offline and after a restart, and is worked out again when the
+    commits change. `GET /v1/node` never calls GitHub for it: the lookup
+    runs with the update check (a minute after start, then every six
+    hours, and on `POST /v1/node/update/check`), and until the first
+    match the kind is `unknown`, with `error` naming the cause when the
+    lookup failed.
+
+    Absent on an agent from before this field. A reader treats absence
+    as `unknown`; nothing refuses it.
+
+    """
+
+    kind: NodeVersionKind
+    release: str | None = Field(
+        None, description='The release tag (`v0.4.0`). Only for kind `release`.'
+    )
+    publishedAt: AwareDatetime | None = Field(
+        None,
+        description='When the release was published, or, for `edge`, when the Edge\nbuild was made (the date of its specs commit).\n',
+    )
+    specsCommit: str | None = Field(
+        None,
+        description='The specs commit of the Edge build. Only for kind `edge`.',
+        pattern='^[0-9a-f]{40}$',
+    )
+    checkedAt: AwareDatetime | None = Field(
+        None, description='When the commits were last matched.'
+    )
+    error: str | None = Field(
+        None,
+        description='Why the lookup could not finish, and what it was trying to\nreach. For `unknown`, the reason no version is known yet; for\n`unmatched`, why the last recheck failed (the answer stands).\n',
+    )
+
+
 class MachinePort(BaseModel):
     """
     This node's machine port (LT1, `docs/design/tls-between-machines.md`):
@@ -5853,12 +6017,16 @@ class ClientKeyLimits(BaseModel):
     )
     allowedTools: list[AllowedTool] | None = Field(
         None,
-        description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search` today. **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
+        description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search`, `image_generation`, and `mcp`\n(remote MCP servers the key\'s caller names, row 59b). **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
         max_length=100,
     )
     writeLogs: bool | None = Field(
         False,
         description="Whether this key may send log records to an agent's log ingress\n(`POST /v1/logs` on `agent.yaml`, C1 in `workbench.md`). It\ngrants nothing else: reading logs stays operator-only.\n\nEvery app the registry installs gets a key with this on,\nbecause the launcher that runs an app in its own account\nforwards what the app prints. Any other key gets it when the\noperator turns it on, so a tool outside the registry sends its\nlogs the same way ours do.\n",
+    )
+    readMetrics: bool | None = Field(
+        False,
+        description='Whether this key may read `GET /metrics` on a gateway or an agent,\nand `GET /v1/metrics/export` on a gateway (row 12): the numbers a\nPrometheus scraper reads. **It grants nothing else.** A key with it\nruns no inference unless `allowedModels` also names a model, and a\nkey without it is refused at every metrics path with 403.\n\nThe console\'s "Make a scrape key" sets it together with\n`allowedModels: []`, so the key can read numbers and run nothing.\nThe metrics paths ask the authority with admission purpose\n`metrics`: a check that names no model and takes no lease.\n',
     )
     maxConcurrentRequests: int | None = Field(
         2,
@@ -7259,6 +7427,14 @@ class Runtime(BaseModel):
         None,
         description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
     )
+    refusedBinary: str | None = Field(
+        None,
+        description="The program this runtime's `binary` names, when the agent runs\nin Eugene's own account and will not run it because someone\nother than root or that account could change it (row 8):\n`lastError` says who. The way out a console offers is to clear\n`binary` (`PATCH /v1/runtimes/{name}` with the spec without it),\nso the runtime runs Eugene's own build of the engine, installed\nfirst with `POST /v1/engines/{engine}/install` when there is\nnone. Absent otherwise; cleared on a successful start.\n",
+    )
+    execTrust: ExecTrust | None = Field(
+        None,
+        description="Present when the last start failed because Eugene's own account\ndid not run the engine's program, whether a runtime's `binary`\nor one the agent found (row 8, part 8c). `needs_approval`: a\nconsole asks the owner, and `POST /v1/exec-approvals` lets it\nrun. Cleared on a successful start.\n",
+    )
     lastDevices: list[LastDevice] | None = Field(
         None,
         description='UUIDs of the cards used at the last successful start, recorded\nby the agent. An observation, never a profile setting or a\nreplacement for its saved device pins. Kept across stops and\nfailed starts, and updated only after a successful start.\nAbsent before a successful start has been observed; an empty\nlist means no device UUIDs were available or used.\n',
@@ -7458,7 +7634,16 @@ class NodeIdentity(BaseModel):
     )
     trustBundleAgeSeconds: int | None = Field(
         None,
-        description="Seconds since this agent last took the control root's bundle\n-- a push, or the pull it makes every minute. Not the\nbundle's signing time: a quiet install's bundle can be days\nold and current. Reported, never enforced: a bundle keeps\nworking while the root is dead, so this is what tells an\noperator the node has not heard from the root. Past ten\nminutes the console lists it as an issue.\n",
+        description="Seconds since this agent last heard from the control root:\nthe pull it makes every minute, or a newer bundle from\nanywhere, counted from when the root signed it. Over machine\nTLS to the root (or loopback) only an answer from the root\ncounts; in plain HTTP, any answer at the root's address,\nwhich is all plain HTTP can say. Not the held bundle's\nsigning time: a quiet install's bundle can be days old and\ncurrent. A clock set back does not shorten it while the\nagent runs. Past ten minutes the console lists it as an\nissue; past `trustBundleMaxAgeSeconds` the agent refuses\nchanges from other machines (`trustBundleFrozen`).\n",
+    )
+    trustBundleMaxAgeSeconds: int | None = Field(
+        None,
+        description='The limit in effect on `trustBundleAgeSeconds`, from the\n`maxTrustBundleAgeHours` setting, in seconds. `0` when there\nis none: the setting is 0, or this agent reaches the root\nwithout encryption, where a pull cannot be told from a\nreplay and the limit is not enforced. Absent when this agent\nhas joined no install, or runs a version older than row 46.\n',
+        ge=0,
+    )
+    trustBundleFrozen: bool | None = Field(
+        None,
+        description="True while `trustBundleAgeSeconds` is past\n`trustBundleMaxAgeSeconds`: this agent refuses changes\nsigned by other machines' keys (the `RootNotHeard` 403) until\nit hears from the root again. Answers, reads and the root's\nown tokens keep working. Absent when this agent has joined\nno install, or runs a version older than row 46.\n",
     )
     tokenPublicKey: str | None = Field(
         None,
@@ -7492,6 +7677,7 @@ class NodeIdentity(BaseModel):
     reach: NodeReach | None = None
     install: NodeInstall | None = None
     update: NodeUpdate | None = None
+    version: NodeVersion | None = None
 
 
 class UnenrollResult(BaseModel):
@@ -7559,6 +7745,10 @@ class EngineDescriptor(BaseModel):
         description='The **curated** flag surface for this engine, as a standard\n`ConfigSchema` so the generic config editor renders it with\nno engine-specific UI code.\n\nCurated, not complete: `llama-server` has hundreds of flags\nand exposing them wholesale would produce a form nobody can\nuse. What is here is what a person actually turns —\ncontext size, GPU layers, batch size, parallel slots, flash\nattention. Anything omitted is still reachable through\n`RuntimeSpec.extraArgs`.\n',
     )
     error: str | None = Field(None, description='Populated when `available: false`.')
+    execTrust: ExecTrust | None = Field(
+        None,
+        description="Present when `error` is Eugene's own account not running the\nbinary it found (row 8, part 8c).\n",
+    )
     managed: ManagedEngine | None = None
     acquisition: EngineAcquisition | None = None
     python: PythonEngine | None = Field(

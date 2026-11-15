@@ -292,6 +292,58 @@ def test_a_key_that_may_send_logs_says_so_to_the_ingress(active_client):
         admission.validate_limits({"writeLogs": 1})
 
 
+def metrics_call(client, key, action="check", request_id="m1", **extra):
+    return client.post(
+        "/v1/auth/client-keys/admission",
+        json={
+            "keyId": key,
+            "action": action,
+            "requestId": request_id,
+            "purpose": "metrics",
+            **extra,
+        },
+    )
+
+
+def test_metrics_purpose_needs_read_metrics(active_client):
+    """Row 12: a scraper's key reads numbers and runs nothing. The check
+    passes only for a key that may read metrics, names no model and takes no
+    lease, and the grant opens no inference."""
+    c = active_client
+    scrape = mint(c, readMetrics=True, allowedModels=[])["key"]
+    assert scrape["limits"]["readMetrics"] is True
+    answer = metrics_call(c, scrape["id"])
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["limits"]["readMetrics"] is True
+    assert "leaseSeconds" not in answer.json()
+
+    # A key without the grant is refused, in words that say what to do.
+    plain = mint(c)["key"]
+    refused = metrics_call(c, plain["id"])
+    assert refused.status_code == 403
+    assert "may not read metrics" in str(refused.json())
+    assert "May read metrics" in str(refused.json())
+
+    # Nothing but a check, and no model: no lease, no inference by this door.
+    assert metrics_call(c, scrape["id"], "acquire").status_code == 403
+    assert metrics_call(c, scrape["id"], "release").status_code == 403
+    assert metrics_call(c, scrape["id"], model="allowed").status_code == 403
+
+    # The grant opens no inference: this key's model list is empty.
+    assert call(c, scrape["id"], "acquire", "i1").status_code == 403
+    # And a key that may run inference may not read metrics by that alone.
+    chat = mint(c, allowedModels=["allowed"])["key"]
+    assert call(c, chat["id"], "acquire", "i2").status_code == 200
+    assert metrics_call(c, chat["id"]).status_code == 403
+
+    # Revoked, the scrape key is refused like any key.
+    assert c.delete(f"/v1/auth/client-keys/{scrape['id']}").status_code == 204
+    assert metrics_call(c, scrape["id"]).status_code == 401
+
+    with pytest.raises(ValueError):
+        admission.validate_limits({"readMetrics": 1})
+
+
 def search_call(client, key, action, request_id="s1", **extra):
     return client.post(
         "/v1/auth/client-keys/admission",

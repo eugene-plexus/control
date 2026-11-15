@@ -287,7 +287,7 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
     try:
         ledger = machine.state.client_admission
         purpose = getattr(body.purpose, "value", body.purpose)
-        if purpose in ("logs", "catalog") and (
+        if purpose in ("logs", "catalog", "metrics") and (
             body.action.value != "check" or body.model or body.personToken
         ):
             raise AdmissionRefusal(
@@ -305,7 +305,7 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
                 request_id=body.requestId,
                 model=body.model,
                 person_token=body.personToken,
-                app_metadata_only=purpose in ("logs", "catalog"),
+                app_metadata_only=purpose in ("logs", "catalog", "metrics"),
                 purpose=str(purpose or "inference"),
             )
         )
