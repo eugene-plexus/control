@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from enum import Enum, StrEnum
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import (
@@ -2590,14 +2590,13 @@ class HostSeries(BaseModel):
     max: list[float | None]
 
 
-class Power(Enum):
+class OperationsPower(StrEnum):
     """
-    The power the route needs. Absent on a read.
+    Row 39, as `control.yaml` names it.
     """
 
     operate_models = 'operate-models'
     operate_machines = 'operate-machines'
-    NoneType_None = None
 
 
 class OperationReport(BaseModel):
@@ -2609,8 +2608,9 @@ class OperationReport(BaseModel):
     )
     name: str = Field(..., description='The name to show for them.', max_length=64)
     owner: bool
-    power: Power | None = Field(
-        None, description='The power the route needs. Absent on a read.'
+    power: OperationsPower | None = Field(
+        None,
+        description='The power the route needs (`control.yaml` `OperationsPower`).',
     )
     action: str = Field(
         ...,
@@ -2627,12 +2627,6 @@ class OperationReport(BaseModel):
     )
 
 
-class Power1(Enum):
-    operate_models = 'operate-models'
-    operate_machines = 'operate-machines'
-    NoneType_None = None
-
-
 class OperationRecord(BaseModel):
     """
     One row of `OperationsLog`, an `OperationReport` with when and where.
@@ -2643,7 +2637,7 @@ class OperationRecord(BaseModel):
     personId: str
     name: str
     owner: bool
-    power: Power1 | None = None
+    power: OperationsPower | None = None
     action: str
     target: str
     status: int
