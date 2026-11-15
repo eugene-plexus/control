@@ -3666,6 +3666,20 @@ class OperationsToken(BaseModel):
     powers: list[OperationsPower]
 
 
+class MachineInScope(BaseModel):
+    name: str
+    label: str | None = None
+    kinds: list[str] = Field(
+        ...,
+        description='The kinds of component this machine runs (`gateway`, `library`, ...).',
+    )
+
+
+class OperationsMachineList(BaseModel):
+    machines: list[MachineInScope]
+    unreachableNodes: list[str]
+
+
 class AdministrationLoginRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',

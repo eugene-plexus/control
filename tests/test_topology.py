@@ -295,3 +295,25 @@ def test_a_search_account_is_a_component_and_an_unknown_kind_leaves_the_view_who
     assert response.status_code == 200, response.text
     kinds = {c["name"]: c["kind"] for c in response.json()["components"]}
     assert kinds == {"left": "inference-driver", "searx": "tool-driver"}
+
+
+def test_a_person_with_an_operations_power_sees_their_machines_and_what_runs_there(
+    active_client: TestClient, agent_a: _Server
+) -> None:
+    """Row 39: the console learns which machine serves what, within scope."""
+    from .test_administration import delegate
+
+    _enroll(active_client, "gpu-box", agent_a.url)
+    _enroll(active_client, "attic", "http://127.0.0.1:1")
+    _enroll(active_client, "elsewhere", "http://127.0.0.1:1")
+    _, auth = delegate(active_client, operateModels=True, operationsMachines=["gpu-box", "attic"])
+    response = active_client.get("/v1/auth/operations-machines", headers=auth)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [m["name"] for m in body["machines"]] == ["attic", "gpu-box"]
+    by_name = {m["name"]: m for m in body["machines"]}
+    assert by_name["gpu-box"]["kinds"] == ["inference-driver"]
+    assert by_name["attic"]["kinds"] == []
+    assert body["unreachableNodes"] == ["attic"]
+    # The owner's session, and a person with no operations power, are refused.
+    assert active_client.get("/v1/auth/operations-machines").status_code == 403

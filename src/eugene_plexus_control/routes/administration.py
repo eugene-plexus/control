@@ -15,11 +15,14 @@ from .._generated.models import (
     AdministrationLoginRequest,
     AdministrationLoginResponse,
     AdministrationSession,
+    MachineInScope,
+    OperationsMachineList,
     OperationsPower,
     OperationsToken,
     OperationsTokenRequest,
 )
 from ..administration import (
+    Administrator,
     DirectoryAdministrator,
     active,
     has_grants,
@@ -150,23 +153,8 @@ async def operations_token(
     powers, and the machine scope. The token is addressed to that one
     machine and carries the session it came from, so signing out ends it
     on every machine that can fetch the trust bundle."""
-    if admin.owner:
-        raise problem(
-            403,
-            "Owner session",
-            "The owner's console reaches every machine already. This exchange is for people "
-            "the owner gave an operations power.",
-        )
     machine = active(request)
-    person = machine.state.people.get(admin.claims.sub)
-    powers = operations_powers(person) if person is not None else []
-    if person is None or not powers:
-        raise problem(
-            403,
-            "No operations power",
-            "The owner has not given you an operations power (Models, or Updates and "
-            "restarts). The owner can, on Eugene's People page.",
-        )
+    person, powers = _operations_person(request, admin)
     name = body.machine
     if not operations_reach(person, name):
         raise problem(
@@ -204,6 +192,64 @@ async def operations_token(
         expiresAt=datetime.fromtimestamp(expires, UTC),
         machine=name,
         powers=[OperationsPower(p) for p in powers],
+    )
+
+
+def _operations_person(request: Request, admin: Administrator) -> tuple[dict[str, Any], list[str]]:
+    """The person behind a named session and their operations powers, or
+    the refusal: the owner's session, or a person with none."""
+    if admin.owner:
+        raise problem(
+            403,
+            "Owner session",
+            "The owner's console reaches every machine already. This is for people the owner "
+            "gave an operations power.",
+        )
+    person = active(request).state.people.get(admin.claims.sub)
+    powers = operations_powers(person) if person is not None else []
+    if person is None or not powers:
+        raise problem(
+            403,
+            "No operations power",
+            "The owner has not given you an operations power (Models, or Updates and "
+            "restarts). The owner can, on Eugene's People page.",
+        )
+    return person, powers
+
+
+@router.get("/v1/auth/operations-machines", response_model=OperationsMachineList)
+async def operations_machines(
+    request: Request, admin: DirectoryAdministrator, response: Response
+) -> OperationsMachineList:
+    """Row 39: the machines a person's operations powers reach, and the
+    kinds of component each runs, read live as `GET /v1/components` does."""
+    person, _ = _operations_person(request, admin)
+    machine = active(request)
+    from .nodes import service_token_for
+    from .topology import _targets
+
+    targets = [t for t in _targets(machine) if operations_reach(person, t[0])]
+    collected = await request.app.state.nodes_client.collect(
+        targets,
+        lambda node: service_token_for(request.app.state.auth_state, node),
+        path="/v1/components",
+        key="components",
+    )
+    kinds: dict[str, set[str]] = {name: set() for name, _ in targets}
+    for item in collected.items:
+        if isinstance(item.get("kind"), str) and item.get("node") in kinds:
+            kinds[str(item["node"])].add(item["kind"])
+    response.headers["Cache-Control"] = "no-store"
+    return OperationsMachineList(
+        machines=[
+            MachineInScope(
+                name=name,
+                label=machine.state.nodes[name].label,
+                kinds=sorted(kinds[name]),
+            )
+            for name, _ in targets
+        ],
+        unreachableNodes=sorted(collected.unreachable),
     )
 
 
