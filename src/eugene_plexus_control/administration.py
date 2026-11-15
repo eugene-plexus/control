@@ -167,3 +167,21 @@ async def require_administrator(
 
 
 DirectoryAdministrator = Annotated[Administrator, Depends(require_administrator)]
+
+
+def has_directory_grants(grants: AdministrationGrants) -> bool:
+    return bool(grants.managePeople or grants.manageGroups or grants.membershipGroups)
+
+
+async def require_directory_reader(admin: DirectoryAdministrator) -> Administrator:
+    """The owner, or a person with a directory grant (row 39).
+
+    A person the owner gave only operations powers runs machines; the
+    people, groups and apps of the install are not theirs to read."""
+    if not admin.owner and not has_directory_grants(admin.session.grants):
+        raise problem(
+            403,
+            "Not a directory administrator",
+            "Your access covers running machines, not people and groups.",
+        )
+    return admin

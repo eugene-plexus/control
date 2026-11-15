@@ -40,7 +40,10 @@ from .._generated.models import (
     PersonPasswordRequest,
     PersonUpdateRequest,
 )
-from ..administration import DirectoryAdministrator, require_administrator
+from ..administration import (
+    DirectoryAdministrator,
+    require_directory_reader,
+)
 from ..applied import (
     OP_DELETE_OIDC_CLIENT,
     OP_DELETE_PERMISSION_GROUP,
@@ -62,7 +65,7 @@ from ..dependencies import (
 from ..state_machine import StateMachine
 from .administration import revoke_operations
 
-router = APIRouter(tags=["people"], dependencies=[Depends(require_administrator)])
+router = APIRouter(tags=["people"], dependencies=[Depends(require_directory_reader)])
 # Registering and removing an app's sign-in is also what installing an app on
 # another machine does, so these two take a node acting for the operator as
 # well, confined to that node's own apps (`require_operator_or_acting_node`).

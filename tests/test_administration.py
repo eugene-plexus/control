@@ -393,6 +393,11 @@ def test_operations_powers_alone_sign_in_but_manage_no_one(active_client: TestCl
         == 403
     )
     assert c.post("/v1/permission-groups", headers=auth, json={"name": "Y"}).status_code == 403
+    # Running machines is not reading the directory (no role sees everything).
+    for route in ("/v1/people", "/v1/permission-groups", "/v1/oidc/clients"):
+        refused = c.get(route, headers=auth)
+        assert refused.status_code == 403, route
+        assert "people and groups" in _why(refused)
 
 
 @pytest.mark.parametrize("change", ["grants", "disable", "password", "delete", "logout"])
