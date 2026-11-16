@@ -338,15 +338,16 @@ def group_claims(state: Any, sub: str) -> dict[str, Any]:
     """`eugene_groups` and `eugene_policies` (row 70), from the root's state
     now: the person's groups as `{id, name}`, and the policies in effect
     (`PoliciesInEffect`). Eugene's owner is in no group. Only for a
-    registered app, which the person may use (`still_valid`, `may_use`)."""
-    from .permissions import effective_policies, groups_in_effect
+    registered app, which the person may use (`still_valid`, `may_use`).
+    The row 37 policies stay out of the claim (`claim_policies`)."""
+    from .permissions import claim_policies, groups_in_effect
 
     person = state.people.get(sub)
     if person is None:
         return {"eugene_groups": [], "eugene_policies": {}}
     return {
         "eugene_groups": groups_in_effect(state, person),
-        "eugene_policies": effective_policies(state, person),
+        "eugene_policies": claim_policies(state, person),
     }
 
 

@@ -46,13 +46,40 @@ MUTATIONS = [
         "current = code_subject or oidc.still_valid(",
         "test_group_revocation_between_approval_and_code_exchange",
     ),
+    # Row 37: models and routing come from the person's active group only.
+    (
+        "active-group-choice-ignored",
+        "permissions.py",
+        'if group["id"] == chosen:',
+        "if False:",
+        "test_a_person_cannot_pick_a_group_they_are_not_in",
+    ),
+    (
+        "any-group-may-be-chosen",
+        "routes/people.py",
+        'elif chosen not in (record.get("groups") or []):',
+        "elif False:",
+        "test_a_person_cannot_pick_a_group_they_are_not_in",
+    ),
+    (
+        "older-console-clears-routing",
+        "routes/people.py",
+        "merged = {p: v for p, v in kept.items() if p not in sent}",
+        "merged = {}",
+        "test_routing_and_models_are_kept_by_a_row_70_console",
+    ),
 ]
 
 
 def main() -> None:
     base = Path(tempfile.mkdtemp(prefix="ep-u1-sabotage-"))
     failures = []
+    # Labels named on the command line run alone (row 37: some older anchors
+    # have moved since this script last ran; their checks are not this row's).
+    wanted = set(sys.argv[1:])
     for label, filename, before, after, test in MUTATIONS:
+        if wanted and label not in wanted:
+            continue
         copy = base / label
         shutil.copytree(ROOT / "src", copy / "src", ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(

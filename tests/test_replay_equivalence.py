@@ -74,6 +74,7 @@ from eugene_plexus_control.applied import (
     OP_SET_MODEL_PRICE,
     OP_SET_NODE_CERTIFICATE_NAMES,
     OP_SET_OIDC_CLIENT_REDIRECTS,
+    OP_SET_PERSON_ACTIVE_GROUP,
     OP_SET_PERSON_PASSWORD,
     OP_SET_SITE_DEV_GRANTS,
     OP_SET_SITE_HOST,
@@ -131,6 +132,7 @@ EXERCISED_OPS = {
     OP_PUT_PERMISSION_GROUP,
     OP_DELETE_PERMISSION_GROUP,
     OP_SET_PERSON_PASSWORD,
+    OP_SET_PERSON_ACTIVE_GROUP,
     OP_DELETE_PERSON,
     OP_PUT_OIDC_CLIENT,
     OP_DELETE_OIDC_CLIENT,
@@ -544,6 +546,24 @@ def _write_history(machine: StateMachine) -> bytes:
                 }
             },
         )
+    # Row 37: a member's own choice of active group (its own entry), then the
+    # group's deletion clearing it.
+    machine.append(
+        OP_PUT_PERSON,
+        {
+            "person": {
+                "id": "p-gwen",
+                "name": "Gwen",
+                "passwordVerifier": verifier,
+                "apps": None,
+                "groups": ["retained-group", "deleted-group"],
+                "disabled": False,
+                "createdAt": when,
+                "passwordChangedAt": when,
+            }
+        },
+    )
+    machine.append(OP_SET_PERSON_ACTIVE_GROUP, {"id": "p-gwen", "activeGroup": "deleted-group"})
     machine.append(OP_DELETE_PERMISSION_GROUP, {"id": "deleted-group"})
     machine.append(
         OP_SET_OIDC_CLIENT_REDIRECTS,

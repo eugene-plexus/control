@@ -56,3 +56,13 @@ def queue_band(state: Any, identity: dict[str, str]) -> dict[str, str]:
     person = state.people.get(identity.get("personId") or "")
     band = effective_policies(state, person).get("queueBand") if person else None
     return {"queueBand": band} if band else {}
+
+
+def model_policies(state: Any, identity: dict[str, str]) -> dict[str, Any]:
+    """Row 37: the verified person's `roleRouting`, `allowedModels` and the
+    `modelGroup` they come from (their active group), or nothing: no person,
+    or that group sets neither. Read from the root's state at each check,
+    never from the caller."""
+    from .permissions import model_policies as of_person
+
+    return of_person(state, state.people.get(identity.get("personId") or ""))

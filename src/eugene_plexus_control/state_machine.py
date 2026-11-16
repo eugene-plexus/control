@@ -331,7 +331,7 @@ class StateMachine:
         from . import usage as counts
         from .applied import OP_PUT_CLIENT_ADMISSION, OP_TOUCH_CLIENT_KEY
         from .client_admission import decide, lineage_of
-        from .person_access import check, queue_band
+        from .person_access import check, model_policies, queue_band
 
         with self._lock:
             if self._role != ROLE_ACTIVE:
@@ -376,6 +376,15 @@ class StateMachine:
                     now=wall,
                     money=False,
                 )
+            models = model_policies(self._state, identity)
+            # Row 37: the person's model lists are a permission, so a running
+            # request is bound to them as to the key's limits; routing and the
+            # band are not, so changing them never cuts one.
+            bound = (
+                {**identity, "modelLimits": models["modelLimits"]}
+                if "modelLimits" in models
+                else identity
+            )
             result, candidate = decide(
                 ledger,
                 self._state.client_keys.get(key_id),
@@ -384,7 +393,7 @@ class StateMachine:
                 request_id=request_id,
                 model=model,
                 now=clock.now(ledger["clock"]),
-                principal=identity,
+                principal=bound,
                 purpose=purpose,
             )
             used = _minute_after(key, action)
@@ -450,7 +459,7 @@ class StateMachine:
             elif used is not None:
                 # A check writes at most one entry a minute for each key.
                 self.append(OP_TOUCH_CLIENT_KEY, {"id": key_id, "usedAt": used})
-            return {**result, **identity, **queue_band(self._state, identity)}
+            return {**result, **identity, **queue_band(self._state, identity), **models}
 
     def first_available_index(self) -> int:
         with self._lock:

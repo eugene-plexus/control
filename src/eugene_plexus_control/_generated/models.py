@@ -1020,6 +1020,58 @@ class Purpose(StrEnum):
     metrics = 'metrics'
 
 
+class RoleRouting1Item(RootModel[str]):
+    root: str = Field(..., max_length=256, min_length=1)
+
+
+class RoleRouting1(RootModel[list[RoleRouting1Item]]):
+    root: list[RoleRouting1Item] = Field(..., max_length=16, min_length=1)
+
+
+class RoleRouting(RootModel[dict[str, RoleRouting1]]):
+    """
+    Row 37: for each model role, the models a person's requests for
+    `role:<role>` try, in order. A role not named here uses the
+    install's slot (`modelSlots`). The keys are `ModelRole` values
+    (`components/common.yaml`); a root refuses any other.
+
+    """
+
+    root: dict[str, RoleRouting1] = Field(..., max_length=16)
+
+
+class ModelGroup(BaseModel):
+    """
+    A permission group, as a refusal names it (row 37).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(..., max_length=80, min_length=1)
+
+
+class Model(RootModel[str]):
+    root: str = Field(..., max_length=256, min_length=1)
+
+
+class GroupModelLimit(BaseModel):
+    """
+    One group's model list, as it limits a person (row 37).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    group: ModelGroup
+    models: list[Model] = Field(
+        ...,
+        description='Exact ids or patterns with `*`, at most 8 `*` in one entry. Empty allows none.',
+        max_length=64,
+    )
+
+
 class AdmissionRefusalReason(StrEnum):
     """
     Why an `acquire` was refused with a 429, in its
@@ -3413,7 +3465,7 @@ class StandbyStatus(BaseModel):
     )
     logVersion: int | None = Field(
         None,
-        description="The log version the standby applies, from the\n`Eugene-Plexus-Log-Version` header of its last pull (row 5);\n0 when its pull carried none (a standby older than row 5).\nAbsent until it has pulled since this root started. Log\nversion 1 adds `retireOidcKeys` and `changePassphrase`: this\nroot refuses to write either while its standby reports less,\nbecause the standby's copy would stop there.\n",
+        description="The log version the standby applies, from the\n`Eugene-Plexus-Log-Version` header of its last pull (row 5);\n0 when its pull carried none (a standby older than row 5).\nAbsent until it has pulled since this root started. Log\nversion 1 adds `retireOidcKeys` and `changePassphrase`: this\nroot refuses to write either while its standby reports less,\nbecause the standby's copy would stop there. Log version 4\n(row 37) adds `setPersonActiveGroup`, and the group and person\nfields of row 37, under the same rule.\n",
         ge=0,
     )
 
@@ -3439,6 +3491,16 @@ class LogOp(StrEnum):
     or clears (`price` null) the owner's rate for one model:
     `{model, price}`. Log version 3, not 2: row 38's `setAlerting` is 2,
     and a standby with row 38 alone must not be sent row 40's op.
+
+    **`setPersonActiveGroup` (row 37, log version 4)** sets one
+    person's `activeGroup` and nothing else of their record: `{id,
+    activeGroup}`, where `activeGroup` is one of their groups or null.
+    It is how a person's own choice at `/oidc/active-group` is written,
+    applied to the record as it is then, so a choice cannot write back
+    anything the owner changed meanwhile. Log version 4 also covers a
+    group record that sets `roleRouting` or `allowedModels` and a person
+    record with `activeGroup`: the root refuses to write any of them
+    (409) while its standby reports a log version below 4.
 
     **`retireOidcKeys` (row 5, log version 1)** keeps only the sign-in
     keys named in `keep` (`{keep: [kid]}`, at least one held key) and
@@ -3581,6 +3643,7 @@ class LogOp(StrEnum):
     changePassphrase = 'changePassphrase'
     setModelPrice = 'setModelPrice'
     setAlerting = 'setAlerting'
+    setPersonActiveGroup = 'setPersonActiveGroup'
 
 
 class Group(RootModel[str]):
@@ -3768,6 +3831,12 @@ class PersonCreateRequest(BaseModel):
 class PersonUpdateRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
+    )
+    activeGroup: str | None = Field(
+        None,
+        description='Row 37, owner only: the group whose routing by role the person\nworks from, one of their groups after this change; null for the\nfirst in their list. A group they are not in is refused (422).\n',
+        max_length=64,
+        min_length=1,
     )
     groups: list[Group] | None = Field(
         None,
@@ -4191,12 +4260,31 @@ class GroupPolicies(BaseModel):
     Policies a permission group sets for its members (row 70). Not set
     is no policy: a person whose groups set none gets the install's
     default. A person in several groups gets the most generous value of
-    each: the highest queue band, the larger percent.
+    each: the highest queue band, the larger percent. `roleRouting`
+    (row 37) is not combined: it comes from the person's active group
+    alone (`Person.activeGroup`). `allowedModels` narrows: a model must
+    be in the list of every group of theirs that sets one (call
+    R37-SELF, Choice 3).
+
+    In a write, a policy left out keeps the group's current value and
+    `null` clears it (rows 37 and 40), so a console that predates a
+    policy never clears it. The root refuses to write a group that sets
+    `roleRouting` or `allowedModels` while its standby reports a log
+    version below 4 (row 37).
 
     """
 
     model_config = ConfigDict(
         extra='forbid',
+    )
+    roleRouting: RoleRouting | None = Field(
+        None,
+        description="Row 37: the models the members' requests for each role try, in\norder. A role not named, or null, uses the install's routing.\nEvery model listed must be in this group's own `allowedModels`\nwhen it sets one (a write that breaks this is a 422). Models\noutside a member's allowed set are dropped when a request runs;\na role whose list keeps none uses the install's list, filtered.\n",
+    )
+    allowedModels: list[AllowedModel] | None = Field(
+        None,
+        description="Row 37: the models the members may reach: exact ids or patterns\nwith `*` (at most 8 in one entry). Null is every model. A member\nin several groups reaches only models every such list allows, and\nan app key's own `allowedModels` still applies too. Changes apply\nto a member's next request.\n",
+        max_length=64,
     )
     queueBand: QueueBand | None = Field(
         None,
@@ -4319,6 +4407,38 @@ class PoliciesSetBy(BaseModel):
     )
     queueBand: list[str] | None = Field(None, max_length=64)
     summaryContextPercent: list[str] | None = Field(None, max_length=64)
+    roleRouting: list[str] | None = Field(
+        None,
+        description='Row 37. The active group, when it routes a role.',
+        max_length=1,
+    )
+
+
+class ActiveGroupRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    group: str | None = Field(
+        ...,
+        description="One of the person's groups, or null for the first in their list.",
+        max_length=64,
+        min_length=1,
+    )
+
+
+class ActiveGroupState(BaseModel):
+    groups: list[OidcGroup] = Field(
+        ...,
+        description="The person's groups, in the order the owner lists them.",
+        max_length=64,
+    )
+    activeGroup: str | None = Field(
+        None, description='The group they chose; null when they chose none.'
+    )
+    inEffect: str | None = Field(
+        None,
+        description='The group whose models and routing apply now; null with no group.',
+    )
 
 
 class AlertRuleKind(StrEnum):
@@ -5270,6 +5390,15 @@ class ClientKeyUpdateRequest(BaseModel):
 
 
 class ClientAdmissionResult(BaseModel):
+    """
+    Row 37: an agent or gateway from before row 37 refuses an answer that
+    carries `roleRouting`, `routingGroup` or `modelLimits` (its model
+    forbids unknown fields), so a person whose groups set them is refused
+    there until that machine is updated: it fails closed, never open.
+    The root sends them only when a group sets them.
+
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -5290,6 +5419,19 @@ class ClientAdmissionResult(BaseModel):
     queueBand: QueueBand | None = Field(
         None,
         description="The verified person's queue band from their permission groups\n(row 70): the highest band any of their groups sets. Present only\nwhen the root verified a person (`personId`) and one of their\ngroups sets a band. Absent for a key with no person, a release, or\na person whose groups set none: the key's own band, or the\ninstall's default, applies. Never taken from the caller.\n",
+    )
+    roleRouting: RoleRouting | None = Field(
+        None,
+        description="The verified person's routing by model role (row 37), from their\nactive group (`Person.activeGroup`). Present only when the root\nverified a person and that group routes at least one role. A\nrequest for `role:<role>` that this names tries these models in\norder, after the gateway drops every model outside the allowed\nset (`modelLimits` and the key's list); a role it does not name\nuses the install's slot. Absent: the\ninstall's routing for every role, as before row 37. Never taken\nfrom the caller.\n",
+    )
+    routingGroup: ModelGroup | None = Field(
+        None,
+        description="The group `roleRouting` comes from (row 37): the person's active\ngroup. Present with `roleRouting`.\n",
+    )
+    modelLimits: list[GroupModelLimit] | None = Field(
+        None,
+        description="Row 37 (call R37-SELF, Choice 3): the model list of every group\nthe verified person is in that sets one, sorted by group name. A\nmodel is allowed only when the key's own `allowedModels` and\nevery list here allow it, for the model asked for, every fallback\nand every model a server-run tool calls; the person's choice of\nactive group never widens it. A `role:<role>` name is not checked\nagainst these lists: the role's models are. Absent when no group\nof theirs sets a list: no limit beyond the key's.\n",
+        max_length=64,
     )
 
 
@@ -5931,6 +6073,12 @@ class SnapshotSite(BaseModel):
 
 
 class SnapshotPerson(BaseModel):
+    activeGroup: str | None = Field(
+        None,
+        description="Row 37: the one of their `groups` whose `roleRouting` applies to\nthem (every group's `allowedModels` applies, call R37-SELF).\nAbsent is the first in their list. Kept only when set; a standby from before row 37 cannot\napply a person who has one. Cleared when they leave the group.\n",
+        max_length=64,
+        min_length=1,
+    )
     administration: AdministrationGrants | None = None
     administrationVersion: int | None = Field(
         None,
@@ -6026,7 +6174,7 @@ class PermissionGroupWrite(BaseModel):
     permissions: list[PersonPermission] | None = Field([], max_length=16)
     policies: GroupPolicies | None = Field(
         None,
-        description="The group's policies: a policy set inside is set, a `null` one is\ncleared, and an absent one keeps its current value (row 40), so a\nconsole that predates a policy never clears it. Omitted from a\nreplace, the group keeps every current policy. Omitted from a\ncreate, the group sets none. An older root refuses this field\n(`additionalProperties: false`).\n",
+        description="The group's policies: a policy set inside is set, a `null` one is\ncleared, and an absent one keeps its current value (rows 37 and 40), so a\nconsole that predates a policy never clears it. Omitted from a\nreplace, the group keeps every current policy. Omitted from a\ncreate, the group sets none. An older root refuses this field\n(`additionalProperties: false`).\n",
     )
 
 
@@ -6069,8 +6217,12 @@ class PoliciesInEffect(BaseModel):
     """
     The policies that apply to a person now (row 70), from the groups
     they are in: the most generous value of each. An absent value is no
-    policy. Individual access (`groups` null) sets none. The same object
-    is the `eugene_policies` sign-in claim.
+    policy. Individual access (`groups` null) sets none. The
+    `eugene_policies` sign-in claim is this object without the row 37
+    fields (`activeGroup`, `roleRouting`, `modelLimits` and their
+    `setBy`): an app reads its routing from the gateway, and a
+    Workbench from before row 37 refuses a claim with fields it does
+    not know.
 
     """
 
@@ -6079,6 +6231,19 @@ class PoliciesInEffect(BaseModel):
     )
     queueBand: QueueBand | None = None
     summaryContextPercent: int | None = Field(None, ge=50, le=95)
+    activeGroup: str | None = Field(
+        None,
+        description="Row 37: the group `roleRouting` comes from: the person's chosen\n`activeGroup`, else the first of their `groups` that exists.\nPresent only when that group routes a role; `/oidc/active-group`\nalways says which group is in effect.\n",
+    )
+    roleRouting: RoleRouting | None = Field(
+        None,
+        description="Row 37. The active group's routing by role. Absent is the install's.",
+    )
+    modelLimits: list[GroupModelLimit] | None = Field(
+        None,
+        description='Row 37 (call R37-SELF, Choice 3): each group of theirs that sets a\nmodel list, with its list, sorted by group name. A model must be\nin every one. Absent is every model.\n',
+        max_length=64,
+    )
     setBy: PoliciesSetBy | None = None
 
 
@@ -6862,6 +7027,12 @@ class Person(BaseModel):
     """
 
     administration: AdministrationGrants | None = None
+    activeGroup: str | None = Field(
+        None,
+        description="Row 37: the one of their `groups` whose `roleRouting` applies to\nthem (every group's `allowedModels` applies, call R37-SELF).\nAbsent is the first in their list. Kept only when set; a standby from before row 37 cannot\napply a person who has one. Cleared when they leave the group.\n",
+        max_length=64,
+        min_length=1,
+    )
     groups: list[Group] | None = Field(
         None,
         description='Null or absent keeps individual access. A list uses only the union of these groups; an empty list grants no access. Individual app/permission settings are retained but inactive in group mode.',

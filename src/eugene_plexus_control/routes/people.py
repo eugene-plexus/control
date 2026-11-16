@@ -200,15 +200,64 @@ def _group_policies(body: PermissionGroupWrite, existing: dict[str, Any] | None)
         return {}
     chosen = body.policies.model_dump(mode="json", exclude_none=True)
     sent = body.policies.model_fields_set
-    return {
+    merged = {
         policy: chosen[policy] if policy in sent else kept[policy]
         for policy in _POLICIES
         if (policy in sent and policy in chosen) or (policy not in sent and policy in kept)
     }
+    if merged.get("roleRouting") == {}:
+        # No role routed is no policy, as the log keeps it.
+        del merged["roleRouting"]
+    _check_role_routing(merged.get("roleRouting"))
+    allowed = merged.get("allowedModels")
+    if allowed is not None:
+        if len(set(allowed)) != len(allowed):
+            raise problem(422, "Repeated model", "The group's models list a model twice.")
+        crowded = [m for m in allowed if m.count("*") > permissions.MAX_STARS]
+        if crowded:
+            raise problem(
+                422,
+                "Too many *",
+                f"{crowded[0]} has more than {permissions.MAX_STARS} *. Use fewer.",
+            )
+        # Row 37 review (settings never lie): a route to a model the group's
+        # own list leaves out would be shown as the route and never taken.
+        from ..client_admission import model_permitted
+
+        for role, models in (merged.get("roleRouting") or {}).items():
+            outside = [m for m in models if not model_permitted(allowed, m)]
+            if outside:
+                raise problem(
+                    422,
+                    "Route outside the group's models",
+                    f"The role {role} lists {outside[0]}, which this group's models do not "
+                    "include. Add it to the models, or take it out of the role.",
+                )
+    return merged
+
+
+def _check_role_routing(routing: dict[str, Any] | None) -> None:
+    """Row 37: only `ModelRole` names, each with distinct models. The
+    contract's own bounds (1-16 models, ids of 1-256) are checked before."""
+    from .._generated.models import ModelRole
+
+    if routing is None:
+        return
+    roles = {role.value for role in ModelRole}
+    unknown = sorted(set(routing) - roles)
+    if unknown:
+        raise problem(
+            422,
+            "Unknown role",
+            f"{', '.join(unknown)} is not a model role. Roles: {', '.join(sorted(roles))}.",
+        )
+    for role, models in routing.items():
+        if len(set(models)) != len(models):
+            raise problem(422, "Repeated model", f"The role {role} lists a model twice.")
 
 
 def _group_write(
-    machine: StateMachine, body: PermissionGroupWrite, group_id: str
+    request: Request, machine: StateMachine, body: PermissionGroupWrite, group_id: str
 ) -> dict[str, Any]:
     name = body.name.strip()
     if not name:
@@ -230,6 +279,10 @@ def _group_write(
         "updatedAt": when,
     }
     policies = _group_policies(body, existing)
+    if policies.keys() & set(permissions.ROW_37_POLICIES):
+        behind = permissions.standby_behind(request.app)
+        if behind is not None:
+            raise problem(409, "Update the standby first", permissions.standby_refusal(behind))
     if policies:
         # Kept only when a policy is set: a group with none writes the same
         # record a root before row 70 wrote, which an older standby applies.
@@ -250,7 +303,7 @@ async def create_group(
 ) -> PermissionGroup:
     admin.require("manageGroups")
     machine = _active(request)
-    record = _group_write(machine, body, uuid.uuid4().hex)
+    record = _group_write(request, machine, body, uuid.uuid4().hex)
     standby_can_hold(request.app, record.get("policies"))
     machine.append(OP_PUT_PERMISSION_GROUP, {"group": record}, actor=admin.claims.sub)
     admin.audit("create-group", record["id"])
@@ -264,7 +317,7 @@ async def replace_group(
     admin.require("manageGroups")
     machine = _active(request)
     before = _group(machine, group_id)
-    record = _group_write(machine, body, group_id)
+    record = _group_write(request, machine, body, group_id)
     if record.get("policies") != before.get("policies"):
         # Row 40: an allowance stops a standby a release behind; say so first.
         standby_can_hold(request.app, record.get("policies"))
@@ -342,11 +395,12 @@ async def update_person(
     changes = body.model_dump(exclude_unset=True)
     admin.ordinary_account(record)
     if not admin.owner:
-        if changes.keys() & {"apps", "permissions", "email"}:
+        if changes.keys() & {"apps", "permissions", "email", "activeGroup"}:
             raise problem(
                 403,
                 "Owner required",
-                "Only the owner can change individual access or an account's email identity.",
+                "Only the owner can change individual access, an account's email identity "
+                "or the group it works from.",
             )
         if changes.keys() & {"displayName", "disabled"}:
             admin.require("managePeople")
@@ -366,6 +420,24 @@ async def update_person(
             record.pop("email", None)
     if "groups" in changes:
         record["groups"] = _check_groups(machine, changes["groups"])
+    if "activeGroup" in changes:
+        chosen = changes["activeGroup"]
+        if chosen is None:
+            record.pop("activeGroup", None)
+        elif chosen not in (record.get("groups") or []):
+            raise problem(
+                422,
+                "Not one of their groups",
+                "Choose a group this person is in, or none for the first in their list.",
+            )
+        else:
+            behind = permissions.standby_behind(request.app)
+            if behind is not None:
+                raise problem(409, "Update the standby first", permissions.standby_refusal(behind))
+            record["activeGroup"] = chosen
+    if record.get("activeGroup") not in (record.get("groups") or []):
+        # Row 37: they left the group they worked from; back to the first.
+        record.pop("activeGroup", None)
     if "apps" in changes:
         record["apps"] = _check_apps(machine, changes["apps"])
     if "permissions" in changes:

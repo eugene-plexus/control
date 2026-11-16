@@ -94,8 +94,38 @@ def apps_in_effect(state: Any, person: dict[str, Any]) -> list[str] | None:
 QUEUE_BANDS: tuple[str, ...] = ("sheddable", "background", "interactive")
 SUMMARY_PERCENT_MIN = 50
 SUMMARY_PERCENT_MAX = 95
+#: The policies combined across all of a person's groups, most generous wins (row 70).
+GENEROUS_POLICIES: tuple[str, ...] = ("queueBand", "summaryContextPercent")
+#: Row 37: routing (from the active group alone) and the model list (every group narrows).
+ROW_37_POLICIES: tuple[str, ...] = ("roleRouting", "allowedModels")
 #: The policies a group may set (`GroupPolicies`).
-GROUP_POLICIES: tuple[str, ...] = ("queueBand", "summaryContextPercent")
+GROUP_POLICIES: tuple[str, ...] = GENEROUS_POLICIES + ROW_37_POLICIES
+#: Row 37: at most this many models in a role's list, and in a group's model list.
+MAX_ROLE_MODELS = 16
+MAX_ALLOWED_MODELS = 64
+MAX_MODEL_ID = 256
+#: Row 37 review: at most this many `*` in one model-list entry.
+MAX_STARS = 8
+
+
+def standby_behind(app: Any) -> str | None:
+    """Row 37: the standby's node when it applies a log version below row
+    37's, so a group record with `roleRouting` or `allowedModels`, a person
+    with `activeGroup`, or a `setPersonActiveGroup` entry would stop its
+    copy; None otherwise (row 5's rule, as row 38's alerts)."""
+    from .applied import ROW_37_LOG_VERSION
+    from .routes.control import standby_short_of
+
+    return standby_short_of(app, ROW_37_LOG_VERSION)
+
+
+def standby_refusal(node: str) -> str:
+    return (
+        f"The standby on {node} is older than this root and could not copy a group's models "
+        "or routing, or a person's chosen group. Update it, then save again."
+    )
+
+
 #: At most this many groups in the `eugene_groups` claim (`Person.groups`'s own bound).
 MAX_CLAIM_GROUPS = 64
 
@@ -111,8 +141,12 @@ def _generosity(policy: str, value: Any) -> int:
 def effective_policies(state: Any, person: dict[str, Any]) -> dict[str, Any]:
     """The group policies that apply to `person` now, as `PoliciesInEffect`.
 
-    The most generous value of each policy across the groups they are in:
-    the highest queue band, the larger summary percent. `setBy` names every
+    The most generous value of each row 70 policy across the groups they are
+    in: the highest queue band, the larger summary percent. Row 37's
+    `roleRouting` comes from their active group alone (`active_group`),
+    which `activeGroup` names; `modelLimits` holds the model list of every
+    group of theirs that sets one (call R37-SELF, Choice 3: a model must be
+    in all of them, whichever group they work from). `setBy` names every
     group that sets the value in effect, sorted by group name. A policy no
     group sets is absent: the reader's default applies. Individual access
     (`groups` null) takes no group's policy; a group id the state no longer
@@ -122,7 +156,7 @@ def effective_policies(state: Any, person: dict[str, Any]) -> dict[str, Any]:
     groups = _by_name(_groups(state, person))
     found: dict[str, Any] = {}
     set_by: dict[str, list[str]] = {}
-    for policy in GROUP_POLICIES:
+    for policy in GENEROUS_POLICIES:
         values = [
             (g["id"], value)
             for g in groups
@@ -134,8 +168,81 @@ def effective_policies(state: Any, person: dict[str, Any]) -> dict[str, Any]:
         winners = [(gid, value) for gid, value in values if _generosity(policy, value) == best]
         found[policy] = winners[0][1]
         set_by[policy] = [gid for gid, _ in winners]
+    # Row 37 (R37-FIRST): routing is one group's, never merged. `activeGroup`
+    # is said only when it routes a role, so a person whose groups set
+    # nothing of row 37 reads exactly what a root before row 37 said.
+    active = active_group(state, person)
+    routing = (active.get("policies") or {}).get("roleRouting") if active else None
+    if active is not None and routing is not None:
+        found["activeGroup"] = active["id"]
+        found["roleRouting"] = routing
+        set_by["roleRouting"] = [active["id"]]
+    limits = model_limits(state, person)
+    if limits:
+        found["modelLimits"] = [
+            {"group": {"id": g["id"], "name": g["name"]}, "models": g["models"]} for g in limits
+        ]
     if set_by:
         found["setBy"] = set_by
+    return found
+
+
+def active_group(state: Any, person: dict[str, Any]) -> dict[str, Any] | None:
+    """The group whose `roleRouting` applies to `person` (row 37): the one
+    they chose, while they are still in it, else the first
+    of their groups (in their list's order) the state still has. None for
+    individual access or no group."""
+    groups = _groups(state, person)
+    chosen = person.get("activeGroup")
+    for group in groups:
+        if group["id"] == chosen:
+            return group
+    return groups[0] if groups else None
+
+
+def claim_policies(state: Any, person: dict[str, Any]) -> dict[str, Any]:
+    """`eugene_policies` for the sign-in claims: `effective_policies` with
+    only the row 70 policies. A Workbench from before row 37 refuses the
+    claim when it holds a field it does not know, and an app reads its
+    routing from the gateway, not from its claims."""
+    found = effective_policies(state, person)
+    kept: dict[str, Any] = {p: found[p] for p in GENEROUS_POLICIES if p in found}
+    set_by = {p: ids for p, ids in (found.get("setBy") or {}).items() if p in GENEROUS_POLICIES}
+    if set_by:
+        kept["setBy"] = set_by
+    return kept
+
+
+def model_limits(state: Any, person: dict[str, Any]) -> list[dict[str, Any]]:
+    """Row 37 (call R37-SELF, Choice 3): `{id, name, models}` for every group
+    of `person`'s that sets a model list, sorted by name. A model is theirs
+    only when every list allows it, so choosing another active group never
+    widens it; a group with no list adds no limit."""
+    return [
+        {"id": g["id"], "name": g["name"], "models": list(models)}
+        for g in _by_name(_groups(state, person))
+        if (models := (g.get("policies") or {}).get("allowedModels")) is not None
+    ]
+
+
+def model_policies(state: Any, person: dict[str, Any] | None) -> dict[str, Any]:
+    """Row 37: what the admission answer carries for a verified person:
+    `roleRouting` and the `routingGroup` it comes from (their active group),
+    and `modelLimits` (every group's list), each only when set. Read from the
+    root's state at each check."""
+    if person is None:
+        return {}
+    found: dict[str, Any] = {}
+    group = active_group(state, person)
+    routing = (group.get("policies") or {}).get("roleRouting") if group else None
+    if group is not None and routing is not None:
+        found["roleRouting"] = routing
+        found["routingGroup"] = {"id": group["id"], "name": group["name"]}
+    limits = model_limits(state, person)
+    if limits:
+        found["modelLimits"] = [
+            {"group": {"id": g["id"], "name": g["name"]}, "models": g["models"]} for g in limits
+        ]
     return found
 
 

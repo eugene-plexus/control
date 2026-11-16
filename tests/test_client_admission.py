@@ -585,3 +585,111 @@ def test_a_check_with_a_model_applies_allowed_models(active_client):
     assert bare.status_code == 200
     # Nothing was taken: the key's whole allowance is still there.
     assert call(c, key, "acquire", "after").status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# row 37: a verified person's routing and models, from their active group
+# --------------------------------------------------------------------------- #
+
+
+def _model_group(client, name, **policies):
+    from tests.test_permission_groups import group
+
+    made = group(client, name=name, apps=None, policies=policies)
+    for policy, value in policies.items():
+        assert made["policies"][policy] == value
+    return made
+
+
+def test_a_verified_person_carries_routing_and_allowed_models(active_client):
+    from tests.test_person_access import call as person_call
+    from tests.test_person_access import setup
+
+    c = active_client
+    _, g, p, signed, key = setup(c)
+    proof = signed["access_token"]
+    # In a group that sets neither: nothing, so the install's routing applies.
+    plain = person_call(c, key, proof).json()
+    assert not {"roleRouting", "routingGroup", "modelLimits"} & set(plain)
+    sales = _model_group(c, "Sales", roleRouting={"chat": ["m2", "m1"]}, allowedModels=["m1", "m2"])
+    ops = _model_group(c, "Ops", roleRouting={"chat": ["m3"]}, allowedModels=["m3", "m1"])
+    c.patch(f"/v1/people/{p['id']}", json={"groups": [sales["id"], ops["id"], g["id"]]})
+    limits = [
+        {"group": {"id": ops["id"], "name": "Ops"}, "models": ["m3", "m1"]},
+        {"group": {"id": sales["id"], "name": "Sales"}, "models": ["m1", "m2"]},
+    ]
+    for action in ("check", "acquire", "renew"):
+        answer = person_call(c, key, proof, action)
+        assert answer.status_code == 200, answer.text
+        body = answer.json()
+        assert body["roleRouting"] == {"chat": ["m2", "m1"]}, action
+        assert body["routingGroup"] == {"id": sales["id"], "name": "Sales"}, action
+        assert body["modelLimits"] == limits, action
+    # The person's choice moves the routing, read at each check, not at sign-in;
+    # every group's model list still applies (R37-SELF, Choice 3).
+    chose = c.patch(f"/v1/people/{p['id']}", json={"activeGroup": ops["id"]})
+    assert chose.status_code == 200, chose.text
+    now = person_call(c, key, proof, request_id="next").json()
+    assert now["roleRouting"] == {"chat": ["m3"]} and now["routingGroup"]["name"] == "Ops"
+    assert now["modelLimits"] == limits
+    # A model list is a permission: changing it ends a running lease.
+    assert person_call(c, key, proof, "acquire", request_id="cut").status_code == 200
+    edited = c.put(
+        f"/v1/permission-groups/{ops['id']}",
+        json={"name": "Ops", "apps": None, "policies": {"allowedModels": ["m3", "m4"]}},
+    )
+    assert edited.status_code == 200, edited.text
+    assert person_call(c, key, proof, "renew", request_id="cut").status_code == 409
+    # A caller cannot name its own models or routing.
+    for forged in ({"modelLimits": []}, {"roleRouting": {"chat": ["m9"]}}):
+        refused = c.post(
+            "/v1/auth/client-keys/admission",
+            json={
+                "keyId": key,
+                "requestId": "f",
+                "action": "check",
+                "personToken": proof,
+                **forged,
+            },
+        )
+        assert refused.status_code == 422
+
+
+def test_a_key_without_a_person_carries_neither(active_client):
+    from tests.test_permission_groups import person
+
+    c = active_client
+    sales = _model_group(c, "Sales", roleRouting={"chat": ["m1"]}, allowedModels=["m1"])
+    person(c, groups=[sales["id"]])
+    key = mint(c)["key"]["id"]
+    for action in ("check", "acquire", "renew", "release"):
+        answer = call(c, key, action)
+        assert answer.status_code == 200, answer.text
+        assert not {"roleRouting", "routingGroup", "modelLimits", "personId"} & set(answer.json())
+
+
+def test_a_pattern_is_matched_in_linear_time():
+    """Row 37 review S1: a regular expression of `.*` runs backtracked for a
+    minute on a 26-character pattern of many stars against a 40-character
+    name. The matcher finds each part left to right instead."""
+    import time
+
+    pattern = "*a" * 12 + "*b"
+    name = "a" * 40
+    began = time.perf_counter()
+    assert not admission.model_permitted([pattern], name)
+    assert not admission.model_permitted(["*qwen*coder*"], "x" * 262144)
+    assert time.perf_counter() - began < 1.0
+    for allowed, model, expected in (
+        (["openrouter/*"], "openrouter/anthropic/claude", True),
+        (["openrouter/*"], "openrouter", False),
+        (["*-8b"], "qwen3-8b", True),
+        (["a*a"], "a", False),
+        (["a*a"], "aa", True),
+        (["*qwen*coder*"], "x-qwen3-coder-30b", True),
+        (["*qwen*coder*"], "coder-qwen", False),
+        (["m1"], "m1", True),
+        (["m1"], "m10", False),
+        (["**"], "", True),
+    ):
+        assert admission.model_permitted(allowed, model) is expected, (allowed, model)

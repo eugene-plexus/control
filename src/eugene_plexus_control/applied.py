@@ -107,6 +107,8 @@ OP_DELETE_PERMISSION_GROUP = "deletePermissionGroup"
 # converted them once at start; replaying one now raises `ApplyError` through
 # `_retired`, which names it and the way out.
 OP_SET_PERSON_PASSWORD = "setPersonPassword"
+#: Row 37: a person's choice of active group, and nothing else of their record.
+OP_SET_PERSON_ACTIVE_GROUP = "setPersonActiveGroup"
 OP_DELETE_PERSON = "deletePerson"
 OP_PUT_OIDC_CLIENT = "putOidcClient"
 OP_DELETE_OIDC_CLIENT = "deleteOidcClient"
@@ -141,7 +143,12 @@ OP_SET_MODEL_PRICE = "setModelPrice"
 #: * 3: `setModelPrice` (row 40), and the usage allowances in a key's limits
 #:   and a group's policies, which a copy of version 2 or older refuses. Not 2:
 #:   a standby that has row 38 alone also says 2, and would stop at row 40's op.
-LOG_VERSION = 3
+#: * 4: `setPersonActiveGroup` (row 37), and the row 37 fields a copy of version 3
+#:   or older refuses: a group's `roleRouting` and `allowedModels`, a person's
+#:   `activeGroup`.
+LOG_VERSION = 4
+#: Row 37: what a standby must apply before this root writes any of them.
+ROW_37_LOG_VERSION = 4
 
 #: The grant that makes a node the install's warm standby (warm-standby.md).
 GRANT_STANDBY = "standby"
@@ -176,6 +183,7 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_PUT_PERMISSION_GROUP,
         OP_DELETE_PERMISSION_GROUP,
         OP_SET_PERSON_PASSWORD,
+        OP_SET_PERSON_ACTIVE_GROUP,
         OP_DELETE_PERSON,
         OP_PUT_OIDC_CLIENT,
         OP_DELETE_OIDC_CLIENT,
@@ -1253,6 +1261,7 @@ def _check_group_policies(raw: Any) -> None:
     from .client_admission import validate_allowances
     from .permissions import (
         GROUP_POLICIES,
+        MAX_ALLOWED_MODELS,
         QUEUE_BANDS,
         SUMMARY_PERCENT_MAX,
         SUMMARY_PERCENT_MIN,
@@ -1273,11 +1282,50 @@ def _check_group_policies(raw: Any) -> None:
         percent = raw["summaryContextPercent"]
         if type(percent) is not int or not SUMMARY_PERCENT_MIN <= percent <= SUMMARY_PERCENT_MAX:
             raise ApplyError("invalid permission group policy summaryContextPercent")
+    if "roleRouting" in raw:
+        _check_role_routing(raw["roleRouting"])
+    if "allowedModels" in raw and not _model_list(
+        raw["allowedModels"], MAX_ALLOWED_MODELS, 0, patterns=True
+    ):
+        raise ApplyError("invalid permission group policy allowedModels")
+
+
+def _model_list(value: Any, most: int, fewest: int, *, patterns: bool = False) -> bool:
+    """Row 37: a list of distinct model ids or `*` patterns, as a key's. A
+    pattern holds at most `MAX_STARS` `*` (row 37 review)."""
+    from .permissions import MAX_MODEL_ID, MAX_STARS
+
+    return (
+        isinstance(value, list)
+        and fewest <= len(value) <= most
+        and all(isinstance(m, str) and 1 <= len(m) <= MAX_MODEL_ID for m in value)
+        and len(set(value)) == len(value)
+        and (not patterns or all(m.count("*") <= MAX_STARS for m in value))
+    )
+
+
+def _check_role_routing(raw: Any) -> None:
+    """Row 37: `RoleRouting` as the log keeps it: at least one role, each a
+    `ModelRole`, each with 1-16 distinct models. Never null or empty."""
+    from ._generated.models import ModelRole
+    from .permissions import MAX_ROLE_MODELS
+
+    roles = {role.value for role in ModelRole}
+    if (
+        not isinstance(raw, dict)
+        or not raw
+        or raw.keys() - roles
+        or not all(_model_list(models, MAX_ROLE_MODELS, 1) for models in raw.values())
+    ):
+        raise ApplyError("invalid permission group policy roleRouting")
 
 
 def _check_group_memberships(groups: dict[str, dict[str, Any]], person: dict[str, Any]) -> None:
     if any(g not in groups for g in person.get("groups") or []):
         raise ApplyError("unknown permission group membership")
+    # Row 37: the active group is one of theirs, so it names a group that exists.
+    if "activeGroup" in person and person["activeGroup"] not in (person.get("groups") or []):
+        raise ApplyError("a person's active group must be one of their groups")
     if any(g not in groups for g in person.get("administration", {}).get("membershipGroups", [])):
         raise ApplyError("unknown administration membership group")
 
@@ -1308,6 +1356,10 @@ def _apply_delete_permission_group(
         else person
         for key, person in state.people.items()
     }
+    for key, person in people.items():
+        if person.get("activeGroup") == group_id:
+            # Row 37: back to the first of their remaining groups.
+            people[key] = {k: v for k, v in person.items() if k != "activeGroup"}
     for key, person in people.items():
         grants = person.get("administration", {})
         if group_id in grants.get("membershipGroups", []):
@@ -1345,6 +1397,8 @@ def _person_record(raw: Any) -> dict[str, Any]:
         "passwordChangedAt",
         "administration",
         "administrationVersion",
+        # Row 37: kept only when chosen; absent is the first of their groups.
+        "activeGroup",
     }
     if "helperGrants" in raw:
         raise _retired("a person record with folder grants (helperGrants)")
@@ -1400,6 +1454,10 @@ def _person_record(raw: Any) -> dict[str, Any]:
     groups = raw.get("groups")
     if groups is not None:
         _string_list(groups, "person groups", limit=64, item_limit=64)
+    if "activeGroup" in raw and (
+        not isinstance(raw["activeGroup"], str) or not 1 <= len(raw["activeGroup"]) <= 64
+    ):
+        raise ApplyError("invalid person active group")
     if not isinstance(raw.get("disabled"), bool):
         raise ApplyError("invalid person disabled")
     _timestamp(raw, "createdAt", "person")
@@ -1432,6 +1490,24 @@ def _apply_set_person_password(
             "administrationVersion": state.people[person_id].get("administrationVersion", 0) + 1,
         }
     )
+    return replace(state, people={**state.people, person_id: record})
+
+
+def _apply_set_person_active_group(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    """Row 37 review: the person's own choice changes only `activeGroup`,
+    applied to the record as it is when the entry applies, so a choice can
+    never write back anything the owner changed meanwhile."""
+    person_id = payload.get("id")
+    if person_id not in state.people or set(payload) != {"id", "activeGroup"}:
+        raise ApplyError(f"entry {index}: unknown person or bad active group entry")
+    chosen = payload["activeGroup"]
+    record = {k: v for k, v in state.people[person_id].items() if k != "activeGroup"}
+    if chosen is not None:
+        record["activeGroup"] = chosen
+    record = _person_record(record)
+    _check_group_memberships(state.permission_groups, record)
     return replace(state, people={**state.people, person_id: record})
 
 
@@ -1801,6 +1877,7 @@ _HANDLERS: dict[str, _Handler] = {
     OP_PUT_PERMISSION_GROUP: _apply_put_permission_group,
     OP_DELETE_PERMISSION_GROUP: _apply_delete_permission_group,
     OP_SET_PERSON_PASSWORD: _apply_set_person_password,
+    OP_SET_PERSON_ACTIVE_GROUP: _apply_set_person_active_group,
     OP_DELETE_PERSON: _apply_delete_person,
     OP_PUT_OIDC_CLIENT: _apply_put_oidc_client,
     OP_DELETE_OIDC_CLIENT: _apply_delete_oidc_client,

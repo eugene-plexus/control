@@ -17,6 +17,7 @@ import binascii
 import contextlib
 import hmac
 import logging
+import math
 import secrets
 import time
 from typing import Any
@@ -28,7 +29,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 from .. import external_sign_in as sso
 from .. import oidc, peer, permissions, security, tokens
-from ..applied import OP_REVOKE_SIGN_IN, OP_SET_PERSON_PASSWORD, OPERATOR_NAME
+from ..applied import (
+    OP_REVOKE_SIGN_IN,
+    OP_SET_PERSON_ACTIVE_GROUP,
+    OP_SET_PERSON_PASSWORD,
+    OPERATOR_NAME,
+)
 from ..dependencies import verify_bearer
 
 log = logging.getLogger(__name__)
@@ -721,6 +727,154 @@ async def userinfo(request: Request) -> JSONResponse:
         },
         headers=_NO_STORE,
     )
+
+
+def _invalid_token() -> JSONResponse:
+    return JSONResponse(
+        {"error": "invalid_token"},
+        status_code=401,
+        headers={"WWW-Authenticate": 'Bearer error="invalid_token"', **_NO_STORE},
+    )
+
+
+#: Row 37 review: a person changes their active group at most once in this
+#: many seconds; each change is a record in the replicated log.
+ACTIVE_GROUP_INTERVAL_SECONDS = 60.0
+
+
+class _OwnerToken(Exception):
+    """The bearer is valid but is Eugene's owner, who is in no group."""
+
+
+def _bearer_person(request: Request) -> dict[str, Any] | None:
+    """The person a bearer access token is for, as `/oidc/userinfo` reads it:
+    signed by this root, still signed in, still allowed the app. None for
+    anything else. Eugene's owner is in no group: `_OwnerToken`."""
+    header = request.headers.get("authorization") or ""
+    scheme, _, value = header.partition(" ")
+    machine = request.app.state.machine
+    try:
+        if scheme.lower() != "bearer":
+            raise jwt.InvalidTokenError("no bearer")
+        claims = oidc.Provider.decode(
+            value.strip(), machine.state, typ=oidc.TYP_ACCESS, audience=None
+        )
+    except jwt.InvalidTokenError:
+        return None
+    subject = oidc.still_valid(machine.state, claims, str(claims.get("client_id") or ""))
+    if subject is None:
+        return None
+    person: dict[str, Any] | None = machine.state.people.get(subject.sub)
+    if person is None and subject.sub == oidc.OWNER.sub:
+        raise _OwnerToken
+    return person
+
+
+def _not_a_person() -> JSONResponse:
+    return _oauth_error(
+        403,
+        "not_a_person",
+        "This is Eugene's owner, who is in no group. Choose a person's group on the People page.",
+    )
+
+
+def _active_group_state(state: Any, person: dict[str, Any]) -> dict[str, Any]:
+    names = {
+        g: state.permission_groups[g]["name"]
+        for g in person.get("groups") or []
+        if g in state.permission_groups
+    }
+    in_effect = permissions.active_group(state, person)
+    return {
+        "groups": [{"id": g, "name": name} for g, name in names.items()],
+        "activeGroup": person.get("activeGroup"),
+        "inEffect": in_effect["id"] if in_effect is not None else None,
+    }
+
+
+@router.get("/oidc/active-group", operation_id="oidcActiveGroup")
+async def active_group(request: Request) -> JSONResponse:
+    """Row 37 (R37-FIRST): the person's groups and the one whose models and
+    routing they work from."""
+    try:
+        person = _bearer_person(request)
+    except _OwnerToken:
+        return _not_a_person()
+    if person is None:
+        return _invalid_token()
+    machine = request.app.state.machine
+    if not machine.is_active:
+        return _oauth_error(
+            503, "temporarily_unavailable", "This control root is a standby; ask the active one."
+        )
+    return JSONResponse(_active_group_state(machine.state, person), headers=_NO_STORE)
+
+
+@router.post("/oidc/active-group", operation_id="oidcSetActiveGroup")
+async def set_active_group(request: Request) -> JSONResponse:
+    """Row 37 (R37-FIRST): the person chooses, for themselves, which of their
+    groups they work from; null is the first in their list. Only a group they
+    are in: the choice selects among what the owner gave them, never more.
+
+    Row 37 review: the body is read before the token and the person are, and
+    nothing is awaited between reading the person and writing the choice; the
+    entry sets `activeGroup` alone, applied to the record as it is then, so a
+    slow body can never write back what the owner changed meanwhile."""
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    try:
+        person = _bearer_person(request)
+    except _OwnerToken:
+        return _not_a_person()
+    if person is None:
+        return _invalid_token()
+    machine = request.app.state.machine
+    if not machine.is_active:
+        return _oauth_error(
+            503, "temporarily_unavailable", "This control root is a standby; ask the active one."
+        )
+    chosen: Any = body["group"] if isinstance(body, dict) and set(body) == {"group"} else ...
+    if chosen is not None and (not isinstance(chosen, str) or not 1 <= len(chosen) <= 64):
+        return _oauth_error(
+            400, "invalid_request", 'Send {"group": the id of one of your groups, or null}.'
+        )
+    if chosen is not None and chosen not in (person.get("groups") or []):
+        return _oauth_error(
+            403, "not_a_member", "You are not in that group. Choose one of your own groups."
+        )
+    if person.get("activeGroup") != chosen:
+        changes: dict[str, float] | None = getattr(request.app.state, "active_group_changes", None)
+        if changes is None:
+            changes = request.app.state.active_group_changes = {}
+        now = time.perf_counter()
+        last = changes.get(person["id"])
+        behind = permissions.standby_behind(request.app)
+        if behind is not None:
+            return _oauth_error(
+                409,
+                "temporarily_unavailable",
+                "Eugene's standby machine runs an older version and cannot keep your choice "
+                "yet. Ask the owner to update it.",
+            )
+        if last is not None and now - last < ACTIVE_GROUP_INTERVAL_SECONDS:
+            wait = max(1, math.ceil(ACTIVE_GROUP_INTERVAL_SECONDS - (now - last)))
+            answer = _oauth_error(
+                429,
+                "slow_down",
+                f"You changed your group less than a minute ago. Try again in {wait} seconds.",
+            )
+            answer.headers["Retry-After"] = str(wait)
+            return answer
+        machine.append(
+            OP_SET_PERSON_ACTIVE_GROUP,
+            {"id": person["id"], "activeGroup": chosen},
+            actor=person["id"],
+        )
+        changes[person["id"]] = now
+        person = machine.state.people[person["id"]]
+    return JSONResponse(_active_group_state(machine.state, person), headers=_NO_STORE)
 
 
 @router.post("/oidc/revoke", operation_id="oidcRevoke")

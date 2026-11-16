@@ -178,6 +178,8 @@ UNSET = {
     "tokensPerDay": None,
     "tokensPerMonth": None,
     "costPerMonthMicros": None,
+    "roleRouting": None,
+    "allowedModels": None,
 }
 
 
@@ -271,3 +273,129 @@ def delegate_people(c: TestClient) -> tuple[dict[str, Any], dict[str, str]]:
     r = c.post("/v1/auth/administration/login", json={"name": "Clerk", "password": PASSWORD})
     assert r.status_code == 200, r.text
     return p, {"Authorization": "Bearer " + r.json()["sessionToken"]}
+
+
+# --------------------------------------------------------------------------- #
+# row 37: models and routing per group, and the group a person works from
+# --------------------------------------------------------------------------- #
+
+
+def test_routing_and_models_are_kept_by_a_row_70_console(active_client: TestClient) -> None:
+    """A console from row 70 sends only the two policies it knows; the
+    group keeps its routing and model list."""
+    c = active_client
+    made = group(
+        c,
+        name="Sales",
+        policies={"roleRouting": {"chat": ["m2", "m1"]}, "allowedModels": ["m1", "m*"]},
+    )
+    assert made["policies"]["roleRouting"] == {"chat": ["m2", "m1"]}
+    path = f"/v1/permission-groups/{made['id']}"
+    old_console = c.put(
+        path,
+        json={
+            "name": "Sales",
+            "policies": {"queueBand": "background", "summaryContextPercent": None},
+        },
+    ).json()
+    assert old_console["policies"] == {
+        **UNSET,
+        "queueBand": "background",
+        "roleRouting": {"chat": ["m2", "m1"]},
+        "allowedModels": ["m1", "m*"],
+    }
+    # Every model is null; no model at all is an empty list.
+    none = c.put(
+        path, json={"name": "Sales", "policies": {"roleRouting": None, "allowedModels": []}}
+    ).json()
+    assert none["policies"]["allowedModels"] == []
+    cleared = c.put(
+        path, json={"name": "Sales", "policies": {"roleRouting": None, "allowedModels": None}}
+    ).json()
+    assert cleared["policies"] == {**UNSET, "queueBand": "background"}
+    # An empty routing is no routing.
+    empty = c.put(path, json={"name": "Sales", "policies": {"roleRouting": {}}}).json()
+    assert empty["policies"]["roleRouting"] is None
+    for bad in (
+        {"roleRouting": {"typo": ["m1"]}},
+        {"roleRouting": {"chat": []}},
+        {"roleRouting": {"chat": ["m1", "m1"]}},
+        {"allowedModels": ["m1", "m1"]},
+        {"allowedModels": [""]},
+    ):
+        refused = c.put(path, json={"name": "Sales", "policies": bad})
+        assert refused.status_code == 422, bad
+    typo = c.put(path, json={"name": "Sales", "policies": {"roleRouting": {"typo": ["m1"]}}})
+    assert "typo is not a model role" in typo.text
+
+
+def test_a_person_cannot_pick_a_group_they_are_not_in(active_client: TestClient) -> None:
+    c = active_client
+    sales = group(c, name="Sales", policies={"roleRouting": {"chat": ["m1"]}})
+    ops = group(c, name="Ops", policies={"roleRouting": {"chat": ["m3"]}})
+    other = group(c, name="Other")
+    p = person(c, groups=[sales["id"], ops["id"]])
+    path = f"/v1/people/{p['id']}"
+    assert p["policiesInEffect"]["activeGroup"] == sales["id"]
+    assert "activeGroup" not in p
+    refused = c.patch(path, json={"activeGroup": other["id"]})
+    assert refused.status_code == 422, refused.text
+    assert "Choose a group this person is in" in refused.text
+    chosen = c.patch(path, json={"activeGroup": ops["id"]}).json()
+    assert chosen["activeGroup"] == ops["id"]
+    assert chosen["policiesInEffect"]["roleRouting"] == {"chat": ["m3"]}
+    assert chosen["policiesInEffect"]["setBy"]["roleRouting"] == [ops["id"]]
+    # Moved out of the group they worked from: back to the first of their list.
+    moved = c.patch(path, json={"groups": [sales["id"]]}).json()
+    assert "activeGroup" not in moved
+    assert moved["policiesInEffect"]["roleRouting"] == {"chat": ["m1"]}
+    # Chosen and left in one change: refused, not silently dropped.
+    both = c.patch(path, json={"groups": [sales["id"]], "activeGroup": ops["id"]})
+    assert both.status_code == 422
+    # None goes back to the first.
+    c.patch(path, json={"groups": [sales["id"], ops["id"]], "activeGroup": ops["id"]})
+    back = c.patch(path, json={"activeGroup": None}).json()
+    assert "activeGroup" not in back
+    assert back["policiesInEffect"]["activeGroup"] == sales["id"]
+
+
+def test_a_route_outside_the_groups_own_models_is_refused(active_client: TestClient) -> None:
+    """Row 37 review S3 (settings never lie): the console would show a route
+    the gateway drops."""
+    c = active_client
+    refused = c.post(
+        "/v1/permission-groups",
+        json={
+            "name": "Sales",
+            "policies": {"allowedModels": ["m1", "qwen3-*"], "roleRouting": {"chat": ["m1", "m3"]}},
+        },
+    )
+    assert refused.status_code == 422, refused.text
+    assert "The role chat lists m3, which this group's models do not include" in refused.text
+    made = group(
+        c,
+        name="Sales",
+        policies={"allowedModels": ["m1", "qwen3-*"], "roleRouting": {"chat": ["qwen3-8b", "m1"]}},
+    )
+    path = f"/v1/permission-groups/{made['id']}"
+    # Narrowing the models under a route is refused too, naming the model.
+    narrowed = c.put(path, json={"name": "Sales", "policies": {"allowedModels": ["m1"]}})
+    assert narrowed.status_code == 422
+    assert "qwen3-8b" in narrowed.text
+    # With no model list, any route stands.
+    assert (
+        c.put(path, json={"name": "Sales", "policies": {"allowedModels": None}}).status_code == 200
+    )
+
+
+def test_a_pattern_with_too_many_stars_is_refused(active_client: TestClient) -> None:
+    """Row 37 review S1: each `*` costs the matcher; at most 8 in one entry."""
+    c = active_client
+    eight = "*a*b*c*d*e*f*g*h"
+    assert group(c, name="Eight", policies={"allowedModels": [eight]})
+    nine = c.post(
+        "/v1/permission-groups",
+        json={"name": "Nine", "policies": {"allowedModels": ["*a*b*c*d*e*f*g*h*i"]}},
+    )
+    assert nine.status_code == 422, nine.text
+    assert "more than 8 *" in nine.text
