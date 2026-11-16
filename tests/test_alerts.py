@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -261,38 +262,84 @@ def test_bad_alert_settings_are_refused_with_the_cause(
     assert words in refused.json()["detail"]["detail"]
 
 
+def _firing(key: str, **fields: Any) -> dict[str, Any]:
+    return {"id": key, "firing": True, "startedAt": "2026-11-16T12:00:00Z", "message": key,
+            **fields}  # fmt: skip
+
+
 def test_a_person_with_operations_power_reads_alerts_but_not_key_slos(
     active_client: TestClient,
 ) -> None:
     c = active_client
+    targets = {
+        "rules": [],
+        "slos": [
+            {"id": "all", "successPercent": 99},
+            {"id": "acme", "clientKeyId": "ck-acme", "successPercent": 99},
+            {"id": "gone", "successPercent": 99},
+        ],
+    }
+    assert c.put("/v1/alerting", json=targets).status_code == 200
     service: AlertService = c.app.state.alerts  # type: ignore[attr-defined]
+    service._cache.gateway_node = "gpu-a"
     service._cache.slos = (
         {"id": "all", "clientKeyId": None, "state": "met", "windowDays": 30,
          "successPercent": 99.0, "requests": 1, "failures": 0},
         {"id": "acme", "clientKeyId": "ck-acme", "state": "met", "windowDays": 30,
          "successPercent": 99.0, "requests": 1, "failures": 0},
     )  # fmt: skip
+    service.problems = [("gpu-b", "Host history of gpu-b: HTTP 404"), ("gpu-a", "Gateway: x")]
     service.book.active = {
-        "slo-burn:acme": {"id": "slo-burn:acme", "ruleId": "slo-burn", "kind": "slo-burn",
-                          "message": "SLO acme burns", "sloId": "acme", "firing": True,
-                          "startedAt": "2026-11-16T12:00:00Z"},
-        "machine-down:gpu-b": {"id": "machine-down:gpu-b", "ruleId": "machine-down",
-                               "kind": "machine-down", "message": "gpu-b does not answer",
-                               "machine": "gpu-b", "firing": True,
-                               "startedAt": "2026-11-16T12:00:00Z"},
-        "machine-down:gpu-a": {"id": "machine-down:gpu-a", "ruleId": "machine-down",
-                               "kind": "machine-down", "message": "gpu-a does not answer",
-                               "machine": "gpu-a", "firing": True,
-                               "startedAt": "2026-11-16T12:00:00Z"},
-    }  # fmt: skip
+        "slo-burn:acme": _firing("slo-burn:acme", ruleId="slo-burn", kind="slo-burn", sloId="acme"),
+        "slo-burn:all": _firing("slo-burn:all", ruleId="slo-burn", kind="slo-burn", sloId="all"),
+        "failure-rate:*": _firing("failure-rate:*", ruleId="failure-rate", kind="failure-rate"),
+        "machine-down:gpu-b": _firing(
+            "machine-down:gpu-b", ruleId="machine-down", kind="machine-down", machine="gpu-b"
+        ),
+        "machine-down:gpu-a": _firing(
+            "machine-down:gpu-a", ruleId="machine-down", kind="machine-down", machine="gpu-a"
+        ),
+    }
     owner = c.get("/v1/alerts")
     assert owner.status_code == 200, owner.text
-    assert len(owner.json()["firing"]) == 3 and len(owner.json()["slos"]) == 2
+    assert len(owner.json()["firing"]) == 5 and len(owner.json()["slos"]) == 2
+    assert len(owner.json()["problems"]) == 2
     _, dana = delegate(c, operateModels=True, operationsMachines=["gpu-a"])
-    seen = c.get("/v1/alerts", headers=dana)
-    assert seen.status_code == 200, seen.text
-    assert [a["id"] for a in seen.json()["firing"]] == ["machine-down:gpu-a"]
-    assert [s["id"] for s in seen.json()["slos"]] == ["all"]
+
+    def seen() -> dict[str, Any]:
+        answer = c.get("/v1/alerts", headers=dana)
+        assert answer.status_code == 200, answer.text
+        return dict(answer.json())
+
+    view = seen()
+    assert sorted(a["id"] for a in view["firing"]) == [
+        "failure-rate:*", "machine-down:gpu-a", "slo-burn:all"
+    ]  # fmt: skip
+    assert [s["id"] for s in view["slos"]] == ["all"]
+    assert view["problems"] == ["Gateway: x"], "a read about gpu-b is outside her reach"
+    # The SLO read failed: the key's SLO alert stays hidden all the same (S1).
+    service._cache.slos = None
+    assert "slo-burn:acme" not in [a["id"] for a in seen()["firing"]]
+    # An SLO deleted is not a current SLO on a model: its alert is not shown.
+    service.book.active["slo-burn:gone"] = _firing(
+        "slo-burn:gone", ruleId="slo-burn", kind="slo-burn", sloId="gone"
+    )
+    targets["slos"] = targets["slos"][:2]
+    assert c.put("/v1/alerting", json=targets).status_code == 200
+    service.book.active["slo-burn:gone"] = _firing(
+        "slo-burn:gone", ruleId="slo-burn", kind="slo-burn", sloId="gone"
+    )
+    assert "slo-burn:gone" not in [a["id"] for a in seen()["firing"]]
+    # The gateway runs outside her reach: nothing it counted reaches her.
+    service._cache.gateway_node = "gpu-b"
+    service.problems = [("gpu-b", "Gateway metrics: HTTP 401")]
+    service._cache.slos = (
+        {"id": "all", "clientKeyId": None, "state": "met", "windowDays": 30,
+         "successPercent": 99.0, "requests": 1, "failures": 0},
+    )  # fmt: skip
+    away = seen()
+    assert [a["id"] for a in away["firing"]] == ["machine-down:gpu-a"]
+    assert away["slos"] == [] and away["problems"] == []
     # The rules and the webhook stay the owner's.
     assert c.get("/v1/alerting", headers=dana).status_code in (401, 403)
     assert c.put("/v1/alerting", headers=dana, json={"rules": [], "slos": []}).status_code in (
@@ -367,4 +414,194 @@ def test_the_root_reads_the_gateway_through_its_agent_with_its_own_token(
     answer["status"] = 503
     refused = asyncio.run(service.read(rules, []))
     assert refused.failures is None
-    assert refused.problems == ("Gateway metrics: request metrics are off on the gateway",)
+    assert refused.problems == (
+        ("gpu-a", "Gateway metrics: request metrics are off on the gateway"),
+    )
+
+
+# --------------------------------------------------------------------- #
+# Review fixes (row 38 review: B1, S3, S4, S6, the gateway, slo-burn)
+# --------------------------------------------------------------------- #
+
+
+SECRET = "https://hooks.slack.com/services/T000/B000/s3cr3t-path"
+
+
+def test_the_webhook_address_is_in_no_log_line(caplog: pytest.LogCaptureFixture) -> None:
+    """B1: httpx logs each request's URL at INFO; the address is a secret."""
+    sender, _ = _failing_then([200])
+    with caplog.at_level(logging.DEBUG):
+        assert asyncio.run(sender.post(SECRET, {"text": "x"})) is True
+        sender_fail, _ = _failing_then([500, 500, 500])
+        asyncio.run(sender_fail.post(SECRET, {"text": "x"}))
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "HTTP Request: POST" in logged, "the client's own line is there, masked"
+    assert "s3cr3t" not in logged and "/services/T000" not in logged
+    assert "hooks.slack.com/<alert webhook>" in logged
+
+
+def test_the_sender_follows_no_redirect_and_sends_no_credential() -> None:
+    """S3: a redirect is a failure, named; no Authorization header leaves."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(302, headers={"location": "http://elsewhere.lan/steal"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def no_wait(_: float) -> None:
+        return None
+
+    sender = WebhookSender(internal=client, egress=client, sleep=no_wait)
+    assert asyncio.run(sender.post("http://hooks.lan/x", {"text": "x"})) is False
+    assert {str(r.url) for r in seen} == {"http://hooks.lan/x"}, "the redirect was followed"
+    assert all("authorization" not in r.headers for r in seen)
+    assert sender.status(True)["lastError"] == "HTTP 302"
+
+
+@pytest.mark.parametrize(
+    "url", ["http://example.com:abc/x", "http://[::1/x", "http://example.com:99999/x"]
+)
+def test_an_address_httpx_cannot_read_is_refused_at_save(
+    active_client: TestClient, url: str
+) -> None:
+    """S4: the address is read as the client reads it; never a 500."""
+    refused = active_client.put("/v1/alerting", json={"rules": [], "slos": [], "webhookUrl": url})
+    assert refused.status_code == 400, refused.text
+    assert "webhook" in refused.json()["detail"]["detail"].lower()
+
+
+def test_a_post_to_an_address_httpx_cannot_read_names_it() -> None:
+    sender = WebhookSender(sleep=lambda _: asyncio.sleep(0))
+    assert asyncio.run(sender.post("http://[::1/x", {"text": "x"}, tries=1)) is False
+    assert sender.status(True)["lastError"] == "the address is not a valid URL"
+
+
+def test_the_test_route_never_answers_500(active_client: TestClient) -> None:
+    c = active_client
+    assert c.post("/v1/alerting/test").status_code == 409, "no webhook set"
+    assert (
+        c.put(
+            "/v1/alerting", json={"rules": [], "slos": [], "webhookUrl": "http://127.0.0.1:1/x"}
+        ).status_code
+        == 200
+    )
+    answer = c.post("/v1/alerting/test")
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["state"] == "failing" and answer.json()["lastError"]
+
+
+def test_the_standby_guard_on_saving_alerts(active_client: TestClient) -> None:
+    """S3: a standby that applies an older log refuses the save, by name, and a
+    root that is not active refuses it too."""
+    c = active_client
+    app = c.app
+    machine = app.state.machine  # type: ignore[attr-defined]
+    before = machine.state.index
+    import eugene_plexus_control.routes.control as control_routes
+
+    real = control_routes.standby_short_of
+    control_routes.standby_short_of = lambda _app, needed: "spare" if needed >= 2 else None
+    try:
+        refused = c.put("/v1/alerting", json={"rules": [], "slos": []})
+    finally:
+        control_routes.standby_short_of = real
+    assert refused.status_code == 409, refused.text
+    assert "spare" in refused.json()["detail"]["detail"]
+    assert machine.state.index == before, "nothing was appended"
+    machine._role = "standby"
+    try:
+        refused = c.put("/v1/alerting", json={"rules": [], "slos": []})
+    finally:
+        machine._role = "control"
+    assert refused.status_code == 409, refused.text
+
+
+def test_a_failure_rate_alert_ends_when_its_model_changes() -> None:
+    """S6: the alert of the model the owner moved the rule off is clear, not unknown."""
+    rule = {"id": "fr", "kind": "failure-rate", "enabled": True, "threshold": 5.0,
+            "forMinutes": 2, "machine": None, "model": "qwen", "sloId": None}  # fmt: skip
+    book = AlertBook(None)
+
+    def step(minute: int, r: dict[str, Any], failures: Any) -> list[dict[str, Any]]:
+        readings = Readings(failures=failures)
+        return book.step(
+            T0 + timedelta(minutes=minute),
+            conditions([r], readings),
+            rules=[r],
+            machines=set(),
+            whole=complete([r], readings),
+        )
+
+    assert step(0, rule, {2: {"qwen": (20, 10)}})[0]["state"] == "firing"
+    moved = {**rule, "model": "gemma"}
+    # The gateway unread: unknown, nothing ends.
+    assert step(1, moved, None) == []
+    assert step(2, moved, {2: {"gemma": (20, 0)}}) == []
+    resolved = step(4, moved, {2: {"gemma": (20, 0)}})
+    assert [(a["id"], a["state"]) for a in resolved] == [("fr:qwen", "resolved")]
+
+
+def test_slo_burn_needs_ten_requests_in_the_hour() -> None:
+    rule = {"id": "burn", "kind": "slo-burn", "enabled": True, "threshold": 2.0,
+            "forMinutes": 1, "machine": None, "model": None, "sloId": None}  # fmt: skip
+    few = Readings(slos=({"id": "s", "burnRate": 50.0, "_hourRequests": 2},))
+    many = Readings(slos=({"id": "s", "burnRate": 50.0, "_hourRequests": 10},))
+    assert [c.holds for c in conditions([rule], few)] == [False]
+    assert [c.holds for c in conditions([rule], many)] == [True]
+
+
+def test_host_history_answers_are_named(active_client: TestClient) -> None:
+    """S6: a 404 or a 503 says what it means, not "no answer"."""
+    service: AlertService = active_client.app.state.alerts  # type: ignore[attr-defined]
+
+    class Nodes:
+        def __init__(self, code: int) -> None:
+            self.code = code
+
+        async def get_json(self, url: str, path: str, token: str | None) -> Any:
+            request = httpx.Request("GET", url + path)
+            raise httpx.HTTPStatusError(
+                "x", request=request, response=httpx.Response(self.code, request=request)
+            )
+
+    real = active_client.app.state.nodes_client  # type: ignore[attr-defined]
+    try:
+        for code, words in ((404, "older than host history"), (503, "keeps no host history")):
+            active_client.app.state.nodes_client = Nodes(code)  # type: ignore[attr-defined]
+            answer = asyncio.run(service._host("nas", "http://nas.lan:8079"))
+            assert isinstance(answer, str) and words in answer
+    finally:
+        active_client.app.state.nodes_client = real  # type: ignore[attr-defined]
+
+
+def test_the_gateway_read_is_the_one_the_proxy_picks(active_client: TestClient) -> None:
+    """Its own machine's gateway first; two elsewhere refused, naming both."""
+    from eugene_plexus_control.nodes_client import NodeCollection
+
+    app = active_client.app
+    service: AlertService = app.state.alerts  # type: ignore[attr-defined]
+
+    class Nodes:
+        def __init__(self, nodes: list[str]) -> None:
+            self.nodes = nodes
+
+        async def collect(self, *args: Any, **kwargs: Any) -> Any:
+            items = [{"kind": "gateway", "node": n} for n in self.nodes]
+            return NodeCollection(items=items, unreachable=[])
+
+    real = app.state.nodes_client  # type: ignore[attr-defined]
+    own = app.state.node_name  # type: ignore[attr-defined]
+    try:
+        app.state.node_name = "root"  # type: ignore[attr-defined]
+        app.state.nodes_client = Nodes(["gpu-a", "root"])  # type: ignore[attr-defined]
+        service._cache.gateway_node_at = 0.0
+        assert asyncio.run(service._gateway_node()) == "root"
+        app.state.nodes_client = Nodes(["gpu-a", "gpu-b"])  # type: ignore[attr-defined]
+        service._cache.gateway_node_at = 0.0
+        with pytest.raises(LookupError, match="gpu-a and gpu-b both run a gateway"):
+            asyncio.run(service._gateway_node())
+    finally:
+        app.state.nodes_client = real  # type: ignore[attr-defined]
+        app.state.node_name = own  # type: ignore[attr-defined]

@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 import httpx
 
@@ -144,8 +144,10 @@ def settings_view(alerting: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def webhook_host(url: str) -> str:
-    parts = urlsplit(url)
-    return parts.hostname or ""
+    try:
+        return httpx.URL(url).host
+    except (httpx.InvalidURL, ValueError, TypeError):
+        return ""
 
 
 def check_update(rules: list[dict[str, Any]], slos: list[dict[str, Any]]) -> str | None:
@@ -188,11 +190,19 @@ def check_update(rules: list[dict[str, Any]], slos: list[dict[str, Any]]) -> str
 
 
 def check_webhook_url(url: str) -> str | None:
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        return "The webhook must be an http:// or https:// address."
+    """Why `url` cannot be the webhook, or None. Read as the client will read it
+    (`httpx.URL`), so an address saved is one a post can be made to."""
     if any(ord(c) < 0x21 for c in url):
         return "The webhook address has a space or a control character in it."
+    try:
+        parsed = httpx.URL(url)
+        port = parsed.port
+    except (httpx.InvalidURL, ValueError, TypeError):
+        return "The webhook address is not a valid URL."
+    if parsed.scheme not in ("http", "https") or not parsed.host:
+        return "The webhook must be an http:// or https:// address."
+    if port is not None and not 0 < port < 65536:
+        return "The webhook address has a port out of range."
     return None
 
 
@@ -222,7 +232,8 @@ class Readings:
     None when the gateway could not be read."""
     slos: tuple[dict[str, Any], ...] | None = None
     """`SloStatus` documents; None when they could not be read."""
-    problems: tuple[str, ...] = ()
+    problems: tuple[tuple[str | None, str], ...] = ()
+    """(machine the read was about, or None; the words)."""
 
 
 @dataclass(frozen=True)
@@ -251,6 +262,10 @@ def complete(rules: list[dict[str, Any]], readings: Readings) -> set[tuple[str, 
     for rule in rules:
         kind = rule["kind"]
         if kind == "slo-burn" and readings.slos is not None:
+            out.add((rule["id"], None))
+        # A failure-rate alert whose model the owner changed is named no more:
+        # with the gateway read, it is clear, not unknown.
+        if kind == "failure-rate" and readings.failures is not None:
             out.add((rule["id"], None))
         for m in readings.machines:
             known = {
@@ -340,11 +355,13 @@ def conditions(rules: list[dict[str, Any]], readings: Readings) -> list[Conditio
                     continue
                 burn = slo.get("burnRate")
                 name = slo.get("name") or slo["id"]
+                # As a failure rate: fewer than MIN_REQUESTS in the hour is no rate.
+                enough = int(slo.get("_hourRequests") or 0) >= MIN_REQUESTS
                 out.append(
                     Condition(
                         key=f"{rid}:{slo['id']}",
                         rule=rule,
-                        holds=burn is not None and burn >= threshold,
+                        holds=enough and burn is not None and burn >= threshold,
                         message=f"SLO {name} is spending its error budget "
                         f"{_num(burn or 0)} times faster than its window allows",
                         value=None if burn is None else round(burn, 2),
@@ -621,6 +638,8 @@ def slo_statuses(
                 "coveredDays": round(covered / 86400, 2),
                 "firstToken": first,
                 "state": state,
+                # Not shown: how many requests the burn rate is over.
+                "_hourRequests": h_requests,
             }
         )
     return out
@@ -652,6 +671,8 @@ def webhook_post(alert: dict[str, Any], *, state: str, console: str | None) -> d
 
 
 def _cause(exc: BaseException) -> str:
+    if isinstance(exc, httpx.InvalidURL):
+        return "the address is not a valid URL"
     if isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP {exc.response.status_code}"
     if isinstance(exc, httpx.TimeoutException):
@@ -662,6 +683,51 @@ def _cause(exc: BaseException) -> str:
     if isinstance(exc, httpx.HTTPError):
         return type(exc).__name__
     return type(exc).__name__
+
+
+class _AddressFilter(logging.Filter):
+    """Row 38 review B1: httpx logs each request's URL at INFO, and a webhook's
+    address is a secret (a Slack hook's path is its credential). Every address
+    the sender posts to is replaced by its scheme and host in any record of
+    `httpx` and `httpcore`, so the log a person with Updates and restarts reads
+    never holds it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.secrets: dict[str, str] = {}
+
+    def remember(self, url: str) -> None:
+        try:
+            parsed = httpx.URL(url)
+            shown = f"{parsed.scheme}://{parsed.host}/<alert webhook>"
+            forms = {url, str(parsed), parsed.raw_path.decode("ascii", "replace")}
+        except (httpx.InvalidURL, ValueError, TypeError):
+            shown, forms = "<alert webhook>", {url}
+        for form in forms:
+            if form and form != "/":
+                self.secrets[form] = shown
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not self.secrets:
+            return True
+        rendered = record.getMessage()
+        masked = rendered
+        for secret in sorted(self.secrets, key=len, reverse=True):
+            masked = masked.replace(secret, self.secrets[secret])
+        if masked != rendered:
+            record.msg, record.args = masked, ()
+        return True
+
+
+#: One filter for the process, on the loggers that print a request's URL.
+ADDRESS_FILTER = _AddressFilter()
+
+
+def _install_address_filter() -> None:
+    for name in ("httpx", "httpcore"):
+        logger = logging.getLogger(name)
+        if ADDRESS_FILTER not in logger.filters:
+            logger.addFilter(ADDRESS_FILTER)
 
 
 class WebhookSender:
@@ -710,6 +776,14 @@ class WebhookSender:
         }
 
     async def post(self, url: str, body: dict[str, Any], *, tries: int = WEBHOOK_TRIES) -> bool:
+        """POST `body` as JSON: no Eugene credential, no redirect followed (a
+        redirect is a failure, named), and the address in no log."""
+        _install_address_filter()
+        ADDRESS_FILTER.remember(url)
+        if check_webhook_url(url) is not None:
+            self.last_attempt = _iso(datetime.now(UTC))
+            self.last_error = "the address is not a valid URL"
+            return False
         cause = "not sent"
         for attempt in range(tries):
             self.last_attempt = _iso(datetime.now(UTC))
@@ -718,7 +792,7 @@ class WebhookSender:
                     url, json=body, timeout=WEBHOOK_TIMEOUT_SECONDS, follow_redirects=False
                 )
                 response.raise_for_status()
-            except (httpx.HTTPError, ValueError) as exc:
+            except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError) as exc:
                 cause = _cause(exc)
                 if attempt + 1 < tries:
                     await self._sleep(2.0**attempt)
@@ -758,7 +832,7 @@ class AlertService:
     sender: WebhookSender = field(default_factory=WebhookSender)
     book: AlertBook = field(init=False)
     evaluated_at: str | None = None
-    problems: list[str] = field(default_factory=list)
+    problems: list[tuple[str | None, str]] = field(default_factory=list)
     _cache: _Cache = field(default_factory=_Cache)
     _client: httpx.AsyncClient | None = None
     _deliveries: set[asyncio.Task[None]] = field(default_factory=set)
@@ -777,10 +851,13 @@ class AlertService:
         return {
             "evaluating": self.running(),
             "evaluatedAt": self.evaluated_at,
-            "problems": list(self.problems),
+            "problems": [text for _, text in self.problems],
             "firing": self.book.firing(),
             "recent": list(self.book.recent),
-            "slos": list(self._cache.slos or ()),
+            "slos": [
+                {k: v for k, v in s.items() if not k.startswith("_")}
+                for s in self._cache.slos or ()
+            ],
             "webhook": self.sender.status(configured),
         }
 
@@ -814,7 +891,23 @@ class AlertService:
         collected = await self.app.state.nodes_client.collect(
             _targets(self.app.state.machine), self._token, path="/v1/components", key="components"
         )
-        found = next((i["node"] for i in collected.items if i.get("kind") == "gateway"), None)
+        nodes = sorted({str(i["node"]) for i in collected.items if i.get("kind") == "gateway"})
+        own = self.app.state.node_name
+        # The agent's proxy takes a gateway on its own machine first; elsewhere
+        # it takes the one machine that runs one. Two elsewhere is refused by
+        # name, so the token is never addressed to a machine the proxy did not pick.
+        if own in nodes:
+            found: str | None = own
+        elif len(nodes) == 1:
+            found = nodes[0]
+        elif nodes:
+            self._cache.gateway_node, self._cache.gateway_node_at = None, 0.0
+            raise LookupError(
+                f"{' and '.join(nodes)} both run a gateway; alerts read one on this machine "
+                "or the only one in the install"
+            )
+        else:
+            found = None
         self._cache.gateway_node = found
         self._cache.gateway_node_at = time.perf_counter()
         return found
@@ -843,9 +936,10 @@ class AlertService:
         response.raise_for_status()
         return response.json()
 
-    async def _host(self, name: str, url: str | None) -> tuple[tuple, tuple] | None:
+    async def _host(self, name: str, url: str | None) -> tuple[tuple, tuple] | str:
+        """(disks, GPUs) from one machine's host history, or why not."""
         if not url:
-            return None
+            return "no address recorded"
         since = _iso(datetime.now(UTC) - timedelta(minutes=5))
         path = (
             f"/v1/node/history?from={quote(since)}&metric=diskFree&metric=diskTotal"
@@ -853,8 +947,17 @@ class AlertService:
         )
         try:
             body = await self.app.state.nodes_client.get_json(url, path, self._token(name))
-        except (httpx.HTTPError, ValueError):
-            return None
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code == 404:
+                return "HTTP 404: its agent is older than host history"
+            if code == 503:
+                return "HTTP 503: its agent keeps no host history (safe mode, or the store failed)"
+            return _cause(exc)
+        except (httpx.HTTPError, ValueError) as exc:
+            return _cause(exc)
+        if not isinstance(body, dict):
+            return "an answer that is not host history"
         free: dict[str, float] = {}
         total: dict[str, float] = {}
         gpus: list[tuple[str, str, float]] = []
@@ -882,7 +985,7 @@ class AlertService:
 
         machine = self.app.state.machine
         probes = getattr(self.app.state, "node_probes", {}) or {}
-        problems: list[str] = []
+        problems: list[tuple[str | None, str]] = []
         targets = _targets(machine)
         wants_host = any(r["enabled"] and r["kind"] in ("disk-full", "gpu-hot") for r in rules)
         hosts = await asyncio.gather(
@@ -894,11 +997,12 @@ class AlertService:
             )
         )
         machines: list[MachineReading] = []
-        for (name, _), host in zip(targets, hosts, strict=True):
+        for (name, _), answer in zip(targets, hosts, strict=True):
             record = machine.state.nodes[name]
             probe = probes.get(name)
-            if wants_host and host is None and (probe is None or probe.reachable):
-                problems.append(f"Host history of {record.label or name}: no answer")
+            host = answer if isinstance(answer, tuple) else None
+            if wants_host and isinstance(answer, str):
+                problems.append((name, f"Host history of {record.label or name}: {answer}"))
             machines.append(
                 MachineReading(
                     name=name,
@@ -917,7 +1021,7 @@ class AlertService:
             for minutes in sorted(lookbacks):
                 read[minutes] = await self._failures(minutes)
         except (httpx.HTTPError, ValueError, LookupError) as exc:
-            problems.append(f"Gateway metrics: {_reason(exc)}")
+            problems.append((self._cache.gateway_node, f"Gateway metrics: {_reason(exc)}"))
             failures = None
 
         wants_slos = bool(slos)
@@ -937,7 +1041,7 @@ class AlertService:
         if not wants_slos:
             self._cache.slos = ()
         if self._cache.slo_problem and wants_slos:
-            problems.append(self._cache.slo_problem)
+            problems.append((self._cache.gateway_node, self._cache.slo_problem))
         return Readings(
             machines=tuple(machines),
             failures=failures,
