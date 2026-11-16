@@ -274,7 +274,7 @@ def conditions(rules: list[dict[str, Any]], readings: Readings) -> list[Conditio
             for m in readings.machines:
                 if rule["machine"] and m.name != rule["machine"]:
                     continue
-                link = f"/hosts?node={quote(m.name)}"
+                link = f"/hosts?sel={quote('agent:' + m.name)}"
                 if kind == "machine-down":
                     out.append(
                         Condition(
