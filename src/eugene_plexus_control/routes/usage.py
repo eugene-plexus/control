@@ -2,7 +2,7 @@
 
 `usage.py` counts and decides; this module answers. The owner sees every key,
 person and group; a directory administrator (row 39) sees people and groups but
-no keys; a signed-in person sees their own through `GET /v1/usage/me`, with the
+no keys; a signed-in person sees their own through `GET /oidc/usage`, with the
 access token an app such as Workbench holds for them.
 """
 
@@ -126,7 +126,7 @@ async def get_usage(
     )
 
 
-@router.get("/v1/usage/me")
+@router.get("/oidc/usage", operation_id="getOwnUsage")
 async def get_own_usage(request: Request) -> JSONResponse:
     """The signed-in person's own usage, by their access token from this root."""
     machine = _active(request)

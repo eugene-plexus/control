@@ -6804,7 +6804,7 @@ class EngineFitModel(BaseModel):
 
 class UsageReport(BaseModel):
     """
-    Row 40, `GET /v1/usage` and `GET /v1/usage/me`.
+    Row 40, `GET /v1/usage` and `GET /oidc/usage`.
     """
 
     model_config = ConfigDict(

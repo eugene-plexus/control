@@ -512,7 +512,7 @@ def refuse_if_spent(
         raise AdmissionRefusal(
             429,
             f"No price is set for {model}, so a money limit cannot allow it. "
-            "The owner sets one in Models.",
+            "The owner sets one on the Usage page.",
             None,
             reason="allowance",
         )

@@ -128,11 +128,11 @@ def test_the_most_generous_group_admits_a_person(active_client):
     assert serve(c, key, "one", prompt=20, token=token).status_code == 200
     # Small is spent, Large is not: she is still admitted.
     assert admit(c, key, "acquire", "two", token=token, price=LOCAL).status_code == 200
-    mine = c.get("/v1/usage/me", headers={"Authorization": f"Bearer {token}"})
+    mine = c.get("/oidc/usage", headers={"Authorization": f"Bearer {token}"})
     assert mine.status_code == 200, mine.text
     kinds = {(s["kind"], s["name"]) for s in mine.json()["subjects"]}
     assert kinds == {("person", "Ada"), ("group", "Large"), ("group", "Small")}
-    assert c.get("/v1/usage/me", headers={"Authorization": "Bearer forged"}).status_code == 401
+    assert c.get("/oidc/usage", headers={"Authorization": "Bearer forged"}).status_code == 401
 
 
 def test_a_spent_monthly_allowance_refuses_with_the_reset_date(active_client):
@@ -180,7 +180,7 @@ def test_an_unknown_price_is_unknown_not_zero(active_client):
     assert refused.status_code == 429
     assert refused.json()["detail"] == (
         "No price is set for cloud/x, so a money limit cannot allow it. "
-        "The owner sets one in Models."
+        "The owner sets one on the Usage page."
     )
     # An older gateway sends no hint: unknown, refused the same way.
     assert admit(c, metered, "acquire", "old-gateway", model="cloud/x").status_code == 429
