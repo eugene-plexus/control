@@ -180,7 +180,8 @@ async def operations_token(
         now=now,
         extra={
             "ops": powers,
-            "name": person.get("displayName") or person["name"],
+            # A display name may be 120 characters; a token's name is 64 at most.
+            "name": (person.get("displayName") or person["name"])[:64],
             "sid": admin.claims.jti,
             "administration_version": person.get("administrationVersion", 0),
         },

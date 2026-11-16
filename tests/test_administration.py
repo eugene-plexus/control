@@ -441,3 +441,19 @@ def test_operations_grants_replay_and_refuse_bad_values(active_client: TestClien
         with pytest.raises(ApplyError):
             from_canonical(broken)
     assert p["administration"]["operationsMachines"] == ["gpu-a"]
+
+
+def test_a_long_display_name_still_makes_a_token_every_machine_takes(
+    active_client: TestClient,
+) -> None:
+    """Review S5: a display name may be 120 characters; a token's name, 64."""
+    c = active_client
+    assert enroll(c, "gpu-a")[1].status_code == 201
+    p, auth = delegate(c, operateModels=True)
+    long_name = "D" * 120
+    assert c.patch(f"/v1/people/{p['id']}", json={"displayName": long_name}).status_code == 200
+    body = _exchange(c, auth, "gpu-a").json()
+    claims = tokens.verify(
+        body["token"], bundle=_bundle(c), recipient="node:gpu-a", classes=[tokens.TYP_OPERATIONS]
+    )
+    assert claims.name == long_name[:64]
