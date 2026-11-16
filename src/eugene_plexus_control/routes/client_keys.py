@@ -38,6 +38,7 @@ from ..dependencies import (
     require_operator,
 )
 from ..state_machine import NotActive, StateMachine
+from .usage import standby_can_hold
 
 router = APIRouter(tags=["client keys"])
 log = logging.getLogger(__name__)
@@ -123,6 +124,7 @@ async def create_key(
     token = _mint(request, name=name, key_id=key_id, issued=issued, expires=expires)
     try:
         limits = validate_limits((body.limits or ClientKeyLimits()).model_dump(exclude_none=True))
+        standby_can_hold(request.app, limits)
     except ValueError as exc:
         raise problem(422, "Invalid key limits", str(exc)) from exc
     key = ClientKey(
@@ -270,6 +272,7 @@ async def set_limits(request: Request, key_id: str, body: ClientKeyUpdateRequest
         raise problem(404, "No such key", "This key is not in the registry.")
     try:
         limits = validate_limits(body.limits.model_dump(exclude_none=True))
+        standby_can_hold(request.app, limits)
         machine.append(OP_SET_CLIENT_KEY_LIMITS, {"id": key_id, "limits": limits}, actor="operator")
     except ValueError as exc:
         raise problem(422, "Invalid limits", str(exc)) from exc
@@ -307,6 +310,12 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
                 person_token=body.personToken,
                 app_metadata_only=purpose in ("logs", "catalog", "metrics"),
                 purpose=str(purpose or "inference"),
+                price=body.price.model_dump(mode="json", exclude_none=True)
+                if body.price is not None and body.action.value == "acquire"
+                else None,
+                usage=body.usage.model_dump(mode="json", exclude_none=True)
+                if body.usage is not None and body.action.value == "release"
+                else None,
             )
         )
         return ClientAdmissionResult.model_validate(result)

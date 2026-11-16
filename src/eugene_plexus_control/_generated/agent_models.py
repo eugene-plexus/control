@@ -3479,46 +3479,17 @@ class Purpose(StrEnum):
     metrics = 'metrics'
 
 
-class ClientAdmissionRequest(BaseModel):
-    """
-    Since row 11 the gateway sends `check` when a request arrives and
-    `acquire` when the request leaves its queue, so a request that waits
-    holds no lease. A `check` that names a `model` applies the key's
-    `allowedModels` as `acquire` does, and takes nothing.
-
-    An `acquire` refused for the key's limits is a 429 with
-    `Retry-After` and `X-Eugene-Refusal-Reason`: `concurrency` when the
-    key already runs `maxConcurrentRequests` requests (on any gateway;
-    the gateway keeps the request's place and asks again), `rate` when
-    its `requestsPerMinute` are used (the gateway refuses the request).
-
-    """
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    action: Action
-    keyId: str = Field(..., max_length=128, min_length=1)
-    requestId: str = Field(..., max_length=128, min_length=1)
-    purpose: Purpose | None = Field(
-        'inference',
-        description='Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key\'s `readMetrics` is on. It never acquires, renews or releases.\n\nLogs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI\'s external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key\'s `allowedModels` does not apply. The gateway checks the key\'s `allowedTools` and `localOnly`, as for every tool.\n',
-    )
-    model: str | None = Field(None, max_length=256, min_length=1)
-    personToken: str | None = Field(
-        None,
-        description='Root-issued OIDC access token carried alongside the app key in\nX-Eugene-Person-Token. The root checks its signature, session,\ncurrent person access and exact registered app owner on every check,\nacquisition and renewal. Required for app:workbench@ keys. Never\npersist or log this token. A standalone authority refuses it.\n',
-        max_length=16384,
-        min_length=1,
-    )
-
-
 class AdmissionRefusalReason(StrEnum):
     """
     Why an `acquire` was refused with a 429, in its
     `X-Eugene-Refusal-Reason` header (row 11): `concurrency`, the key
     already runs `maxConcurrentRequests` requests; `rate`, its
-    `requestsPerMinute` are used. An agent that forwards the root's
+    `requestsPerMinute` are used; `allowance` (row 40), a token or money
+    allowance of the key, the person or one of their groups is spent, or
+    the model has no price while a money allowance applies. An
+    `allowance` refusal is final until the allowance resets: its
+    `Retry-After` is the seconds until then, and its `detail` is the
+    sentence the caller is shown. An agent that forwards the root's
     answer passes the header on, and a standalone agent sets it the same
     way.
 
@@ -3526,6 +3497,34 @@ class AdmissionRefusalReason(StrEnum):
 
     concurrency = 'concurrency'
     rate = 'rate'
+    allowance = 'allowance'
+
+
+class ModelPrice(BaseModel):
+    """
+    Row 40: a model's rate, in millionths of a US dollar for each million
+    tokens. One micro-dollar for a million tokens is one pico-dollar a
+    token, so a request's cost is a whole number of pico-dollars:
+    `promptTokens * inputPerMillionMicros + completionTokens *
+    outputPerMillionMicros`. Integers, so every sum is exact.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    inputPerMillionMicros: int = Field(..., ge=0, le=1000000000000)
+    outputPerMillionMicros: int = Field(..., ge=0, le=1000000000000)
+
+
+class ModelPriceLocality(StrEnum):
+    """
+    Where a model runs, as the gateway's `ModelLocality` says it (row 40).
+    """
+
+    local = 'local'
+    external = 'external'
+    unknown = 'unknown'
 
 
 class QueueBand(StrEnum):
@@ -4340,6 +4339,61 @@ class PromptCacheSource(StrEnum):
     extra_args = 'extra_args'
     off = 'off'
     unsupported = 'unsupported'
+
+
+class RuntimeDiskPromptCache(BaseModel):
+    """
+    The prompt cache on disk for this runtime (row 15,
+    `GET /v1/prompt-cache`): whether this run saves its conversations at
+    a planned stop and reads them back at its next start, read from the
+    command line it was started with and this machine's setting now, and
+    what is saved for it. Absent for a runtime that does not run on
+    llama.cpp, and for a search model.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    saving: bool = Field(
+        ...,
+        description="True when a planned stop of this run saves its conversations and\nits next start reads them back. False when the setting is off,\nthe engine was started without Eugene's folder (an older start,\na build without `--slot-save-path`, an engine other machines can\nreach by its last `--host`, slot routes turned off or behind an\nAPI key, or a folder set by hand), and `note` says which. While\nit saves, `note` says why the last stop kept less than it held\n(no room above the free-space floor or the cap, no time, the\nengine's refusal). Never a path.\n",
+    )
+    conversations: int = Field(
+        ...,
+        description='Saved conversations its next start would read back (the engine\nreads back at most one per slot).\n',
+        ge=0,
+    )
+    bytes: int = Field(..., description='Their size on disk.', ge=0)
+    note: str | None = Field(
+        None, description='Why it does not save, or what applies at the next start.'
+    )
+
+
+class PromptCacheOnDiskRuntime(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    runtime: str
+    conversations: int = Field(..., ge=0)
+    bytes: int = Field(..., ge=0)
+
+
+class PromptCacheOnDiskCleared(BaseModel):
+    """
+    What `DELETE /v1/prompt-cache` deleted.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    conversations: int = Field(..., description='Files deleted.', ge=0)
+    bytesFreed: int = Field(..., ge=0)
+    notDeleted: int = Field(..., description='Files the system would not delete.', ge=0)
+    reason: str | None = Field(
+        None,
+        description='The first cause a file was not deleted, as the system gave it.',
+    )
 
 
 class RuntimeSpeculation(BaseModel):
@@ -6539,6 +6593,24 @@ class ClientKeyLimits(BaseModel):
         ge=0,
         le=64,
     )
+    tokensPerDay: int | None = Field(
+        None,
+        description="Row 40: how many tokens (in and out) this key's lineage may use in\none UTC day, across every gateway. A request is refused before it\nruns once the day's tokens reach it (429, `insufficient_quota`,\n`X-Eugene-Refusal-Reason: allowance`); a request that crosses the\nline while it runs finishes. **Absent means no limit**, and no\ndefault is declared on purpose, as for `readMetrics`: the\nauthority writes it only when it is set. Not part of the policy a\nrunning request is bound to, and never sent in an admission answer.\n",
+        ge=1,
+        le=1000000000000,
+    )
+    tokensPerMonth: int | None = Field(
+        None,
+        description='Row 40. As `tokensPerDay`, for one calendar month (UTC). Absent means no limit.',
+        ge=1,
+        le=1000000000000000,
+    )
+    costPerMonthMicros: int | None = Field(
+        None,
+        description="Row 40: how much this key's lineage may spend in one calendar month\n(UTC), in millionths of a US dollar, at the install's prices (the\nowner's rate for a model, else its provider's published price, else\nnothing for a local model). A model with no price is refused while\nthis is set, because its cost cannot be counted. `0` allows only\nmodels that cost nothing. Absent means no limit.\n",
+        ge=0,
+        le=1000000000000000,
+    )
 
 
 class ClientKey(BaseModel):
@@ -6620,6 +6692,41 @@ class ClientAdmissionResult(BaseModel):
         None,
         description="The verified person's queue band from their permission groups\n(row 70): the highest band any of their groups sets. Present only\nwhen the root verified a person (`personId`) and one of their\ngroups sets a band. Absent for a key with no person, a release, or\na person whose groups set none: the key's own band, or the\ninstall's default, applies. Never taken from the caller.\n",
     )
+
+
+class ModelPriceHint(BaseModel):
+    """
+    Row 40: what a gateway knows about a model's price from its drivers.
+    `locality` is the model's `ModelLocality` (`local` only when every
+    backend serving it is local). `providerPrice` is the price its
+    provider publishes, as its driver reported it; absent when no driver
+    reported one, or when two backends report different prices and one
+    of them has none. The authority's owner rate wins over both.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    locality: ModelPriceLocality
+    providerPrice: ModelPrice | None = None
+
+
+class AdmissionUsage(BaseModel):
+    """
+    Row 40: what one served request used, as the gateway that served it
+    measured it. `model` is the model that served it (a fallback's, not
+    the one asked for), and `price` that model's hint.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str = Field(..., max_length=256, min_length=1)
+    promptTokens: int = Field(..., ge=0, le=100000000)
+    completionTokens: int = Field(..., ge=0, le=100000000)
+    price: ModelPriceHint
 
 
 class ClientKeyCreated(BaseModel):
@@ -6876,6 +6983,48 @@ class RuntimePromptCache(BaseModel):
     note: str | None = Field(
         None,
         description="Why the size is not what the profile asked for or what is\nunusual about it: a build that does not offer a setting, a size\nfrom `extraArgs` that overrides the profile's. Null when the\nsize is what the profile says.\n",
+    )
+
+
+class PromptCacheOnDisk(BaseModel):
+    """
+    What this machine keeps of its engines' prompt caches on disk, and
+    the limits it keeps them under (`GET /v1/prompt-cache`). Counts,
+    sizes and dates only; never what the conversations say.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    enabled: bool = Field(
+        ..., description='The setting `diskPromptCache` now. Off deletes every file.'
+    )
+    days: int = Field(
+        ...,
+        description='A file not used for this many days is deleted (`diskPromptCacheDays`).',
+        ge=1,
+    )
+    capBytes: int = Field(
+        ...,
+        description='Above this size the least recently used files are deleted\n(`diskPromptCacheGib`).\n',
+        ge=0,
+    )
+    bytes: int = Field(..., ge=0)
+    conversations: int = Field(
+        ..., description='Saved conversations, one file each.', ge=0
+    )
+    oldest: AwareDatetime | None = Field(
+        None, description='When the oldest file was saved. Null with no files.'
+    )
+    newest: AwareDatetime | None = Field(
+        None, description='When the newest file was saved. Null with no files.'
+    )
+    folder: str | None = Field(
+        None, description='The folder on this machine. Null when this agent has none.'
+    )
+    runtimes: list[PromptCacheOnDiskRuntime] = Field(
+        ..., description='One entry per runtime with saved conversations.'
     )
 
 
@@ -7881,6 +8030,48 @@ class NodeReachResult(BaseModel):
     )
 
 
+class ClientAdmissionRequest(BaseModel):
+    """
+    Since row 11 the gateway sends `check` when a request arrives and
+    `acquire` when the request leaves its queue, so a request that waits
+    holds no lease. A `check` that names a `model` applies the key's
+    `allowedModels` as `acquire` does, and takes nothing.
+
+    An `acquire` refused for the key's limits is a 429 with
+    `Retry-After` and `X-Eugene-Refusal-Reason`: `concurrency` when the
+    key already runs `maxConcurrentRequests` requests (on any gateway;
+    the gateway keeps the request's place and asks again), `rate` when
+    its `requestsPerMinute` are used (the gateway refuses the request).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    action: Action
+    keyId: str = Field(..., max_length=128, min_length=1)
+    requestId: str = Field(..., max_length=128, min_length=1)
+    purpose: Purpose | None = Field(
+        'inference',
+        description='Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key\'s `readMetrics` is on. It never acquires, renews or releases.\n\nLogs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI\'s external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key\'s `allowedModels` does not apply. The gateway checks the key\'s `allowedTools` and `localOnly`, as for every tool.\n',
+    )
+    model: str | None = Field(None, max_length=256, min_length=1)
+    price: ModelPriceHint | None = Field(
+        None,
+        description="Row 40, `acquire` only: how the gateway sees the requested model's\nprice, so the authority can tell whether a money allowance can\ncount it. An authority before row 40 refuses the field (422) and\nthe gateway asks again without it.\n",
+    )
+    usage: AdmissionUsage | None = Field(
+        None,
+        description="Row 40, `release` only: what the request used. The authority counts\nit for the key's lineage, the person it verified at `acquire`, and\nthat person's groups. Absent (a request that was never served, or a\ngateway before row 40) counts nothing. An authority before row 40\nrefuses the field (422) and the gateway releases again without it.\n",
+    )
+    personToken: str | None = Field(
+        None,
+        description='Root-issued OIDC access token carried alongside the app key in\nX-Eugene-Person-Token. The root checks its signature, session,\ncurrent person access and exact registered app owner on every check,\nacquisition and renewal. Required for app:workbench@ keys. Never\npersist or log this token. A standalone authority refuses it.\n',
+        max_length=16384,
+        min_length=1,
+    )
+
+
 class Runtime(BaseModel):
     """
     Combined declarative + operational view of one engine process.
@@ -7995,6 +8186,7 @@ class Runtime(BaseModel):
     loadProgress: LoadProgress | None = None
     speculation: RuntimeSpeculation | None = None
     promptCache: RuntimePromptCache | None = None
+    diskPromptCache: RuntimeDiskPromptCache | None = None
     engineLoad: int | None = Field(
         None,
         description='Requests occupying the engine now, from every client of it, as the\nengine counts them (row 14, M4-LOAD). Only vLLM says: its `GET /load`\nanswers `{"server_load": n}`, read every 2 s while the runtime is\n`ready`. llama.cpp has no such number, so the field is null there, and\nnull when the engine did not answer the last read or is not `ready`.\nIt is never a 0 for an engine that said nothing. A gateway counts only\nits own requests, so this is where another door\'s use shows. Observed,\nnever declared.\n',

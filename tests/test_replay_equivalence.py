@@ -70,6 +70,7 @@ from eugene_plexus_control.applied import (
     OP_ROTATE_SIGNING_KEY,
     OP_SET_CLIENT_KEY_LIMITS,
     OP_SET_INSTALL_CA,
+    OP_SET_MODEL_PRICE,
     OP_SET_NODE_CERTIFICATE_NAMES,
     OP_SET_OIDC_CLIENT_REDIRECTS,
     OP_SET_PERSON_PASSWORD,
@@ -145,6 +146,7 @@ EXERCISED_OPS = {
     OP_SET_NODE_CERTIFICATE_NAMES,
     OP_RETIRE_OIDC_KEYS,
     OP_CHANGE_PASSPHRASE,
+    OP_SET_MODEL_PRICE,
 }
 
 
@@ -354,6 +356,55 @@ def _write_history(machine: StateMachine) -> bytes:
             },
         },
     )
+    # Row 40: an acquire that remembers its person, its release that counts
+    # the use, and the owner's prices, set and cleared.
+    second = {
+        "started": 11.0,
+        "until": 41.0,
+        "active": True,
+        "charged": True,
+        "model": "chosen",
+        "policyDigest": "example-digest",
+    }
+    machine.append(
+        OP_PUT_CLIENT_ADMISSION,
+        {
+            "clock": 11.0,
+            "keyId": "app-key",
+            "bucket": {"second": second},
+            "usageOpen": {"requestId": "second", "person": "p-büro", "groups": ["g-1"]},
+        },
+    )
+    machine.append(
+        OP_PUT_CLIENT_ADMISSION,
+        {
+            "clock": 12.0,
+            "keyId": "app-key",
+            "bucket": {"second": {**second, "active": False}},
+            "usage": {
+                "requestId": "second",
+                "subjects": ["key:app-key", "person:p-büro", "group:g-1"],
+                "day": "2026-09-09",
+                "month": "2026-09",
+                "model": "chosen",
+                "promptTokens": 12,
+                "completionTokens": 8,
+                "costPicos": 156000000,
+            },
+        },
+    )
+    machine.append(
+        OP_SET_MODEL_PRICE,
+        {
+            "model": "chosen",
+            "price": {"outputPerMillionMicros": 15000000, "inputPerMillionMicros": 3000000},
+        },
+    )
+    machine.append(
+        OP_SET_MODEL_PRICE,
+        {"model": "gone", "price": {"inputPerMillionMicros": 1, "outputPerMillionMicros": 2}},
+    )
+    machine.append(OP_SET_MODEL_PRICE, {"model": "gone", "price": None})
 
     machine.append(OP_TOUCH_CLIENT_KEY, {"id": "app-key", "usedAt": "2026-09-09T11:21:00+00:00"})
     machine.append(
@@ -985,6 +1036,9 @@ def _genesis(machine: StateMachine) -> dict[str, Any]:
         "revokedSignIns": [],
         "accessAudit": [],
         "browserSignIn": {},
+        "clientAdmission": None,
+        "clientUsage": None,
+        "modelPrices": {},
         "signingKeyId": "1",
         "sealedSigningKey": placeholder("signing"),
     }

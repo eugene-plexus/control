@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from enum import IntEnum, StrEnum
 from typing import Any, Literal
 
@@ -1019,46 +1020,17 @@ class Purpose(StrEnum):
     metrics = 'metrics'
 
 
-class ClientAdmissionRequest(BaseModel):
-    """
-    Since row 11 the gateway sends `check` when a request arrives and
-    `acquire` when the request leaves its queue, so a request that waits
-    holds no lease. A `check` that names a `model` applies the key's
-    `allowedModels` as `acquire` does, and takes nothing.
-
-    An `acquire` refused for the key's limits is a 429 with
-    `Retry-After` and `X-Eugene-Refusal-Reason`: `concurrency` when the
-    key already runs `maxConcurrentRequests` requests (on any gateway;
-    the gateway keeps the request's place and asks again), `rate` when
-    its `requestsPerMinute` are used (the gateway refuses the request).
-
-    """
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    action: Action
-    keyId: str = Field(..., max_length=128, min_length=1)
-    requestId: str = Field(..., max_length=128, min_length=1)
-    purpose: Purpose | None = Field(
-        'inference',
-        description='Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key\'s `readMetrics` is on. It never acquires, renews or releases.\n\nLogs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI\'s external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key\'s `allowedModels` does not apply. The gateway checks the key\'s `allowedTools` and `localOnly`, as for every tool.\n',
-    )
-    model: str | None = Field(None, max_length=256, min_length=1)
-    personToken: str | None = Field(
-        None,
-        description='Root-issued OIDC access token carried alongside the app key in\nX-Eugene-Person-Token. The root checks its signature, session,\ncurrent person access and exact registered app owner on every check,\nacquisition and renewal. Required for app:workbench@ keys. Never\npersist or log this token. A standalone authority refuses it.\n',
-        max_length=16384,
-        min_length=1,
-    )
-
-
 class AdmissionRefusalReason(StrEnum):
     """
     Why an `acquire` was refused with a 429, in its
     `X-Eugene-Refusal-Reason` header (row 11): `concurrency`, the key
     already runs `maxConcurrentRequests` requests; `rate`, its
-    `requestsPerMinute` are used. An agent that forwards the root's
+    `requestsPerMinute` are used; `allowance` (row 40), a token or money
+    allowance of the key, the person or one of their groups is spent, or
+    the model has no price while a money allowance applies. An
+    `allowance` refusal is final until the allowance resets: its
+    `Retry-After` is the seconds until then, and its `detail` is the
+    sentence the caller is shown. An agent that forwards the root's
     answer passes the header on, and a standalone agent sets it the same
     way.
 
@@ -1066,6 +1038,34 @@ class AdmissionRefusalReason(StrEnum):
 
     concurrency = 'concurrency'
     rate = 'rate'
+    allowance = 'allowance'
+
+
+class ModelPrice(BaseModel):
+    """
+    Row 40: a model's rate, in millionths of a US dollar for each million
+    tokens. One micro-dollar for a million tokens is one pico-dollar a
+    token, so a request's cost is a whole number of pico-dollars:
+    `promptTokens * inputPerMillionMicros + completionTokens *
+    outputPerMillionMicros`. Integers, so every sum is exact.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    inputPerMillionMicros: int = Field(..., ge=0, le=1000000000000)
+    outputPerMillionMicros: int = Field(..., ge=0, le=1000000000000)
+
+
+class ModelPriceLocality(StrEnum):
+    """
+    Where a model runs, as the gateway's `ModelLocality` says it (row 40).
+    """
+
+    local = 'local'
+    external = 'external'
+    unknown = 'unknown'
 
 
 class QueueBand(StrEnum):
@@ -3568,6 +3568,7 @@ class LogOp(StrEnum):
     setNodeCertificateNames = 'setNodeCertificateNames'
     retireOidcKeys = 'retireOidcKeys'
     changePassphrase = 'changePassphrase'
+    setModelPrice = 'setModelPrice'
 
 
 class Group(RootModel[str]):
@@ -4195,6 +4196,105 @@ class GroupPolicies(BaseModel):
         ge=50,
         le=95,
     )
+    tokensPerDay: int | None = Field(
+        None,
+        description="Row 40: how many tokens (in and out) the group's members may use\ntogether in one UTC day, across every gateway: one allowance for\nthe whole group, counted from each request of a member that the\nroot verified (an app such as Workbench sends the person's token).\nA person whose groups set it is refused while every one of those\ngroups has spent it (the most generous applies). A person's own\nlimit is a group of one. Never in `PoliciesInEffect`. An older\nroot refuses it, and an older standby stops at a group that sets\nit until it is updated.\n",
+        ge=1,
+        le=1000000000000,
+    )
+    tokensPerMonth: int | None = Field(
+        None,
+        description='Row 40. As `tokensPerDay`, for one calendar month (UTC).',
+        ge=1,
+        le=1000000000000000,
+    )
+    costPerMonthMicros: int | None = Field(
+        None,
+        description="Row 40: how much the group's members may spend together in one\ncalendar month (UTC), in millionths of a US dollar, at the\ninstall's prices. While it is the only allowance that admits a\nmember, a model with no price is refused to them.\n",
+        ge=0,
+        le=1000000000000000,
+    )
+
+
+class OwnerModelPrice(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str = Field(..., max_length=256, min_length=1)
+    inputPerMillionMicros: int = Field(..., ge=0, le=1000000000000)
+    outputPerMillionMicros: int = Field(..., ge=0, le=1000000000000)
+
+
+class ModelPriceWrite(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str = Field(..., max_length=256, min_length=1)
+    price: ModelPrice | None = Field(
+        ..., description="The rate, or null to clear the owner's rate."
+    )
+
+
+class UsageSubjectKind(StrEnum):
+    key = 'key'
+    person = 'person'
+    group = 'group'
+
+
+class UsageAllowanceKind(StrEnum):
+    tokensPerDay = 'tokensPerDay'
+    tokensPerMonth = 'tokensPerMonth'
+    costPerMonth = 'costPerMonth'
+
+
+class Kept(BaseModel):
+    """
+    How many days and months of counters the root keeps.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    days: int
+    months: int
+
+
+class UsageModelTotals(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str
+    requests: int = Field(..., ge=0)
+    promptTokens: int = Field(..., ge=0)
+    completionTokens: int = Field(..., ge=0)
+    costUsd: str = Field(..., pattern='^[0-9]+\\.[0-9]{12}$')
+    unpricedRequests: int = Field(..., ge=0)
+
+
+class UsageAllowance(BaseModel):
+    """
+    One allowance that applies to the subject, and how much of it is
+    used. `limit`, `used` and `left` are token counts for a token
+    allowance and exact US dollar strings (twelve places) for
+    `costPerMonth`.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    kind: UsageAllowanceKind
+    limit: str
+    used: str
+    left: str
+    spent: bool = Field(
+        ..., description='True when the next request is refused for it.'
+    )
+    resetsAt: AwareDatetime
+    setBy: str | None = Field(
+        None,
+        description="For a person, the id of the group that sets it. Absent for a key's or a group's own allowance.",
+    )
 
 
 class PoliciesSetBy(BaseModel):
@@ -4806,6 +4906,24 @@ class ClientKeyLimits(BaseModel):
         ge=0,
         le=64,
     )
+    tokensPerDay: int | None = Field(
+        None,
+        description="Row 40: how many tokens (in and out) this key's lineage may use in\none UTC day, across every gateway. A request is refused before it\nruns once the day's tokens reach it (429, `insufficient_quota`,\n`X-Eugene-Refusal-Reason: allowance`); a request that crosses the\nline while it runs finishes. **Absent means no limit**, and no\ndefault is declared on purpose, as for `readMetrics`: the\nauthority writes it only when it is set. Not part of the policy a\nrunning request is bound to, and never sent in an admission answer.\n",
+        ge=1,
+        le=1000000000000,
+    )
+    tokensPerMonth: int | None = Field(
+        None,
+        description='Row 40. As `tokensPerDay`, for one calendar month (UTC). Absent means no limit.',
+        ge=1,
+        le=1000000000000000,
+    )
+    costPerMonthMicros: int | None = Field(
+        None,
+        description="Row 40: how much this key's lineage may spend in one calendar month\n(UTC), in millionths of a US dollar, at the install's prices (the\nowner's rate for a model, else its provider's published price, else\nnothing for a local model). A model with no price is refused while\nthis is set, because its cost cannot be counted. `0` allows only\nmodels that cost nothing. Absent means no limit.\n",
+        ge=0,
+        le=1000000000000000,
+    )
 
 
 class ClientKey(BaseModel):
@@ -4887,6 +5005,41 @@ class ClientAdmissionResult(BaseModel):
         None,
         description="The verified person's queue band from their permission groups\n(row 70): the highest band any of their groups sets. Present only\nwhen the root verified a person (`personId`) and one of their\ngroups sets a band. Absent for a key with no person, a release, or\na person whose groups set none: the key's own band, or the\ninstall's default, applies. Never taken from the caller.\n",
     )
+
+
+class ModelPriceHint(BaseModel):
+    """
+    Row 40: what a gateway knows about a model's price from its drivers.
+    `locality` is the model's `ModelLocality` (`local` only when every
+    backend serving it is local). `providerPrice` is the price its
+    provider publishes, as its driver reported it; absent when no driver
+    reported one, or when two backends report different prices and one
+    of them has none. The authority's owner rate wins over both.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    locality: ModelPriceLocality
+    providerPrice: ModelPrice | None = None
+
+
+class AdmissionUsage(BaseModel):
+    """
+    Row 40: what one served request used, as the gateway that served it
+    measured it. `model` is the model that served it (a fallback's, not
+    the one asked for), and `price` that model's hint.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str = Field(..., max_length=256, min_length=1)
+    promptTokens: int = Field(..., ge=0, le=100000000)
+    completionTokens: int = Field(..., ge=0, le=100000000)
+    price: ModelPriceHint
 
 
 class ClientKeyCreated(BaseModel):
@@ -5585,6 +5738,41 @@ class PermissionGroupWrite(BaseModel):
     )
 
 
+class ModelPriceList(BaseModel):
+    """
+    The owner's price for each model that has one (row 40).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    prices: list[OwnerModelPrice]
+
+
+class UsageTotals(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    requests: int = Field(..., ge=0)
+    promptTokens: int = Field(..., ge=0)
+    completionTokens: int = Field(..., ge=0)
+    tokens: int = Field(..., ge=0)
+    costUsd: str = Field(
+        ...,
+        description='US dollars, exact: a decimal with twelve places (one pico-dollar).\nA string, so no reader rounds it through a float.\n',
+        pattern='^[0-9]+\\.[0-9]{12}$',
+    )
+    unpricedRequests: int = Field(
+        ...,
+        description='Requests whose model had no price when they were counted. Their cost is unknown and is not in `costUsd`.',
+        ge=0,
+    )
+    models: list[UsageModelTotals] = Field(
+        ...,
+        description='The same counts by the model that served each request. Past 32 models in one period, the rest are under `*`.',
+    )
+
+
 class PoliciesInEffect(BaseModel):
     """
     The policies that apply to a person now (row 70), from the groups
@@ -5839,6 +6027,48 @@ class JobSiteAudit(BaseModel):
         extra='forbid',
     )
     entries: list[SiteAuditEntry]
+
+
+class ClientAdmissionRequest(BaseModel):
+    """
+    Since row 11 the gateway sends `check` when a request arrives and
+    `acquire` when the request leaves its queue, so a request that waits
+    holds no lease. A `check` that names a `model` applies the key's
+    `allowedModels` as `acquire` does, and takes nothing.
+
+    An `acquire` refused for the key's limits is a 429 with
+    `Retry-After` and `X-Eugene-Refusal-Reason`: `concurrency` when the
+    key already runs `maxConcurrentRequests` requests (on any gateway;
+    the gateway keeps the request's place and asks again), `rate` when
+    its `requestsPerMinute` are used (the gateway refuses the request).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    action: Action
+    keyId: str = Field(..., max_length=128, min_length=1)
+    requestId: str = Field(..., max_length=128, min_length=1)
+    purpose: Purpose | None = Field(
+        'inference',
+        description='Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key\'s `readMetrics` is on. It never acquires, renews or releases.\n\nLogs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI\'s external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key\'s `allowedModels` does not apply. The gateway checks the key\'s `allowedTools` and `localOnly`, as for every tool.\n',
+    )
+    model: str | None = Field(None, max_length=256, min_length=1)
+    price: ModelPriceHint | None = Field(
+        None,
+        description="Row 40, `acquire` only: how the gateway sees the requested model's\nprice, so the authority can tell whether a money allowance can\ncount it. An authority before row 40 refuses the field (422) and\nthe gateway asks again without it.\n",
+    )
+    usage: AdmissionUsage | None = Field(
+        None,
+        description="Row 40, `release` only: what the request used. The authority counts\nit for the key's lineage, the person it verified at `acquire`, and\nthat person's groups. Absent (a request that was never served, or a\ngateway before row 40) counts nothing. An authority before row 40\nrefuses the field (422) and the gateway releases again without it.\n",
+    )
+    personToken: str | None = Field(
+        None,
+        description='Root-issued OIDC access token carried alongside the app key in\nX-Eugene-Person-Token. The root checks its signature, session,\ncurrent person access and exact registered app owner on every check,\nacquisition and renewal. Required for app:workbench@ keys. Never\npersist or log this token. A standalone authority refuses it.\n',
+        max_length=16384,
+        min_length=1,
+    )
 
 
 class Node(BaseModel):
@@ -6235,6 +6465,14 @@ class Snapshot(BaseModel):
         description='Durable logical clock and per-key admission buckets; replayed verbatim with leases and rolling-window charges.',
     )
     accessAudit: list[AccessAuditEvent] | None = Field(None, max_length=1000)
+    clientUsage: dict[str, Any] | None = Field(
+        None,
+        description='Row 40: the usage counters per key lineage, person and group, per\nUTC day (62 kept) and calendar month (13 kept), and the subjects\nof each running request a person was verified for (`open`, by\nrequest id), so its release counts for them. Written by\n`putClientAdmission` entries (`usageOpen` at an acquire, `usage`\nat a release). A root before row 40 ignores it.\n',
+    )
+    modelPrices: dict[str, ModelPrice] | None = Field(
+        None,
+        description="Row 40: the owner's price for each model, by model id, as\n`setModelPrice` wrote it (`{model, price}`; `price: null`\nremoves it).\n",
+    )
     clientKeys: list[ClientKey] | None = None
     index: int
     epoch: int
@@ -6375,6 +6613,25 @@ class PersonList(BaseModel):
         None,
         description='The name the owner signs in with, once the install has people.',
     )
+
+
+class UsageSubject(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    kind: UsageSubjectKind
+    id: str = Field(
+        ...,
+        description="A key's lineage (its first key's id), a person's id, or a group's id.",
+    )
+    name: str = Field(
+        ...,
+        description="The key's, person's or group's name now. A subject that no longer exists keeps its id as its name.",
+    )
+    day: UsageTotals
+    month: UsageTotals
+    range: UsageTotals | None = None
+    allowances: list[UsageAllowance]
 
 
 class SiteSummary(BaseModel):
@@ -6543,6 +6800,27 @@ class EngineFitModel(BaseModel):
         None,
         description="`engine_table`: the engine's answer for each model it runs, on\nthe node that reported it.\n",
     )
+
+
+class UsageReport(BaseModel):
+    """
+    Row 40, `GET /v1/usage` and `GET /v1/usage/me`.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    day: date = Field(..., description="The UTC day each subject's `day` reports.")
+    month: str = Field(
+        ...,
+        description="The calendar month (`YYYY-MM`) each subject's `month` reports.",
+    )
+    from_: date | None = Field(None, alias='from')
+    to: date | None = None
+    kept: Kept = Field(
+        ..., description='How many days and months of counters the root keeps.'
+    )
+    subjects: list[UsageSubject]
 
 
 class SiteReport(BaseModel):

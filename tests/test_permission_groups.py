@@ -171,7 +171,14 @@ def test_group_revocation_between_approval_and_code_exchange(active_client: Test
 # row 70: policies per group
 # --------------------------------------------------------------------------- #
 
-UNSET = {"queueBand": None, "summaryContextPercent": None}
+#: Row 40 added the usage allowances, answered as null when not set.
+UNSET = {
+    "queueBand": None,
+    "summaryContextPercent": None,
+    "tokensPerDay": None,
+    "tokensPerMonth": None,
+    "costPerMonthMicros": None,
+}
 
 
 def test_group_policies_are_set_kept_by_an_older_console_and_cleared(
@@ -184,14 +191,14 @@ def test_group_policies_are_set_kept_by_an_older_console_and_cleared(
     set_ = group(
         c, name="Night shift", policies={"queueBand": "background", "summaryContextPercent": 70}
     )
-    assert set_["policies"] == {"queueBand": "background", "summaryContextPercent": 70}
+    assert set_["policies"] == {**UNSET, "queueBand": "background", "summaryContextPercent": 70}
     path = f"/v1/permission-groups/{set_['id']}"
     # A console that predates policies sends none: the group keeps them.
     kept = c.put(path, json={"name": "Night shift", "description": "Late"}).json()
     assert kept["policies"] == set_["policies"] and kept["description"] == "Late"
     # Policies are replaced whole: what is not sent is not set.
     replaced = c.put(path, json={"name": "Night shift", "policies": {"summaryContextPercent": 90}})
-    assert replaced.json()["policies"] == {"queueBand": None, "summaryContextPercent": 90}
+    assert replaced.json()["policies"] == {**UNSET, "summaryContextPercent": 90}
     cleared = c.put(path, json={"name": "Night shift", "policies": UNSET}).json()
     assert cleared["policies"] == UNSET
     assert "policies" not in c.app.state.machine.state.permission_groups[set_["id"]]

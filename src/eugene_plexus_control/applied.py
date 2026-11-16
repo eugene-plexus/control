@@ -73,6 +73,7 @@ from functools import partial
 from typing import Any
 
 from . import sign_in_state
+from . import usage as usage_counts
 
 # Op names, matching `LogOp` in control.yaml. Duplicated as constants
 # rather than imported from the generated enum so this module stays free
@@ -123,6 +124,8 @@ OP_SET_NODE_CERTIFICATE_NAMES = "setNodeCertificateNames"
 # Row 5 (`specs/docs/design/rows/row-05.md`), log version 1.
 OP_RETIRE_OIDC_KEYS = "retireOidcKeys"
 OP_CHANGE_PASSPHRASE = "changePassphrase"
+# Row 40 (`specs/docs/design/rows/row-40.md`), log version 2.
+OP_SET_MODEL_PRICE = "setModelPrice"
 
 #: The log version this build applies (`Eugene-Plexus-Log-Version`, row 5):
 #: which ops it knows. Every build reports the same `__version__`, so a root
@@ -132,7 +135,9 @@ OP_CHANGE_PASSPHRASE = "changePassphrase"
 #: * 0: every op before row 5 (what a standby that sends no number applies).
 #: * 1: `retireOidcKeys`, `changePassphrase`, and every op merged before them
 #:   (`rotateClientKey` and `touchClientKey` among them).
-LOG_VERSION = 1
+#: * 2: `setModelPrice` (row 40), and the usage allowances in a key's limits
+#:   and a group's policies, which a version-1 copy refuses.
+LOG_VERSION = 2
 
 #: The grant that makes a node the install's warm standby (warm-standby.md).
 GRANT_STANDBY = "standby"
@@ -183,6 +188,7 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_SET_NODE_CERTIFICATE_NAMES,
         OP_RETIRE_OIDC_KEYS,
         OP_CHANGE_PASSPHRASE,
+        OP_SET_MODEL_PRICE,
     }
 )
 
@@ -460,6 +466,11 @@ class AppliedState:
     identity: InstallIdentity = field(default_factory=InstallIdentity)
     client_keys: dict[str, dict[str, Any]] = field(default_factory=dict)
     client_admission: dict[str, Any] = field(default_factory=lambda: {"clock": 0.0, "buckets": {}})
+    client_usage: dict[str, Any] = field(default_factory=usage_counts.empty)
+    """Row 40: usage counters per key lineage, person and group, and the
+    person each running request was verified for (`usage.py`)."""
+    model_prices: dict[str, dict[str, int]] = field(default_factory=dict)
+    """Row 40: the owner's price for each model, by model id."""
     access_audit: list[dict[str, Any]] = field(default_factory=list)
     browser_sign_in: dict[str, Any] = field(
         default_factory=lambda: {
@@ -1114,9 +1125,36 @@ def _apply_put_client_admission(
         keys = state.client_keys
         if used is not None and used in keys:
             keys = {**keys, used: _touched(state, used, payload["usedAt"])}
+        # Row 40: an acquire remembers the person it verified; a release counts
+        # what the request used. A root before row 40 ignores both.
+        counts = state.client_usage
+        if "usageOpen" in payload:
+            counts = usage_counts.opened(counts, payload["usageOpen"])
+        if "usage" in payload:
+            counts = usage_counts.counted(counts, payload["usage"])
+        counts = usage_counts.settled(counts, ledger)
     except (ValueError, TypeError, KeyError, ApplyError) as exc:
         raise ApplyError("invalid admission update") from exc
-    return replace(state, client_admission=ledger, client_keys=keys)
+    return replace(state, client_admission=ledger, client_keys=keys, client_usage=counts)
+
+
+def _apply_set_model_price(
+    state: AppliedState, payload: dict[str, Any], index: int
+) -> AppliedState:
+    """Row 40: set (`price` an object) or clear (`price` null) the owner's
+    rate for one model."""
+    model, price = payload.get("model"), payload.get("price", ...)
+    if not isinstance(model, str) or not 1 <= len(model) <= 256 or price is ...:
+        raise ApplyError("invalid model price")
+    prices = dict(state.model_prices)
+    if price is None:
+        prices.pop(model, None)
+    else:
+        try:
+            prices[model] = usage_counts.valid_price(price)
+        except ValueError as exc:
+            raise ApplyError("invalid model price") from exc
+    return replace(state, model_prices=prices)
 
 
 def _apply_revoke_client_key(
@@ -1201,7 +1239,9 @@ def _permission_group_record(raw: Any) -> dict[str, Any]:
 
 def _check_group_policies(raw: Any) -> None:
     """`GroupPolicies` as the log keeps it: only the policies set, never
-    null, never empty, and nothing else, so one form has one byte string."""
+    null, never empty, and nothing else, so one form has one byte string.
+    Row 40's usage allowances are policies too (`usage.GROUP_ALLOWANCES`)."""
+    from .client_admission import validate_allowances
     from .permissions import (
         GROUP_POLICIES,
         QUEUE_BANDS,
@@ -1209,8 +1249,15 @@ def _check_group_policies(raw: Any) -> None:
         SUMMARY_PERCENT_MIN,
     )
 
-    if not isinstance(raw, dict) or not raw or raw.keys() - set(GROUP_POLICIES):
+    known = set(GROUP_POLICIES) | set(usage_counts.GROUP_ALLOWANCES)
+    if not isinstance(raw, dict) or not raw or raw.keys() - known:
         raise ApplyError("invalid permission group policies")
+    allowances = {k: raw[k] for k in usage_counts.GROUP_ALLOWANCES if k in raw}
+    try:
+        if validate_allowances(allowances) != allowances:
+            raise ValueError("null allowance")
+    except ValueError as exc:
+        raise ApplyError("invalid permission group allowance") from exc
     if "queueBand" in raw and raw["queueBand"] not in QUEUE_BANDS:
         raise ApplyError("invalid permission group policy queueBand")
     if "summaryContextPercent" in raw:
@@ -1732,6 +1779,7 @@ _HANDLERS: dict[str, _Handler] = {
     OP_SET_NODE_CERTIFICATE_NAMES: _apply_set_node_certificate_names,
     OP_RETIRE_OIDC_KEYS: _apply_retire_oidc_keys,
     OP_CHANGE_PASSPHRASE: _apply_change_passphrase,
+    OP_SET_MODEL_PRICE: _apply_set_model_price,
     **{op: partial(sign_in_state.apply, op=op) for op in sign_in_state.OPS},
 }
 
@@ -1799,6 +1847,8 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
         "config": dict(state.config),
         "clientKeys": [state.client_keys[key] for key in sorted(state.client_keys)],
         "clientAdmission": state.client_admission,
+        "clientUsage": state.client_usage,
+        "modelPrices": {model: state.model_prices[model] for model in sorted(state.model_prices)},
         "accessAudit": state.access_audit,
         "browserSignIn": state.browser_sign_in,
         "salt": identity.salt,
@@ -1922,6 +1972,8 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         runtimes=runtimes,
         config=dict(raw.get("config") or {}),
         client_admission=validate_ledger(raw.get("clientAdmission")),
+        client_usage=_usage_from(raw.get("clientUsage")),
+        model_prices=_prices_from(raw.get("modelPrices")),
         access_audit=validate_audit(raw.get("accessAudit", [])),
         client_keys=_key_records(raw.get("clientKeys", [])),
         revoked_sessions={str(r["jti"]): int(r["exp"]) for r in raw.get("revokedSessions") or []},
@@ -1946,3 +1998,18 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
             sealedInstallCaKey=raw.get("sealedInstallCaKey"),
         ),
     )
+
+
+def _usage_from(raw: Any) -> dict[str, Any]:
+    """Row 40's counters from a snapshot; a snapshot before row 40 has none."""
+    try:
+        return usage_counts.validate(raw)
+    except ValueError as exc:
+        raise ApplyError(f"invalid usage counters in snapshot: {exc}") from exc
+
+
+def _prices_from(raw: Any) -> dict[str, dict[str, int]]:
+    try:
+        return usage_counts.validate_prices(raw)
+    except ValueError as exc:
+        raise ApplyError(f"invalid model prices in snapshot: {exc}") from exc

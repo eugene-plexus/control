@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 
 from .. import oidc, permissions, security
+from .. import usage as usage_counts
 from .._generated.models import (
     AdministrationGrants,
     OidcClient,
@@ -64,6 +65,7 @@ from ..dependencies import (
 )
 from ..state_machine import StateMachine
 from .administration import revoke_operations
+from .usage import standby_can_hold
 
 router = APIRouter(tags=["people"], dependencies=[Depends(require_directory_reader)])
 # Registering and removing an app's sign-in is also what installing an app on
@@ -174,8 +176,12 @@ def _group_view(record: dict[str, Any]) -> PermissionGroup:
     for each policy not set, so a console can tell this root knows them."""
     kept = record.get("policies") or {}
     return PermissionGroup.model_validate(
-        {**record, "policies": {policy: kept.get(policy) for policy in permissions.GROUP_POLICIES}}
+        {**record, "policies": {policy: kept.get(policy) for policy in _POLICIES}}
     )
+
+
+#: Every policy a group sets: row 70's, and row 40's usage allowances.
+_POLICIES = (*permissions.GROUP_POLICIES, *usage_counts.GROUP_ALLOWANCES)
 
 
 def _group_policies(body: PermissionGroupWrite, existing: dict[str, Any] | None) -> dict[str, Any]:
@@ -190,7 +196,7 @@ def _group_policies(body: PermissionGroupWrite, existing: dict[str, Any] | None)
     if body.policies is None:
         return {}
     chosen = body.policies.model_dump(mode="json", exclude_none=True)
-    return {policy: chosen[policy] for policy in permissions.GROUP_POLICIES if policy in chosen}
+    return {policy: chosen[policy] for policy in _POLICIES if policy in chosen}
 
 
 def _group_write(
@@ -237,6 +243,7 @@ async def create_group(
     admin.require("manageGroups")
     machine = _active(request)
     record = _group_write(machine, body, uuid.uuid4().hex)
+    standby_can_hold(request.app, record.get("policies"))
     machine.append(OP_PUT_PERMISSION_GROUP, {"group": record}, actor=admin.claims.sub)
     admin.audit("create-group", record["id"])
     return _group_view(record)
@@ -248,8 +255,11 @@ async def replace_group(
 ) -> PermissionGroup:
     admin.require("manageGroups")
     machine = _active(request)
-    _group(machine, group_id)
+    before = _group(machine, group_id)
     record = _group_write(machine, body, group_id)
+    if record.get("policies") != before.get("policies"):
+        # Row 40: an allowance stops a standby a release behind; say so first.
+        standby_can_hold(request.app, record.get("policies"))
     machine.append(OP_PUT_PERMISSION_GROUP, {"group": record}, actor=admin.claims.sub)
     admin.audit("edit-group", group_id)
     return _group_view(record)

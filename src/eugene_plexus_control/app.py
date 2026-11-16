@@ -58,6 +58,7 @@ from .routes import oidc as oidc_routes
 from .routes import people as people_routes
 from .routes import people_known as people_known_routes
 from .routes import topology as topology_routes
+from .routes import usage as usage_routes
 from .routes.nodes import service_token_for
 from .settings import Settings, load_settings
 from .state_machine import ROLE_ACTIVE, ROLE_STANDBY, StateMachine
@@ -680,6 +681,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health_routes.router)
     app.include_router(auth_routes.router)
     app.include_router(client_key_routes.router)
+    app.include_router(usage_routes.router)
     app.include_router(node_routes.router)
     app.include_router(control_routes.router)
     app.include_router(topology_routes.router)

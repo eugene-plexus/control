@@ -317,8 +317,16 @@ class StateMachine:
         person_token: str | None = None,
         app_metadata_only: bool = False,
         purpose: str = "inference",
+        price: dict[str, Any] | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Read, decide and commit under one lock, including policy edits."""
+        """Read, decide and commit under one lock, including policy edits.
+
+        Row 40: an inference `acquire` is refused when a usage allowance that
+        applies is spent (`usage.refuse_if_spent`), and remembers the person it
+        verified; a `release` that carries `usage` counts it, once, for the
+        key's lineage, that person and their groups, at the install's price."""
+        from . import usage as counts
         from .applied import OP_PUT_CLIENT_ADMISSION, OP_TOUCH_CLIENT_KEY
         from .client_admission import decide, lineage_of
         from .person_access import check, queue_band
@@ -338,6 +346,34 @@ class StateMachine:
                 if action != "release" and not app_metadata_only
                 else {}
             )
+            key = self._state.client_keys.get(key_id)
+            # Whether the release ends a lease that is still held: only such a
+            # release counts, so a second release of one request counts nothing.
+            held_before = (
+                ledger["buckets"].get(lineage_of(key, key_id), {}).get(request_id)
+                if action == "release"
+                else None
+            )
+            wall = datetime.now(UTC)
+            if (
+                action == "check"
+                and model
+                and purpose == "inference"
+                and not app_metadata_only
+                and key is not None
+            ):
+                # Refused on arrival, before it waits in a queue, when a token
+                # allowance is spent; money waits for the price at `acquire`.
+                counts.refuse_if_spent(
+                    self._state,
+                    key=key,
+                    key_id=key_id,
+                    person_id=identity.get("personId"),
+                    model=model,
+                    hint=None,
+                    now=wall,
+                    money=False,
+                )
             result, candidate = decide(
                 ledger,
                 self._state.client_keys.get(key_id),
@@ -349,7 +385,6 @@ class StateMachine:
                 principal=identity,
                 purpose=purpose,
             )
-            key = self._state.client_keys.get(key_id)
             used = _minute_after(key, action)
             if candidate is not None:
                 bucket_id = lineage_of(key, key_id)
@@ -360,6 +395,49 @@ class StateMachine:
                 }
                 if used is not None:
                     payload |= {"usedId": key_id, "usedAt": used}
+                if action == "acquire" and purpose == "inference" and model:
+                    counts.refuse_if_spent(
+                        self._state,
+                        key=key,
+                        key_id=key_id,
+                        person_id=identity.get("personId"),
+                        model=model,
+                        hint=price,
+                        now=wall,
+                    )
+                    person = identity.get("personId")
+                    if person:
+                        payload["usageOpen"] = {
+                            "requestId": request_id,
+                            "person": person,
+                            "groups": [g["id"] for g in counts.groups_of(self._state, person)],
+                        }
+                if (
+                    action == "release"
+                    and usage is not None
+                    and held_before is not None
+                    and held_before["active"]
+                ):
+                    rate, _ = counts.price_of(
+                        self._state.model_prices, usage["model"], usage.get("price")
+                    )
+                    payload["usage"] = {
+                        "requestId": request_id,
+                        "subjects": counts.subjects_for(
+                            self._state,
+                            key,
+                            key_id,
+                            self._state.client_usage["open"].get(request_id),
+                        ),
+                        "day": counts.day_of(wall),
+                        "month": counts.month_of(wall),
+                        "model": usage["model"],
+                        "promptTokens": usage["promptTokens"],
+                        "completionTokens": usage["completionTokens"],
+                        "costPicos": counts.cost_picos(
+                            rate, usage["promptTokens"], usage["completionTokens"]
+                        ),
+                    }
                 self.append(OP_PUT_CLIENT_ADMISSION, payload)
             elif used is not None:
                 # A check writes at most one entry a minute for each key.
