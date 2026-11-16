@@ -6,6 +6,7 @@ import logging
 import secrets
 import time
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
@@ -29,7 +30,12 @@ from ..applied import (
     OP_SET_CLIENT_KEY_LIMITS,
     ApplyError,
 )
-from ..client_admission import AdmissionClock, AdmissionRefusal, validate_limits
+from ..client_admission import (
+    USAGE_LIMITS,
+    AdmissionClock,
+    AdmissionRefusal,
+    validate_limits,
+)
 from ..dependencies import (
     ActingOperator,
     problem,
@@ -53,6 +59,17 @@ def active(request: Request) -> StateMachine:
 
 def authority(machine: StateMachine) -> str:
     return "control:" + str(machine.state.identity.controlPublicKey)
+
+
+def kept_allowances(sent: ClientKeyLimits, current: dict[str, Any]) -> dict[str, Any]:
+    """The limits an edit sets (review S2): every limit as sent, but a usage
+    allowance the edit leaves out keeps the key's current one, and `null` clears
+    it. A console a release behind knows no allowance, so it never clears one."""
+    out = sent.model_dump(exclude_none=True)
+    for name in USAGE_LIMITS:
+        if name not in sent.model_fields_set and current.get(name) is not None:
+            out[name] = current[name]
+    return out
 
 
 def records(machine: StateMachine) -> list[ClientKey]:
@@ -271,7 +288,12 @@ async def set_limits(request: Request, key_id: str, body: ClientKeyUpdateRequest
     if key_id not in machine.state.client_keys:
         raise problem(404, "No such key", "This key is not in the registry.")
     try:
-        limits = validate_limits(body.limits.model_dump(exclude_none=True))
+        limits = validate_limits(
+            kept_allowances(
+                body.limits,
+                machine.state.client_keys[key_id].get("limits") or {},
+            )
+        )
         standby_can_hold(request.app, limits)
         machine.append(OP_SET_CLIENT_KEY_LIMITS, {"id": key_id, "limits": limits}, actor="operator")
     except ValueError as exc:

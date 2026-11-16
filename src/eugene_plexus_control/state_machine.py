@@ -421,6 +421,12 @@ class StateMachine:
                     rate, _ = counts.price_of(
                         self._state.model_prices, usage["model"], usage.get("price")
                     )
+                    admitted = str(held_before.get("model") or "")
+                    if rate is None and admitted and admitted != usage["model"]:
+                        # Review S1: served under another name (a slot, an alias, a
+                        # backend answering as its dated snapshot) that has no price:
+                        # priced at the model its lease was acquired for.
+                        rate, _ = counts.price_of(self._state.model_prices, admitted, None)
                     payload["usage"] = {
                         "requestId": request_id,
                         "subjects": counts.subjects_for(

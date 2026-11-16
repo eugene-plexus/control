@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -312,36 +312,204 @@ def test_an_older_standby_holds_back_the_first_allowance(active_client, monkeypa
     assert c.post("/v1/auth/client-keys", json={"name": "y"}).status_code == 201
 
 
-def test_counters_are_bounded_and_dropped_after_keeping():
+def _record(day: str, rid: str = "r", model: str = "m", cost: int | None = 0) -> dict:
+    return {
+        "requestId": rid,
+        "subjects": ["key:k"],
+        "day": day,
+        "month": day[:7],
+        "model": model,
+        "promptTokens": 10,
+        "completionTokens": 5,
+        "costPicos": cost,
+    }
+
+
+def test_a_period_holds_at_most_its_models():
     usage = counts.empty()
     for n in range(40):
-        usage = counts.counted(
-            usage,
-            {
-                "requestId": f"r{n}",
-                "subjects": ["key:k"],
-                "day": "2026-01-01",
-                "month": "2026-01",
-                "model": f"model-{n}",
-                "promptTokens": 1,
-                "completionTokens": 1,
-                "costPicos": None,
-            },
-        )
+        usage = counts.counted(usage, _record("2026-01-01", f"r{n}", f"model-{n}", None))
     models = usage["counters"]["key:k"]["d:2026-01-01"]["models"]
     assert len(models) == counts.MODELS_KEPT + 1 and models["*"]["requests"] == 8
-    later = counts.counted(
-        usage,
-        {
-            "requestId": "late",
-            "subjects": ["key:other"],
-            "day": "2027-03-01",
-            "month": "2027-03",
-            "model": "m",
-            "promptTokens": 1,
-            "completionTokens": 0,
-            "costPicos": 0,
+
+
+def test_any_state_counted_writes_passes_validate():
+    """Review B2: the bound is held by `counted` itself, whatever the dates."""
+    import random
+
+    rng = random.Random(40)
+    usage = counts.empty()
+    start = date(2026, 1, 1)
+    for n in range(1500):
+        # Mostly day after day, with clocks that jump years ahead and back.
+        jump = rng.choice([0] * 20 + [400, -400, 3650, -30])
+        day = start + timedelta(days=n // 3 + jump)
+        usage = counts.counted(usage, _record(day.isoformat(), f"r{n}"))
+        assert counts.validate(usage) == usage
+    periods = usage["counters"]["key:k"]
+    assert sum(p.startswith("d:") for p in periods) <= counts.DAYS_KEPT
+    assert sum(p.startswith("m:") for p in periods) <= counts.MONTHS_KEPT
+
+
+def test_a_clock_once_a_year_ahead_wipes_nothing():
+    usage = counts.empty()
+    start = date(2026, 1, 1)
+    for n in range(100):
+        usage = counts.counted(usage, _record((start + timedelta(days=n)).isoformat(), cost=10**9))
+    april = counts.totals_of(usage, "key:k", "m:2026-04")["costPicos"]
+    assert april > 0
+    usage = counts.counted(usage, _record("2028-01-01", "skewed"))
+    assert counts.totals_of(usage, "key:k", "m:2026-04")["costPicos"] == april
+    # The clock is right again: today's requests count into today.
+    usage = counts.counted(usage, _record("2026-04-11", "back"))
+    assert counts.totals_of(usage, "key:k", "d:2026-04-11")["requests"] == 1
+    assert counts.totals_of(usage, "key:k", "m:2026-04")["requests"] == 11
+
+
+def test_a_root_whose_clock_ran_ahead_still_loads_its_snapshot(tmp_path):
+    """Review B2's restart: a skewed release, a year of use, a snapshot, a reload."""
+    from eugene_plexus_control.applied import OP_PUT_CLIENT_ADMISSION
+    from eugene_plexus_control.log_store import LogStore
+    from eugene_plexus_control.state_machine import StateMachine
+
+    machine = StateMachine(LogStore(tmp_path), compact_threshold=40)
+    machine.load()
+
+    def release(n: int, day: str) -> None:
+        machine.append(
+            OP_PUT_CLIENT_ADMISSION,
+            {"clock": float(n), "keyId": "k", "bucket": {}, "usage": _record(day, f"r{n}")},
+        )
+
+    release(1, "2026-11-16")
+    release(2, "2027-12-01")  # one release while the clock was a year ahead
+    for n in range(3, 160):
+        release(n, (date(2026, 11, 16) + timedelta(days=n)).isoformat())
+    machine.snapshot_now()
+    reloaded = StateMachine(LogStore(tmp_path), compact_threshold=40)
+    reloaded.load()
+    assert reloaded.state.client_usage == machine.state.client_usage
+    assert counts.totals_of(reloaded.state.client_usage, "key:k", "d:2027-12-01")["requests"] >= 1
+
+
+# --------------------------------------------------------------------------- #
+# review fixes (S1, S2, S5, S6)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_request_served_under_another_name_is_priced_at_the_admitted_model(active_client):
+    """S1: a backend that answers as its dated snapshot must not make it free."""
+    c = active_client
+    key = mint(c, costPerMonthMicros=10_000)
+    c.put(
+        "/v1/usage/prices",
+        json={
+            "model": "gpt-4o",
+            "price": {"inputPerMillionMicros": 2_500_000, "outputPerMillionMicros": 10_000_000},
+        },
+    ).raise_for_status()
+    assert admit(c, key, "acquire", "r1", model="gpt-4o", price=CLOUD).status_code == 200
+    used = {
+        "model": "gpt-4o-2024-08-06",
+        "promptTokens": 1000,
+        "completionTokens": 100,
+        "price": {"locality": "unknown"},
+    }
+    assert admit(c, key, "release", "r1", model="gpt-4o", usage=used).status_code == 200
+    month = subject(c, "key", key)["month"]
+    # 1,000 at $2.50 a million and 100 at $10: $0.0035.
+    assert month["costUsd"] == "0.003500000000" and month["unpricedRequests"] == 0
+
+
+def test_an_older_console_editing_a_group_keeps_its_allowances(active_client):
+    """S2: v0.7.0's console sends row 70's two policies on every edit."""
+    c = active_client
+    sales = group(c, name="Sales", policies={"costPerMonthMicros": 4_000_000})
+    edited = c.put(
+        f"/v1/permission-groups/{sales['id']}",
+        json={
+            "name": "Sales team",
+            "apps": None,
+            "permissions": [],
+            "policies": {"queueBand": None, "summaryContextPercent": None},
         },
     )
-    assert "key:k" not in later["counters"], "14 months on, nothing of k is kept"
-    assert counts.validate(later) == later
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["policies"]["costPerMonthMicros"] == 4_000_000
+    cleared = c.put(
+        f"/v1/permission-groups/{sales['id']}",
+        json={"name": "Sales team", "policies": {"costPerMonthMicros": None}},
+    )
+    assert cleared.json()["policies"]["costPerMonthMicros"] is None
+
+
+def test_an_older_console_editing_a_key_keeps_its_allowances(active_client):
+    c = active_client
+    key = mint(c, tokensPerDay=1000)
+    before = c.get("/v1/auth/client-keys").json()["keys"][0]["limits"]
+    older = {k: v for k, v in before.items() if k != "tokensPerDay"}
+    older["requestsPerMinute"] = 30
+    edited = c.put(f"/v1/auth/client-keys/{key}/limits", json={"limits": older})
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["limits"]["tokensPerDay"] == 1000
+    assert edited.json()["limits"]["requestsPerMinute"] == 30
+    cleared = c.put(
+        f"/v1/auth/client-keys/{key}/limits", json={"limits": {**older, "tokensPerDay": None}}
+    )
+    assert "tokensPerDay" not in cleared.json()["limits"]
+
+
+def test_a_membership_administrator_sees_only_their_groups_and_sets_no_price(active_client):
+    """S5: who reads whose usage, pinned."""
+    from tests.test_administration import delegate
+
+    c = active_client
+    mint(c, name="secret key")
+    sales = group(c, name="Sales", policies={"tokensPerDay": 5})
+    legal = group(c, name="Legal", policies={"tokensPerDay": 5})
+    person(c, name="Lena", groups=[legal["id"]])
+    person(c, name="Sam", groups=[sales["id"]])
+    _, auth = delegate(c, membershipGroups=[sales["id"]])
+    seen = {(s["kind"], s["name"]) for s in c.get("/v1/usage", headers=auth).json()["subjects"]}
+    assert seen == {("group", "Sales"), ("person", "Sam")}, seen
+    price = {"model": "m", "price": {"inputPerMillionMicros": 0, "outputPerMillionMicros": 0}}
+    assert c.put("/v1/usage/prices", headers=auth, json=price).status_code in (401, 403)
+    assert c.get("/v1/usage/prices", headers=auth).status_code == 200
+
+
+def test_a_person_reads_only_their_own_and_no_other_members_models(active_client):
+    """S5: /oidc/usage answers for the token's person only, and a group's totals
+    carry no breakdown of what other members used."""
+    c = active_client
+    app, key = _signed(c)
+    cid = app["client"]["clientId"]
+    sales = group(c, name="Sales", apps=[cid], policies={"tokensPerDay": 1000})
+    person(c, name="Ada", groups=[sales["id"]])
+    bob = person(c, name="Bob", groups=[sales["id"]])
+    ada = _tokens(c, app, name="Ada", password=PASSWORD)["access_token"]
+    bobs = _tokens(c, app, name="Bob", password=PASSWORD)["access_token"]
+    assert serve(c, key, "b1", model="secret-model", prompt=50, token=bobs).status_code == 200
+    mine = c.get("/oidc/usage", headers={"Authorization": f"Bearer {ada}"}).json()
+    people = [s for s in mine["subjects"] if s["kind"] == "person"]
+    (team,) = [s for s in mine["subjects"] if s["kind"] == "group"]
+    assert [p["name"] for p in people] == ["Ada"] and bob["id"] not in str(mine)
+    assert team["day"]["tokens"] == 55 and team["day"]["models"] == []
+    assert "secret-model" not in str(mine)
+    # A person's token opens nothing of the owner's report.
+    assert c.get("/v1/usage", headers={"Authorization": f"Bearer {ada}"}).status_code in (
+        401,
+        403,
+    )
+
+
+def test_an_allowance_is_reported_for_now_whatever_period_is_shown(active_client):
+    """S6: a past month's report must not say "spent, refused until <a past date>"."""
+    c = active_client
+    key = mint(c, tokensPerMonth=10)
+    assert serve(c, key, "now", prompt=10, completion=5).status_code == 200
+    past = c.get("/v1/usage", params={"day": "2025-01-15", "month": "2025-01"}).json()
+    (mine,) = [s for s in past["subjects"] if s["id"] == key]
+    (allowance,) = mine["allowances"]
+    assert mine["month"]["tokens"] == 0, "January 2025 had no use"
+    assert allowance["used"] == "15" and allowance["spent"] is True
+    assert allowance["resetsAt"] > datetime.now(UTC).isoformat()

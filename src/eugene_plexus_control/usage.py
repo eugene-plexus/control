@@ -25,16 +25,22 @@ key's counters), the person the root verified at `acquire`, and each of that
 person's groups then. An allowance is checked before a request runs; a request
 that crosses the line while it runs finishes, and the next is refused.
 
-Counters are kept per UTC day for `DAYS_KEPT` days and per calendar month for
-`MONTHS_KEPT` months, and each holds at most `MODELS_KEPT` models (the rest
-under `*`), so the replicated state stays bounded.
+Each subject keeps its newest `DAYS_KEPT` UTC days and newest `MONTHS_KEPT`
+calendar months with use, and each period at most `MODELS_KEPT` models (the rest
+under `*`), so the replicated state stays bounded. **The bound is held by
+count, on every count, never by age against one record's date** (review B2): a
+release dated by a root whose clock was a year ahead adds one stray period to
+the subjects it touches and wipes nothing, and no state `counted` writes can
+fail `validate`, so a root always loads its own snapshot. A record is never
+moved to another day either: after a clock that ran ahead, requests dated today
+count into today, where today's allowances read them.
 """
 
 from __future__ import annotations
 
 import calendar
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -194,7 +200,7 @@ def money_words(picos: int) -> str:
 
 
 def empty() -> dict[str, Any]:
-    return {"counters": {}, "open": {}, "pruned": ""}
+    return {"counters": {}, "open": {}}
 
 
 def _nonnegative(value: Any) -> bool:
@@ -221,13 +227,11 @@ def validate(raw: Any) -> dict[str, Any]:
     """The counters as a snapshot holds them (`clientUsage`), checked."""
     if raw is None:
         return empty()
-    if not isinstance(raw, dict) or set(raw) != {"counters", "open", "pruned"}:
+    if not isinstance(raw, dict) or set(raw) != {"counters", "open"}:
         raise ValueError("invalid usage state")
-    counters, opened, pruned = raw["counters"], raw["open"], raw["pruned"]
+    counters, opened = raw["counters"], raw["open"]
     if not isinstance(counters, dict) or not isinstance(opened, dict):
         raise ValueError("invalid usage state")
-    if pruned != "" and not _valid_day(pruned):
-        raise ValueError("invalid usage pruning day")
     for subject, periods in counters.items():
         if not isinstance(subject, str) or subject.split(":", 1)[0] not in (
             "key",
@@ -235,8 +239,11 @@ def validate(raw: Any) -> dict[str, Any]:
             "group",
         ):
             raise ValueError("invalid usage subject")
-        if not isinstance(periods, dict) or len(periods) > DAYS_KEPT + MONTHS_KEPT + 2:
+        if not isinstance(periods, dict):
             raise ValueError("invalid usage periods")
+        days = sum(1 for period in periods if str(period).startswith("d:"))
+        if days > DAYS_KEPT or len(periods) - days > MONTHS_KEPT:
+            raise ValueError("usage periods exceed their bound")
         for period, totals in periods.items():
             if not isinstance(period, str) or not (
                 (period.startswith("d:") and _valid_day(period[2:]))
@@ -286,15 +293,14 @@ def _added(totals: dict[str, Any] | None, delta: dict[str, int], model: str) -> 
     return new
 
 
-def _pruned(periods: dict[str, Any], day: str, month: str) -> dict[str, Any]:
-    oldest_day = (date.fromisoformat(day) - timedelta(days=DAYS_KEPT - 1)).isoformat()
-    oldest_month = _month_index(month) - (MONTHS_KEPT - 1)
-    return {
-        period: totals
-        for period, totals in periods.items()
-        if (period.startswith("d:") and period[2:] >= oldest_day)
-        or (period.startswith("m:") and _month_index(period[2:]) >= oldest_month)
-    }
+def _kept(periods: dict[str, Any]) -> dict[str, Any]:
+    """A subject's newest `DAYS_KEPT` days and newest `MONTHS_KEPT` months.
+    By count, so no date, however wrong, can make it hold more or drop all."""
+    days = sorted((p for p in periods if p.startswith("d:")), reverse=True)[:DAYS_KEPT]
+    months = sorted((p for p in periods if p.startswith("m:")), reverse=True)[:MONTHS_KEPT]
+    if len(days) + len(months) == len(periods):
+        return periods
+    return {p: periods[p] for p in (*days, *months)}
 
 
 def opened(usage: dict[str, Any], record: Any) -> dict[str, Any]:
@@ -346,11 +352,6 @@ def counted(usage: dict[str, Any], record: Any) -> dict[str, Any]:
         "unpriced": 1 if cost is None else 0,
     }
     counters = dict(usage["counters"])
-    pruned = str(usage.get("pruned") or "")
-    if day > pruned:
-        # Once a day, every subject loses what is past keeping.
-        counters = {s: kept for s, p in counters.items() if (kept := _pruned(p, day, month))}
-        pruned = day
     for subject in subjects:
         if not isinstance(subject, str) or subject.split(":", 1)[0] not in (
             "key",
@@ -361,10 +362,10 @@ def counted(usage: dict[str, Any], record: Any) -> dict[str, Any]:
         periods = dict(counters.get(subject) or {})
         periods[f"d:{day}"] = _added(periods.get(f"d:{day}"), delta, model)
         periods[f"m:{month}"] = _added(periods.get(f"m:{month}"), delta, model)
-        counters[subject] = periods
+        counters[subject] = _kept(periods)
     request_id = record.get("requestId")
     remaining = {k: v for k, v in usage["open"].items() if k != request_id}
-    return {"counters": counters, "open": remaining, "pruned": pruned}
+    return {"counters": counters, "open": remaining}
 
 
 def settled(usage: dict[str, Any], ledger: dict[str, Any]) -> dict[str, Any]:
@@ -625,6 +626,8 @@ def subject_view(
     month: str,
     days: list[str] | None,
     allowances: list[Allowance],
+    current: tuple[str, str],
+    breakdown: bool = True,
 ) -> dict[str, Any]:
     usage = state.client_usage
     kind, _, ident = subject.partition(":")
@@ -640,10 +643,15 @@ def subject_view(
         "name": name,
         "day": _totals_view(totals_of(usage, subject, f"d:{day}")),
         "month": _totals_view(totals_of(usage, subject, f"m:{month}")),
-        "allowances": [_allowance_view(a, usage, day, month) for a in allowances],
+        # Review S6: an allowance is about now, whatever period is shown.
+        "allowances": [_allowance_view(a, usage, *current) for a in allowances],
     }
     if days is not None:
         view["range"] = _totals_view(_sum(usage, subject, days))
+    if not breakdown:
+        for span in ("day", "month", "range"):
+            if span in view:
+                view[span]["models"] = []
     return view
 
 
@@ -679,7 +687,14 @@ def report(
     month: str,
     first: str | None = None,
     last: str | None = None,
+    now: datetime | None = None,
+    breakdown: Callable[[str], bool] = lambda subject: True,
 ) -> dict[str, Any]:
+    """The usage of `subjects` in `day`, `month` and an optional range of days,
+    with each allowance's state now (`now`, the current UTC day and month).
+    `breakdown` says whose per-model counts may be shown."""
+    moment = now or datetime.now(UTC)
+    current = (day_of(moment), month_of(moment))
     days: list[str] | None = None
     if first is not None and last is not None:
         start, end = date.fromisoformat(first), date.fromisoformat(last)
@@ -696,6 +711,8 @@ def report(
                 month=month,
                 days=days,
                 allowances=allowances_of(state, subject),
+                current=current,
+                breakdown=breakdown(subject),
             )
             for subject in subjects
         ],

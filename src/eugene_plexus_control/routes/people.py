@@ -189,14 +189,22 @@ def _group_policies(body: PermissionGroupWrite, existing: dict[str, Any] | None)
 
     Omitted from a replace keeps the group's current policies, so a console
     that predates them never clears them; omitted from a create sets none.
+    Inside, a policy left out keeps its current value and `null` clears it
+    (review S2): a console a release behind sends row 70's two and never
+    clears row 40's allowances.
     """
+    kept: dict[str, Any] = (existing or {}).get("policies") or {}
     if "policies" not in body.model_fields_set:
-        kept: dict[str, Any] = (existing or {}).get("policies") or {}
         return dict(kept)
     if body.policies is None:
         return {}
     chosen = body.policies.model_dump(mode="json", exclude_none=True)
-    return {policy: chosen[policy] for policy in _POLICIES if policy in chosen}
+    sent = body.policies.model_fields_set
+    return {
+        policy: chosen[policy] if policy in sent else kept[policy]
+        for policy in _POLICIES
+        if (policy in sent and policy in chosen) or (policy not in sent and policy in kept)
+    }
 
 
 def _group_write(

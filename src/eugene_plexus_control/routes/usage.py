@@ -159,6 +159,8 @@ async def get_own_usage(request: Request) -> JSONResponse:
         [f"person:{person}", *(f"group:{g}" for g in groups)],
         day=chosen_day,
         month=chosen_month,
+        # A group's totals only: what each other member used, model by model, is theirs.
+        breakdown=lambda subject: subject.startswith("person:"),
     )
     return JSONResponse(
         UsageReport.model_validate(body).model_dump(mode="json", exclude_none=True),

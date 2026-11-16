@@ -196,9 +196,13 @@ def test_group_policies_are_set_kept_by_an_older_console_and_cleared(
     # A console that predates policies sends none: the group keeps them.
     kept = c.put(path, json={"name": "Night shift", "description": "Late"}).json()
     assert kept["policies"] == set_["policies"] and kept["description"] == "Late"
-    # Policies are replaced whole: what is not sent is not set.
+    # Row 40 (review S2): a policy left out keeps its value; null clears it.
     replaced = c.put(path, json={"name": "Night shift", "policies": {"summaryContextPercent": 90}})
-    assert replaced.json()["policies"] == {**UNSET, "summaryContextPercent": 90}
+    assert replaced.json()["policies"] == {
+        **UNSET,
+        "queueBand": "background",
+        "summaryContextPercent": 90,
+    }
     cleared = c.put(path, json={"name": "Night shift", "policies": UNSET}).json()
     assert cleared["policies"] == UNSET
     assert "policies" not in c.app.state.machine.state.permission_groups[set_["id"]]
