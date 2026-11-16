@@ -40,6 +40,7 @@ from .applied import (
     OP_CHANGE_PASSPHRASE,
     OP_PUT_OIDC_KEY,
     OP_ROTATE_SIGNING_KEY,
+    OP_SET_ALERTING,
     OP_SET_INSTALL_CA,
     ROLE_CONTROL,
     AppliedState,
@@ -162,6 +163,7 @@ SEALED_OPS = frozenset(
         OP_ROTATE_SIGNING_KEY,
         OP_SET_INSTALL_CA,
         "putExternalProvider",
+        OP_SET_ALERTING,
     }
 )
 

@@ -123,6 +123,7 @@ OP_SET_NODE_CERTIFICATE_NAMES = "setNodeCertificateNames"
 # Row 5 (`specs/docs/design/rows/row-05.md`), log version 1.
 OP_RETIRE_OIDC_KEYS = "retireOidcKeys"
 OP_CHANGE_PASSPHRASE = "changePassphrase"
+OP_SET_ALERTING = "setAlerting"
 
 #: The log version this build applies (`Eugene-Plexus-Log-Version`, row 5):
 #: which ops it knows. Every build reports the same `__version__`, so a root
@@ -132,7 +133,8 @@ OP_CHANGE_PASSPHRASE = "changePassphrase"
 #: * 0: every op before row 5 (what a standby that sends no number applies).
 #: * 1: `retireOidcKeys`, `changePassphrase`, and every op merged before them
 #:   (`rotateClientKey` and `touchClientKey` among them).
-LOG_VERSION = 1
+#: * 2: `setAlerting` (row 38).
+LOG_VERSION = 2
 
 #: The grant that makes a node the install's warm standby (warm-standby.md).
 GRANT_STANDBY = "standby"
@@ -183,6 +185,7 @@ ALL_OPS: frozenset[str] = frozenset(
         OP_SET_NODE_CERTIFICATE_NAMES,
         OP_RETIRE_OIDC_KEYS,
         OP_CHANGE_PASSPHRASE,
+        OP_SET_ALERTING,
     }
 )
 
@@ -486,6 +489,10 @@ class AppliedState:
     revoked_sign_ins: dict[str, int] = field(default_factory=dict)
     """Sign-ins revoked at `/oidc/revoke`, `sid -> exp`, as `revokeSession`
     keeps sessions."""
+    alerting: dict[str, Any] | None = None
+    """Row 38: the alert rules, SLO targets and the sealed webhook address,
+    as `setAlerting` wrote them (`SnapshotAlerting`). None until the owner
+    saves them, and the built-in rules apply (`alerts.DEFAULT_RULES`)."""
 
 
 # --------------------------------------------------------------------------- #
@@ -1491,6 +1498,27 @@ def _apply_retire_oidc_keys(
     return replace(state, oidc_keys=tuple(k for k in state.oidc_keys if k["kid"] in keep))
 
 
+def _apply_set_alerting(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
+    """Replace the alert rules and SLO targets, and the sealed webhook (row 38).
+    The writer validated them against `AlertingUpdate`; this keeps the shape."""
+    rules, slos = payload.get("rules"), payload.get("slos")
+    if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+        raise ApplyError(f"entry {index}: setAlerting needs a list of rules")
+    if not isinstance(slos, list) or not all(isinstance(s, dict) for s in slos):
+        raise ApplyError(f"entry {index}: setAlerting needs a list of SLO targets")
+    sealed = _optional_str(payload, "sealedWebhookUrl")
+    host = _optional_str(payload, "webhookHost")
+    return replace(
+        state,
+        alerting={
+            "rules": [dict(r) for r in rules],
+            "slos": [dict(s) for s in slos],
+            "sealedWebhookUrl": sealed,
+            "webhookHost": host if sealed else None,
+        },
+    )
+
+
 #: The identity's sealed values, as `changePassphrase`'s `sealed` names them.
 SEALED_IDENTITY = {
     "signingKey": "sealedSigningKey",
@@ -1520,6 +1548,9 @@ def sealed_inventory(state: AppliedState) -> dict[str, Any]:
         for ident, record in sorted((state.browser_sign_in.get("providers") or {}).items())
         if record.get("sealedSecret")
     }
+    webhook = (state.alerting or {}).get("sealedWebhookUrl")
+    if webhook:
+        inventory["alertWebhook"] = webhook
     return inventory
 
 
@@ -1563,7 +1594,12 @@ def _apply_change_passphrase(
     for ident, secret in sealed["externalProviders"].items():
         providers[ident] = {**providers[ident], "sealedSecret": secret}
     sign_in["providers"] = providers
-    return replace(state, identity=identity, oidc_keys=keys, browser_sign_in=sign_in)
+    alerting = state.alerting
+    if "alertWebhook" in sealed and alerting is not None:
+        alerting = {**alerting, "sealedWebhookUrl": sealed["alertWebhook"]}
+    return replace(
+        state, identity=identity, oidc_keys=keys, browser_sign_in=sign_in, alerting=alerting
+    )
 
 
 def _apply_revoke_sign_in(state: AppliedState, payload: dict[str, Any], index: int) -> AppliedState:
@@ -1732,6 +1768,7 @@ _HANDLERS: dict[str, _Handler] = {
     OP_SET_NODE_CERTIFICATE_NAMES: _apply_set_node_certificate_names,
     OP_RETIRE_OIDC_KEYS: _apply_retire_oidc_keys,
     OP_CHANGE_PASSPHRASE: _apply_change_passphrase,
+    OP_SET_ALERTING: _apply_set_alerting,
     **{op: partial(sign_in_state.apply, op=op) for op in sign_in_state.OPS},
 }
 
@@ -1824,6 +1861,18 @@ def to_canonical(state: AppliedState) -> dict[str, Any]:
         "revokedSignIns": [
             {"jti": sid, "exp": exp} for sid, exp in sorted(state.revoked_sign_ins.items())
         ],
+        "alerting": _alerting_canonical(state.alerting),
+    }
+
+
+def _alerting_canonical(alerting: dict[str, Any] | None) -> dict[str, Any] | None:
+    if alerting is None:
+        return None
+    return {
+        "rules": [dict(r) for r in alerting.get("rules") or []],
+        "slos": [dict(s) for s in alerting.get("slos") or []],
+        "sealedWebhookUrl": alerting.get("sealedWebhookUrl"),
+        "webhookHost": alerting.get("webhookHost"),
     }
 
 
@@ -1933,6 +1982,9 @@ def from_canonical(raw: dict[str, Any]) -> AppliedState:
         },
         oidc_keys=tuple(_oidc_key_record(item) for item in raw.get("oidcKeys") or []),
         revoked_sign_ins={str(r["jti"]): int(r["exp"]) for r in raw.get("revokedSignIns") or []},
+        alerting=_alerting_canonical(raw.get("alerting"))
+        if isinstance(raw.get("alerting"), dict)
+        else None,
         identity=InstallIdentity(
             salt=raw.get("salt"),
             passphraseVerifier=raw.get("passphraseVerifier"),

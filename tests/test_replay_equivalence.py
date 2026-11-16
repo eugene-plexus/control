@@ -68,6 +68,7 @@ from eugene_plexus_control.applied import (
     OP_REVOKE_SIGN_IN,
     OP_ROTATE_CLIENT_KEY,
     OP_ROTATE_SIGNING_KEY,
+    OP_SET_ALERTING,
     OP_SET_CLIENT_KEY_LIMITS,
     OP_SET_INSTALL_CA,
     OP_SET_NODE_CERTIFICATE_NAMES,
@@ -145,6 +146,7 @@ EXERCISED_OPS = {
     OP_SET_NODE_CERTIFICATE_NAMES,
     OP_RETIRE_OIDC_KEYS,
     OP_CHANGE_PASSPHRASE,
+    OP_SET_ALERTING,
 }
 
 
@@ -592,6 +594,18 @@ def _write_history(machine: StateMachine) -> bytes:
         sealed_under=machine.state.identity.salt,
     )
     machine.append(OP_SET_NODE_CERTIFICATE_NAMES, {"name": "attic", "names": ["attic.lan"]})
+    # Row 38: alert rules and a sealed webhook, which the passphrase change
+    # below seals again with everything else.
+    machine.append(
+        OP_SET_ALERTING,
+        {
+            "rules": [{"id": "hot", "kind": "gpu-hot", "threshold": 80, "forMinutes": 2}],
+            "slos": [{"id": "all", "successPercent": 99.5, "windowDays": 30}],
+            "sealedWebhookUrl": placeholder("alert-webhook"),
+            "webhookHost": "hooks.lan",
+        },
+        sealed_under=machine.state.identity.salt,
+    )
     # Row 5: a second sign-in key, every other retired, and the passphrase
     # changed, every sealed value with it (the install CA's key included).
     _write_row5_history(machine, when)

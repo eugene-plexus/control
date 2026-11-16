@@ -36,6 +36,7 @@ from . import __version__, keyring_store, passphrase_file, security
 from . import config as config_module
 from . import machine_list as machine_list_module
 from .admission_worker import AdmissionWorker
+from .alerts import AlertService
 from .announcement_refusals import AnnouncementRefusals
 from .applied import OP_PATCH_CONFIG, RetiredData, normalize_url
 from .auth_state import AuthState
@@ -47,6 +48,7 @@ from .replication import Follower, StandbyToken
 from .root_tls import RootTls
 from .routes import admin as admin_routes
 from .routes import administration as administration_routes
+from .routes import alerts as alert_routes
 from .routes import auth as auth_routes
 from .routes import client_keys as client_key_routes
 from .routes import config as config_routes
@@ -196,6 +198,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.follower = None
     app.state.node_poller = None
+    # Row 38: the alert evaluator; it runs while this is the active root.
+    app.state.alerts = None if settings.safe_mode else AlertService(app, Path(settings.state_dir))
+    app.state.alerts_task = None
     # Row 5: whether the passphrase file holds this install's passphrase,
     # at start and every hour; and the sign-in key's schedule.
     app.state.passphrase_file_state = None
@@ -252,6 +257,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.root_tls_task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await app.state.root_tls_task
+        if app.state.alerts_task is not None:
+            app.state.alerts_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await app.state.alerts_task
+        if app.state.alerts is not None:
+            await app.state.alerts.aclose()
         app.state.hourly.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await app.state.hourly
@@ -443,6 +454,10 @@ def start_root_tasks(app: FastAPI) -> None:
     them here. Each at most once."""
     if getattr(app.state, "node_poller", None) is None:
         app.state.node_poller = asyncio.create_task(_poll_nodes(app), name="control-node-poller")
+    # Row 38: the alert evaluator moves with the root (a promoted copy starts it here).
+    service = getattr(app.state, "alerts", None)
+    if service is not None and getattr(app.state, "alerts_task", None) is None:
+        app.state.alerts_task = asyncio.create_task(service.run(), name="control-alerts")
     settings: Settings = app.state.settings
     if settings.nodes_origin and getattr(app.state, "root_tls_task", None) is None:
         app.state.root_tls_task = asyncio.create_task(
@@ -694,6 +709,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(external_sign_in_routes.management)
     # Row 53, before the people routes: `/v1/people/known` is not a person id.
     app.include_router(people_known_routes.router)
+    app.include_router(alert_routes.router)
     app.include_router(people_routes.router)
     app.include_router(administration_routes.router)
     app.include_router(people_routes.app_clients)
