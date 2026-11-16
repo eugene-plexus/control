@@ -148,6 +148,10 @@ class NodesClient:
         response.raise_for_status()
         return response.json()
 
+    async def get_json(self, url: str, path: str, token: str | None) -> Any:
+        """One read of one node, as the poller makes it (row 38: host history)."""
+        return await self._get(url, path, token)
+
     async def probe(self, name: str, url: str | None, token: str | None) -> NodeProbe:
         """Ask one node who it is and which epoch it has recorded.
 

@@ -140,6 +140,8 @@ def reseal(state: AppliedState, old_key: bytes, new_passphrase: str) -> Resealed
         ident: again(sealed, f"connected account {providers[ident].get('name') or ident}")
         for ident, sealed in inventory["externalProviders"].items()
     }
+    if "alertWebhook" in inventory:
+        out["alertWebhook"] = again(inventory["alertWebhook"], "the alert webhook address")
     return Resealed(
         payload={
             "salt": base64.b64encode(salt).decode("ascii"),

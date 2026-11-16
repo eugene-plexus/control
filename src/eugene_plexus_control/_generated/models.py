@@ -3435,6 +3435,11 @@ class AccessAudit(BaseModel):
 
 class LogOp(StrEnum):
     """
+    **`setModelPrice` (row 40, log version 3)** sets (`price` an object)
+    or clears (`price` null) the owner's rate for one model:
+    `{model, price}`. Log version 3, not 2: row 38's `setAlerting` is 2,
+    and a standby with row 38 alone must not be sent row 40's op.
+
     **`retireOidcKeys` (row 5, log version 1)** keeps only the sign-in
     keys named in `keep` (`{keep: [kid]}`, at least one held key) and
     drops the others, so every token they signed stops verifying. It
@@ -3446,7 +3451,8 @@ class LogOp(StrEnum):
     holds every value the old master key sealed, sealed again under
     the new one by the writer (`signingKey`, `controlKey`,
     `recoveryKey`, `installCaKey`, `oidcKeys` by `kid`, and
-    `externalProviders` by id). It must name exactly the sealed values
+    `externalProviders` by id, and `alertWebhook` when a webhook is set).
+    It must name exactly the sealed values
     the state holds, no more and no fewer, or it does not apply. Every
     root that applies it writes a snapshot and drops every entry
     before it, so no value sealed under the old key stays in the log;
@@ -3454,6 +3460,11 @@ class LogOp(StrEnum):
     every entry that carries a sealed value (`putOidcKey`,
     `rotateSigningKey`, `setInstallCa`, `putExternalProvider`,
     `changePassphrase`) only while the salt is the one it sealed under.
+
+    **`setAlerting` (row 38, log version 2)** replaces the alert rules
+    and SLO targets (`{rules, slos, sealedWebhookUrl, webhookHost}`).
+    The webhook address is sealed under the master key, and the
+    writer appends it only while the salt is the one it sealed under.
 
     **`setNodeCertificateNames` (LT2, 2026-10-20)** replaces the names
     the owner listed for one node's client certificate (`{name,
@@ -3569,6 +3580,7 @@ class LogOp(StrEnum):
     retireOidcKeys = 'retireOidcKeys'
     changePassphrase = 'changePassphrase'
     setModelPrice = 'setModelPrice'
+    setAlerting = 'setAlerting'
 
 
 class Group(RootModel[str]):
@@ -4307,6 +4319,280 @@ class PoliciesSetBy(BaseModel):
     )
     queueBand: list[str] | None = Field(None, max_length=64)
     summaryContextPercent: list[str] | None = Field(None, max_length=64)
+
+
+class AlertRuleKind(StrEnum):
+    """
+    What a rule watches, and what its `threshold` means:
+
+    - `machine-down`: an enrolled machine this root cannot reach. No
+      threshold.
+    - `disk-full`: a model or engine folder's volume, percent used.
+    - `gpu-hot`: a GPU's temperature, °C. A GPU that does not report
+      its temperature is never hot.
+    - `failure-rate`: failed requests, percent of the requests over the
+      last `forMinutes` (at least 10 requests).
+    - `slo-burn`: an SLO's error budget spent this many times faster
+      than its window allows, over the last hour.
+
+    """
+
+    machine_down = 'machine-down'
+    disk_full = 'disk-full'
+    gpu_hot = 'gpu-hot'
+    failure_rate = 'failure-rate'
+    slo_burn = 'slo-burn'
+
+
+class AlertRule(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^[a-z0-9][a-z0-9-]{0,63}$')
+    kind: AlertRuleKind
+    enabled: bool | None = True
+    threshold: float | None = Field(
+        0, description='What `kind` says. Ignored by `machine-down`.', ge=0.0
+    )
+    forMinutes: int | None = Field(
+        5,
+        description='How long the condition must hold before the alert fires, and how\nlong it must be clear before it resolves, so a value that flaps\ndoes not post every minute.\n',
+        ge=1,
+        le=1440,
+    )
+    machine: str | None = Field(
+        None,
+        description='One machine by name; null is every machine. Machine kinds only.',
+    )
+    model: str | None = Field(
+        None,
+        description='One model; null is every model together. `failure-rate` only.',
+    )
+    sloId: str | None = Field(
+        None, description='One SLO; null is every SLO. `slo-burn` only.'
+    )
+
+
+class SloFirstTokenPercentile(IntEnum):
+    integer_50 = 50
+    integer_90 = 90
+    integer_99 = 99
+
+
+class SloTarget(BaseModel):
+    """
+    A target for one model, one client key or the whole install, over a
+    rolling window. Success is computed from the gateway's hourly
+    rollups, so a window may reach 90 days. A first-token target is read
+    as a percentile over the requests the gateway still keeps whole
+    (`metricsRetentionDays`), and says so; a client key's target has
+    success only, over the same kept requests.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^[a-z0-9][a-z0-9-]{0,63}$')
+    name: str | None = Field(None, max_length=120)
+    model: str | None = Field(None, description='Null is every model.')
+    clientKeyId: str | None = Field(
+        None, description='One client key. Set with model null.'
+    )
+    windowDays: int | None = Field(30, ge=1, le=90)
+    successPercent: float = Field(
+        ...,
+        description='The share of requests that must be served.',
+        ge=50.0,
+        le=99.999,
+    )
+    firstTokenSeconds: float | None = Field(None, gt=0.0, le=600.0)
+    firstTokenPercentile: SloFirstTokenPercentile | None = Field(
+        None,
+        description='With `firstTokenSeconds`, "this share of first tokens within that time".',
+    )
+
+
+class AlertWebhookView(BaseModel):
+    configured: bool
+    host: str | None = Field(
+        None,
+        description="The webhook's host only. The address is a secret and is never shown back.",
+    )
+
+
+class AlertingSettings(BaseModel):
+    rules: list[AlertRule]
+    slos: list[SloTarget]
+    webhook: AlertWebhookView
+    defaults: bool = Field(
+        ...,
+        description='True until the owner saves rules; `rules` is then the built-in set in effect.',
+    )
+
+
+class AlertingUpdate(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    rules: list[AlertRule] = Field(..., max_length=50)
+    slos: list[SloTarget] = Field(..., max_length=50)
+    webhookUrl: str | None = Field(
+        None,
+        description='Absent keeps the webhook; null or empty removes it.',
+        max_length=2048,
+    )
+
+
+class AlertState(StrEnum):
+    firing = 'firing'
+    resolved = 'resolved'
+
+
+class Alert(BaseModel):
+    id: str = Field(..., description='One alert: the rule and what it is about.')
+    ruleId: str
+    kind: AlertRuleKind
+    state: AlertState
+    message: str = Field(
+        ..., description='One line, state first: "GPU 0 on nas is at 88 °C".'
+    )
+    value: float | None = None
+    threshold: float | None = None
+    machine: str | None = None
+    model: str | None = None
+    sloId: str | None = None
+    link: str | None = Field(None, description='The console page that shows it.')
+    startedAt: AwareDatetime
+    resolvedAt: AwareDatetime | None = None
+
+
+class SloState(StrEnum):
+    """
+    `at-risk`: met, with less than a quarter of the error budget left,
+    or the first-token target not met. `missed`: no budget left.
+
+    """
+
+    met = 'met'
+    at_risk = 'at-risk'
+    missed = 'missed'
+    no_data = 'no-data'
+
+
+class SloFirstTokenStatus(BaseModel):
+    percentile: SloFirstTokenPercentile
+    targetSeconds: float
+    measuredSeconds: float | None = Field(
+        None,
+        description='The percentile over the kept requests that streamed; null when none did.',
+    )
+    met: bool | None = None
+    keptDays: float = Field(
+        ...,
+        description='The days of whole requests the percentile is read over (the window, or less).',
+    )
+
+
+class SloStatus(BaseModel):
+    id: str
+    name: str | None = None
+    model: str | None = None
+    clientKeyId: str | None = None
+    clientKeyName: str | None = None
+    windowDays: int
+    successPercent: float = Field(..., description='The target.')
+    requests: int = Field(..., ge=0)
+    failures: int = Field(..., ge=0)
+    measuredPercent: float | None = Field(
+        None, description='Served over requests in the window; null with no requests.'
+    )
+    budgetLeftPercent: float | None = Field(
+        None,
+        description='The allowed failures not yet spent, percent; below zero when overspent.',
+    )
+    burnRate: float | None = Field(
+        None,
+        description="The last hour's failure share over the share the target allows; 1 spends the budget exactly over the window.",
+    )
+    coveredDays: float | None = Field(
+        None, description="The days the gateway's records reach back over this window."
+    )
+    firstToken: SloFirstTokenStatus | None = None
+    state: SloState
+
+
+class AlertWebhookState(StrEnum):
+    off = 'off'
+    ok = 'ok'
+    failing = 'failing'
+
+
+class AlertWebhookStatus(BaseModel):
+    state: AlertWebhookState
+    lastAttemptAt: AwareDatetime | None = None
+    lastSuccessAt: AwareDatetime | None = None
+    lastError: str | None = Field(
+        None,
+        description='Why the last post failed, after three tries: "connection refused", "HTTP 404".',
+    )
+
+
+class State1(StrEnum):
+    firing = 'firing'
+    resolved = 'resolved'
+    test = 'test'
+
+
+class AlertWebhookPost(BaseModel):
+    """
+    What the root posts to the webhook, as JSON, for each alert that
+    fires or resolves. Slack, Discord, ntfy and Home Assistant take it
+    (`text` and `content` carry the line for the chat ones).
+
+    """
+
+    rule: str
+    state: State1
+    value: float | None = None
+    threshold: float | None = None
+    machine: str | None = None
+    model: str | None = None
+    url: str | None = None
+    at: AwareDatetime
+    text: str
+    content: str | None = None
+
+
+class AlertsView(BaseModel):
+    evaluating: bool = Field(
+        ..., description='False on a standby, and on a root that is locked.'
+    )
+    evaluatedAt: AwareDatetime | None = None
+    problems: list[str] = Field(
+        ...,
+        description='Reads the last evaluation could not make, each with its cause: "Gateway metrics: connection refused".',
+    )
+    firing: list[Alert]
+    recent: list[Alert] = Field(
+        ..., description='Resolved alerts, newest first, at most 100.'
+    )
+    slos: list[SloStatus]
+    webhook: AlertWebhookStatus
+
+
+class SnapshotAlerting(BaseModel):
+    """
+    What `setAlerting` wrote (row 38).
+    """
+
+    rules: list[dict[str, Any]]
+    slos: list[dict[str, Any]]
+    sealedWebhookUrl: str | None = Field(
+        None,
+        description='The webhook address, sealed under the passphrase-derived key.',
+    )
+    webhookHost: str | None = None
 
 
 class SitePersonLink(BaseModel):
@@ -6557,6 +6843,10 @@ class Snapshot(BaseModel):
     oidcKeys: list[SnapshotOidcKey] | None = Field(
         None,
         description="The provider's RSA keys, newest first, each sealed under the\npassphrase-derived key as `sealedSigningKey` is.\n",
+    )
+    alerting: SnapshotAlerting | None = Field(
+        None,
+        description='What `setAlerting` wrote; null until the owner saves alert settings (row 38).',
     )
     revokedSignIns: list[RevokedSession] | None = Field(
         None,
