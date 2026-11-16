@@ -124,7 +124,7 @@ OP_SET_NODE_CERTIFICATE_NAMES = "setNodeCertificateNames"
 # Row 5 (`specs/docs/design/rows/row-05.md`), log version 1.
 OP_RETIRE_OIDC_KEYS = "retireOidcKeys"
 OP_CHANGE_PASSPHRASE = "changePassphrase"
-# Row 40 (`specs/docs/design/rows/row-40.md`), log version 2.
+# Row 40 (`specs/docs/design/rows/row-40.md`), log version 3.
 OP_SET_MODEL_PRICE = "setModelPrice"
 
 #: The log version this build applies (`Eugene-Plexus-Log-Version`, row 5):
@@ -135,9 +135,11 @@ OP_SET_MODEL_PRICE = "setModelPrice"
 #: * 0: every op before row 5 (what a standby that sends no number applies).
 #: * 1: `retireOidcKeys`, `changePassphrase`, and every op merged before them
 #:   (`rotateClientKey` and `touchClientKey` among them).
-#: * 2: `setModelPrice` (row 40), and the usage allowances in a key's limits
-#:   and a group's policies, which a version-1 copy refuses.
-LOG_VERSION = 2
+#: * 2: row 38's `setAlerting` (merged before row 40).
+#: * 3: `setModelPrice` (row 40), and the usage allowances in a key's limits
+#:   and a group's policies, which a copy of version 2 or older refuses. Not 2:
+#:   a standby that has row 38 alone also says 2, and would stop at row 40's op.
+LOG_VERSION = 3
 
 #: The grant that makes a node the install's warm standby (warm-standby.md).
 GRANT_STANDBY = "standby"

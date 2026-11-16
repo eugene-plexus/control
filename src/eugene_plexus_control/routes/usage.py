@@ -37,7 +37,7 @@ def _active(request: Request) -> StateMachine:
 
 def standby_can_hold(app: Any, values: dict[str, Any] | None) -> None:
     """Refuse a write that sets a usage allowance while the standby's copy
-    would stop at it (log version 2, row 40): update the standby first."""
+    would stop at it (log version 3, row 40): update the standby first."""
     if not values or not any(values.get(k) is not None for k in counts.GROUP_ALLOWANCES):
         return
     _standby_current(app)

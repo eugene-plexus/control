@@ -513,3 +513,35 @@ def test_an_allowance_is_reported_for_now_whatever_period_is_shown(active_client
     assert mine["month"]["tokens"] == 0, "January 2025 had no use"
     assert allowance["used"] == "15" and allowance["spent"] is True
     assert allowance["resetsAt"] > datetime.now(UTC).isoformat()
+
+
+def test_a_standby_on_log_version_2_is_refused_row_40s_writes(active_client):
+    """Row 38 takes log version 2 (`setAlerting`); row 40's ops need 3. A standby
+    that has row 38 alone says 2, and its copy would stop at a price or an
+    allowance, so the root refuses those writes until it is updated."""
+    from tests.conftest import enroll
+
+    c = active_client
+    enroll(c, "b")
+    assert c.put("/v1/nodes/b/standby", json={"on": True}).status_code in (200, 202, 204)
+    c.app.state.standby_reports["b"] = {
+        "appliedIndex": 0,
+        "at": datetime.now(UTC),
+        "seen": 0.0,
+        "logVersion": 2,
+    }
+    price = {"model": "m", "price": {"inputPerMillionMicros": 1, "outputPerMillionMicros": 1}}
+    refused = c.put("/v1/usage/prices", json=price)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["detail"] == (
+        "Update b first; its copy would stop at this change."
+    )
+    made = c.post("/v1/auth/client-keys", json={"name": "x", "limits": {"tokensPerDay": 5}})
+    assert made.status_code == 409
+    assert group_status(c, {"tokensPerDay": 5}) == 409
+    c.app.state.standby_reports["b"]["logVersion"] = 3
+    assert c.put("/v1/usage/prices", json=price).status_code == 200
+
+
+def group_status(c, policies):
+    return c.post("/v1/permission-groups", json={"name": "Sales", "policies": policies}).status_code

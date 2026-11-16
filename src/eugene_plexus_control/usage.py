@@ -60,7 +60,7 @@ PICOS_PER_MICRO = 10**6
 PICOS_PER_DOLLAR = 10**12
 #: Row 40 raises the log version: `setModelPrice`, and allowances in a key's
 #: limits or a group's policies, stop an older standby's copy.
-LOG_VERSION_NEEDED = 2
+LOG_VERSION_NEEDED = 3
 #: The largest rate, in micro-dollars a million tokens ($1,000,000).
 MAX_RATE = 10**12
 TOTALS = ("requests", "promptTokens", "completionTokens", "costPicos", "unpriced")
