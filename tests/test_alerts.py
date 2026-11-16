@@ -596,10 +596,10 @@ def test_the_gateway_read_is_the_one_the_proxy_picks(active_client: TestClient) 
     try:
         app.state.node_name = "root"  # type: ignore[attr-defined]
         app.state.nodes_client = Nodes(["gpu-a", "root"])  # type: ignore[attr-defined]
-        service._cache.gateway_node_at = 0.0
+        service._cache.gateway_node_at = None
         assert asyncio.run(service._gateway_node()) == "root"
         app.state.nodes_client = Nodes(["gpu-a", "gpu-b"])  # type: ignore[attr-defined]
-        service._cache.gateway_node_at = 0.0
+        service._cache.gateway_node_at = None
         with pytest.raises(LookupError, match="gpu-a and gpu-b both run a gateway"):
             asyncio.run(service._gateway_node())
     finally:

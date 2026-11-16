@@ -816,7 +816,8 @@ class WebhookSender:
 @dataclass
 class _Cache:
     gateway_node: str | None = None
-    gateway_node_at: float = 0.0
+    gateway_node_at: float | None = None
+    """When the gateway's machine was last asked; None: never, or forgotten."""
     slos: tuple[dict[str, Any], ...] | None = None
     slos_at: float = 0.0
     slo_problem: str | None = None
@@ -882,8 +883,11 @@ class AlertService:
 
     async def _gateway_node(self) -> str | None:
         """The machine that runs the gateway, asked every ten minutes."""
-        if time.perf_counter() - self._cache.gateway_node_at < COMPONENTS_EVERY_SECONDS and (
-            self._cache.gateway_node
+        asked = self._cache.gateway_node_at
+        if (
+            asked is not None
+            and time.perf_counter() - asked < COMPONENTS_EVERY_SECONDS
+            and (self._cache.gateway_node)
         ):
             return self._cache.gateway_node
         from .routes.topology import _targets
@@ -901,7 +905,7 @@ class AlertService:
         elif len(nodes) == 1:
             found = nodes[0]
         elif nodes:
-            self._cache.gateway_node, self._cache.gateway_node_at = None, 0.0
+            self._cache.gateway_node, self._cache.gateway_node_at = None, None
             raise LookupError(
                 f"{' and '.join(nodes)} both run a gateway; alerts read one on this machine "
                 "or the only one in the install"
