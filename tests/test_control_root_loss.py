@@ -311,8 +311,16 @@ def test_a_replicating_standby_is_promotable_from_the_passphrase_alone(tmp_path:
         )
         assert refused.status_code == 401
 
-        promoted = standby.post(
+        # It follows no root, so it cannot say what a promotion would lose:
+        # that takes `force` (control#16).
+        unknown = standby.post(
             "/v1/control/promote", json={"passphrase": PASSPHRASE}, headers=headers
+        )
+        assert unknown.status_code == 409, unknown.text
+        assert "How far behind is unknown" in unknown.text
+
+        promoted = standby.post(
+            "/v1/control/promote", json={"passphrase": PASSPHRASE, "force": True}, headers=headers
         )
         assert promoted.status_code == 200, promoted.text
         body = promoted.json()

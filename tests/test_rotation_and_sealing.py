@@ -266,7 +266,8 @@ def test_promotion_announces_the_new_epoch_with_the_same_keys(
         ]
         promoted = standby.post(
             "/v1/control/promote",
-            json={"passphrase": PASSPHRASE},
+            # It follows no root, so its lag is unknown (control#16).
+            json={"passphrase": PASSPHRASE, "force": True},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert promoted.status_code == 200, promoted.text

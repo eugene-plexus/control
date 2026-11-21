@@ -42,6 +42,7 @@ from ..dependencies import (
     verify_with_view,
     via_public_sites,
 )
+from ..replication import FollowerStatus
 from ..state_machine import AlreadyActive, StateMachine
 
 log = logging.getLogger(__name__)
@@ -203,7 +204,10 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
 
     **Refusing to promote is a valid outcome.** A standby that trails
     the active root reports the gap and returns 409, because silently
-    promoting a stale root is how an install loses its node registry.
+    promoting a stale root is how an install loses its node registry. So
+    does one that cannot say how far behind it is: until its first pull
+    since it started (the usual case when the active root died and this
+    standby restarted), an unknown lag is not a lag of zero.
     `force` exists for the operator who has decided that losing the tail
     beats staying down — an explicit choice with a name, not a silent
     default.
@@ -239,6 +243,13 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
         )
 
     lag = follower.status.lag_entries if follower is not None else None
+    lag_unknown = follower is not None and lag is None
+    if follower is not None and lag is None and not body.force:
+        raise problem(
+            status.HTTP_409_CONFLICT,
+            "How far behind is unknown",
+            _unknown_lag_detail(follower.status, machine.state.index),
+        )
     if lag and not body.force:
         raise problem(
             status.HTTP_409_CONFLICT,
@@ -250,25 +261,50 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
             "trade you want.",
         )
 
-    # Stop replicating before writing. A promoted root that was still
-    # pulling from its predecessor would be accepting entries it did not
-    # assign, which is the single-writer property gone.
+    # Pause replicating before writing: a root that still pulled from its
+    # predecessor would accept entries it did not assign, and the single
+    # writer would be gone. Paused, not stopped: the unseal and the
+    # promote entry below can fail, and a standby that failed to promote
+    # must go on following, or it is insurance that is no longer there.
+    # The unseal stays inside the pause because a pull could take a
+    # passphrase change between it and the promote entry.
     if follower is not None:
-        await follower.stop()
-        request.app.state.follower = None
+        await follower.pause()
 
     from .auth import unseal_into
 
-    unseal_into(auth, machine, passphrase)
-
     node_name = getattr(request.app.state, "node_name", None)
+    replaced = machine.state.epoch
     try:
-        replaced = machine.state.epoch
+        unseal_into(auth, machine, passphrase)
         machine.promote(node=node_name)
     except AlreadyActive as exc:
+        # Another promotion won; it stops the follower.
         raise problem(
             status.HTTP_409_CONFLICT, "Already active", "This control root is already active."
         ) from exc
+    except BaseException as exc:
+        # `promote` puts the role back when its entry is not written. A
+        # root that did write it (its snapshot failed after) never follows
+        # again.
+        if machine.is_active:
+            if follower is not None:
+                await follower.stop()
+                request.app.state.follower = None
+            raise
+        if follower is not None:
+            follower.resume()
+        if isinstance(exc, OSError):
+            raise problem(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Promotion not written",
+                f"This standby could not write its promotion ({exc}). It is still a standby "
+                "and follows the active root again.",
+            ) from exc
+        raise
+    if follower is not None:
+        await follower.stop()
+        request.app.state.follower = None
 
     # Row 4: this root's own machine table from its own records, before
     # anything is pushed, so the pushes and every poll after go over TLS to
@@ -297,11 +333,17 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
 
     start_root_tasks(request.app)
 
+    if lag_unknown and body.force:
+        forced = " (forced, how far behind unknown)"
+    elif lag and body.force:
+        forced = f" (forced, {lag} entries behind)"
+    else:
+        forced = ""
     log.warning(
         "PROMOTED to active control root at epoch %d, applied index %d%s",
         machine.state.epoch,
         machine.state.index,
-        f" (forced, {lag} entries behind)" if lag and body.force else "",
+        forced,
     )
     return ControlStatus(
         role=NodeRole(machine.role),
@@ -311,6 +353,31 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
         standbys=_standby_statuses(request),
         initialized=True,
     )
+
+
+def _unknown_lag_detail(status_now: FollowerStatus, index: int) -> str:
+    """Why this standby cannot say what a promotion would lose: the cause it
+    observed, where it is, and the way past (control#16)."""
+    if status_now.active_url is None:
+        cause = (
+            "This standby has no active root to follow (EUGENE_PLEXUS_CONTROL_ACTIVE_URL "
+            "is not set), so it cannot say what a promotion would lose."
+        )
+    else:
+        cause = (
+            f"This standby has not read the position of the active root at "
+            f"{status_now.active_url} since it started, so it cannot say what a promotion "
+            "would lose."
+        )
+    parts = [cause, f"It last applied entry {index}."]
+    if status_now.last_contact_at is not None:
+        parts.append(f"It last had contact with the active root at {status_now.last_contact_at}.")
+    elif status_now.active_url is not None:
+        parts.append("It has had no contact with the active root since it started.")
+    if status_now.last_error:
+        parts.append(f"The last pull failed: {status_now.last_error.rstrip('.')}.")
+    parts.append("Re-run with force=true to promote anyway.")
+    return " ".join(parts)
 
 
 @router.post(

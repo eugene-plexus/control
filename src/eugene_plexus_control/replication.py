@@ -233,12 +233,30 @@ class Follower:
             return
         self._task = asyncio.create_task(self._run(), name="control-follower")
 
-    async def stop(self) -> None:
-        self._stop.set()
+    @property
+    def running(self) -> bool:
+        """Whether the pull loop is running now."""
+        return self._task is not None and not self._task.done()
+
+    async def pause(self) -> None:
+        """Stop pulling and wait until the loop has ended, but keep the
+        clients, so `resume` can carry on. A promotion pauses before it
+        writes and resumes when it fails (control#16)."""
         if self._task is not None:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
+            self._task = None
+
+    def resume(self) -> None:
+        """Pull again after `pause`. Nothing to do after `stop`, or with no
+        active root to follow."""
+        if self._task is None and not self._stop.is_set() and self.status.active_url is not None:
+            self._task = asyncio.create_task(self._run(), name="control-follower")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        await self.pause()
         await self._client.aclose()
         closer = getattr(self._token_provider, "aclose", None)
         if closer is not None:

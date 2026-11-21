@@ -150,7 +150,8 @@ def test_a_promotion_pushes_the_bundle_then_a_list_that_names_the_new_root(
         ]
         promoted = standby.post(
             "/v1/control/promote",
-            json={"passphrase": PASSPHRASE},
+            # It follows no root, so its lag is unknown (control#16).
+            json={"passphrase": PASSPHRASE, "force": True},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert promoted.status_code == 200, promoted.text
@@ -355,7 +356,8 @@ def test_a_promotion_ends_the_old_roots_tokens_without_an_epoch(tmp_path: Path) 
         assert app.state.machine.state.config.get("tokenEpochs") is None, "no mark yet"
         promoted = client.post(
             "/v1/control/promote",
-            json={"passphrase": PASSPHRASE},
+            # It follows no root, so its lag is unknown (control#16).
+            json={"passphrase": PASSPHRASE, "force": True},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert promoted.status_code == 200, promoted.text
