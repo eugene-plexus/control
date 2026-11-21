@@ -728,14 +728,22 @@ class StateMachine:
 
     # ----- promotion --------------------------------------------------
 
-    def promote(self, *, node: str | None) -> dict[str, Any]:
+    def promote(self, *, node: str | None) -> dict[str, Any] | None:
         """Become the active root at a higher epoch.
 
         Flips the role first so `append` is legal, then writes a
-        `promote` entry stamped `epoch + 1`. If the append fails the
-        role is put back, because a root that believes it is active
-        without having recorded it is exactly the split-brain this whole
-        mechanism exists to prevent.
+        `promote` entry stamped `epoch + 1`. If the entry was not
+        committed the role is put back, because a root that believes it
+        is active without having recorded it is exactly the split-brain
+        this whole mechanism exists to prevent.
+
+        **Committed is what counts, not whether `append` raised**
+        (control#16). `append` stores the entry and commits it before it
+        may write a snapshot, and a snapshot that fails after that (a full
+        disk, a file another process holds) leaves the promotion in the
+        log: the next start reads it and starts this node as the root. So
+        a failure after the commit is logged and the promotion stands, and
+        the entry is returned only when `append` returned it.
 
         Agents learn the new epoch on their next contact and fence the
         old root by refusing its lower one — no election, no quorum, and
@@ -747,18 +755,36 @@ class StateMachine:
             new_epoch = self._state.epoch + 1
             previous_role = self._role
             self._role = ROLE_ACTIVE
+            entry: dict[str, Any] | None = None
             try:
                 entry = self.append(
                     "promote", {"node": node} if node else {}, epoch_override=new_epoch
                 )
-            except BaseException:
-                self._role = previous_role
-                raise
+            except BaseException as exc:
+                if self._state.epoch < new_epoch or not isinstance(exc, Exception):
+                    if self._state.epoch < new_epoch:
+                        self._role = previous_role
+                    raise
+                log.warning(
+                    "the promote entry at index %d is written, but the snapshot after it "
+                    "failed (%s); this root is active",
+                    self._state.index,
+                    exc,
+                )
             # Snapshot immediately. A promotion is the moment an
             # operator is most likely to lose the host again, and a
             # standby of the *new* root should be able to bootstrap
-            # without replaying the old root's whole history.
-            self.snapshot_now()
+            # without replaying the old root's whole history. Not
+            # having one costs a longer replay, not the promotion.
+            try:
+                self.snapshot_now()
+            except Exception as exc:
+                log.warning(
+                    "promoted at epoch %d, but its snapshot was not written (%s); a standby of "
+                    "this root replays the log instead",
+                    new_epoch,
+                    exc,
+                )
             log.warning(
                 "promoted to active control root at epoch %d (was %s)", new_epoch, previous_role
             )

@@ -212,6 +212,18 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
     beats staying down — an explicit choice with a name, not a silent
     default.
     """
+    # One promotion at a time on one standby: two at once would each pause
+    # and resume the follower, and the second would decide on a state the
+    # first was changing. The second waits, then finds this root active or
+    # the follower as the first left it.
+    lock = getattr(request.app.state, "promote_lock", None)
+    if lock is None:
+        lock = request.app.state.promote_lock = asyncio.Lock()
+    async with lock:
+        return await _promote(request, body)
+
+
+async def _promote(request: Request, body: PromoteRequest) -> ControlStatus:
     machine: StateMachine = request.app.state.machine
     auth: AuthState = request.app.state.auth_state
     follower = getattr(request.app.state, "follower", None)
@@ -242,13 +254,13 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
             "Passphrase did not match the replicated verifier.",
         )
 
-    lag = follower.status.lag_entries if follower is not None else None
-    lag_unknown = follower is not None and lag is None
-    if follower is not None and lag is None and not body.force:
+    reading: FollowerStatus | None = follower.status if follower is not None else None
+    lag = reading.lag_entries if reading is not None else None
+    if lag is None and not body.force:
         raise problem(
             status.HTTP_409_CONFLICT,
             "How far behind is unknown",
-            _unknown_lag_detail(follower.status, machine.state.index),
+            _unknown_lag_detail(reading, machine.state.index),
         )
     if lag and not body.force:
         raise problem(
@@ -284,13 +296,13 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
             status.HTTP_409_CONFLICT, "Already active", "This control root is already active."
         ) from exc
     except BaseException as exc:
-        # `promote` puts the role back when its entry is not written. A
-        # root that did write it (its snapshot failed after) never follows
-        # again.
+        # `promote` puts the role back unless its entry is committed, and a
+        # snapshot failing after the commit does not raise. Active here means
+        # the entry is in the log and something else stopped the request:
+        # this root never follows again.
         if machine.is_active:
             if follower is not None:
-                await follower.stop()
-                request.app.state.follower = None
+                await _stop_follower(request, follower)
             raise
         if follower is not None:
             follower.resume()
@@ -303,8 +315,7 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
             ) from exc
         raise
     if follower is not None:
-        await follower.stop()
-        request.app.state.follower = None
+        await _stop_follower(request, follower)
 
     # Row 4: this root's own machine table from its own records, before
     # anything is pushed, so the pushes and every poll after go over TLS to
@@ -333,17 +344,12 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
 
     start_root_tasks(request.app)
 
-    if lag_unknown and body.force:
-        forced = " (forced, how far behind unknown)"
-    elif lag and body.force:
-        forced = f" (forced, {lag} entries behind)"
-    else:
-        forced = ""
     log.warning(
-        "PROMOTED to active control root at epoch %d, applied index %d%s",
+        "PROMOTED to active control root at epoch %d, applied index %d%s; %s",
         machine.state.epoch,
         machine.state.index,
-        forced,
+        " (forced)" if body.force else "",
+        _lag_reading(reading),
     )
     return ControlStatus(
         role=NodeRole(machine.role),
@@ -355,9 +361,41 @@ async def promote(request: Request, body: PromoteRequest) -> ControlStatus:
     )
 
 
-def _unknown_lag_detail(status_now: FollowerStatus, index: int) -> str:
+async def _stop_follower(request: Request, follower: Any) -> None:
+    """Stop a promoted root's follower. A follower that fails to close its
+    clients does not stop the root from starting: its loop has ended by
+    then (`pause`), so the cause is logged and the root goes on."""
+    request.app.state.follower = None
+    try:
+        await follower.stop()
+    except Exception as exc:
+        log.warning("the promoted root's follower did not close cleanly: %s", exc)
+
+
+def _lag_reading(reading: FollowerStatus | None) -> str:
+    """The lag a promotion went on, and how old that reading was."""
+    if reading is None:
+        return "lag unknown, replication was not running"
+    lag = reading.lag_entries
+    said = "lag unknown" if lag is None else f"lag {lag} entr{'y' if lag == 1 else 'ies'}"
+    if reading.last_contact_at is None:
+        return f"{said}, no contact with the active root since this standby started"
+    try:
+        age = (datetime.now(UTC) - datetime.fromisoformat(reading.last_contact_at)).total_seconds()
+    except ValueError:
+        return f"{said}, last contact at {reading.last_contact_at}"
+    return f"{said}, read {age:.0f} s before"
+
+
+def _unknown_lag_detail(status_now: FollowerStatus | None, index: int) -> str:
     """Why this standby cannot say what a promotion would lose: the cause it
     observed, where it is, and the way past (control#16)."""
+    if status_now is None:
+        return (
+            "This standby's replication is not running, so it cannot say what a promotion "
+            f"would lose. It last applied entry {index}. Re-run with force=true to promote "
+            "anyway."
+        )
     if status_now.active_url is None:
         cause = (
             "This standby has no active root to follow (EUGENE_PLEXUS_CONTROL_ACTIVE_URL "
